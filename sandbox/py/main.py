@@ -1,5 +1,6 @@
 import os
 import textwrap
+from pathlib import Path
 
 from bitgn.harness_connect import HarnessServiceClientSync
 from bitgn.harness_pb2 import StatusRequest, GetBenchmarkRequest, StartPlaygroundRequest, EvalPolicy, EndTrialRequest
@@ -9,7 +10,10 @@ from agent import run_agent
 
 BITGN_URL = os.getenv("BENCHMARK_HOST") or "https://api.bitgn.com"
 
-MODEL_ID = "gpt-4.1-2025-04-14"
+# Model configuration: LiteLLM provider/model format
+MODEL_ID = os.getenv("MODEL_ID") or os.getenv("EXECUTOR_MODEL") or "openai/gpt-4.1"
+SCOUT_MODEL = os.getenv("SCOUT_MODEL")  # optional: None = LLM-free scout
+SKILLS_DIR = Path(__file__).parent / "skills"
 
 CLI_RED = "\x1B[31m"
 CLI_GREEN = "\x1B[32m"
@@ -44,7 +48,13 @@ def main() -> None:
             print("Task:", trial.instruction)
 
             try:
-                run_agent(MODEL_ID,trial.harness_url, trial.instruction)
+                run_agent(
+                    executor_model=MODEL_ID,
+                    harness_url=trial.harness_url,
+                    task_text=trial.instruction,
+                    scout_model=SCOUT_MODEL,
+                    skills_dir=SKILLS_DIR,
+                )
             except Exception as e:
                 print(e)
 
