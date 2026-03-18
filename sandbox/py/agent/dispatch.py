@@ -1,0 +1,248 @@
+"""Tool dispatch: maps tool names to VM operations.
+
+Imports from agent.tracker, agent.tools, and agent.llm (ToolCall type only).
+Enforces protected files, tracks grounding, supports concurrent execution.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import posixpath
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable
+
+from google.protobuf.json_format import MessageToDict
+from connectrpc.errors import ConnectError
+
+from bitgn.vm.mini_connect import MiniRuntimeClientSync
+from bitgn.vm.mini_pb2 import (
+    AnswerRequest,
+    DeleteRequest,
+    ListRequest,
+    OutlineRequest,
+    ReadRequest,
+    SearchRequest,
+    WriteRequest,
+)
+
+from agent.tracker import GroundingTracker
+from agent.llm import ToolCall
+
+log = logging.getLogger(__name__)
+
+
+def _normalize_path(path: str) -> str:
+    """Normalize a file path for protected-file comparison.
+
+    - Strip leading '/'
+    - Resolve '..' segments via posixpath.normpath
+    - Lowercase for comparison
+    """
+    stripped = path.lstrip("/")
+    normalized = posixpath.normpath(stripped)
+    return normalized.lower()
+
+
+# ---------------------------------------------------------------------------
+# Handler functions: each takes (vm, args, tracker, protected_files, skill_loader)
+# and returns a JSON string result.
+# ---------------------------------------------------------------------------
+
+def _handle_tree(
+    vm: MiniRuntimeClientSync,
+    args: dict[str, Any],
+    tracker: GroundingTracker,
+    protected_files: set[str],
+    skill_loader: Any | None,
+) -> str:
+    path = args.get("path", "/")
+    resp = vm.outline(OutlineRequest(path=path))
+    # tree is a directory operation, not a file read — do not add to tracker
+    return json.dumps(MessageToDict(resp), ensure_ascii=False)
+
+
+def _handle_list_dir(
+    vm: MiniRuntimeClientSync,
+    args: dict[str, Any],
+    tracker: GroundingTracker,
+    protected_files: set[str],
+    skill_loader: Any | None,
+) -> str:
+    path = args.get("path", "/")
+    resp = vm.list(ListRequest(path=path))
+    return json.dumps(MessageToDict(resp), ensure_ascii=False)
+
+
+def _handle_read_file(
+    vm: MiniRuntimeClientSync,
+    args: dict[str, Any],
+    tracker: GroundingTracker,
+    protected_files: set[str],
+    skill_loader: Any | None,
+) -> str:
+    path = args.get("path", "")
+    resp = vm.read(ReadRequest(path=path))
+    tracker.add(path)
+    return json.dumps(MessageToDict(resp), ensure_ascii=False)
+
+
+def _handle_write_file(
+    vm: MiniRuntimeClientSync,
+    args: dict[str, Any],
+    tracker: GroundingTracker,
+    protected_files: set[str],
+    skill_loader: Any | None,
+) -> str:
+    path = args.get("path", "")
+    content = args.get("content", "")
+    resp = vm.write(WriteRequest(path=path, content=content))
+    return json.dumps(MessageToDict(resp), ensure_ascii=False)
+
+
+def _handle_delete_file(
+    vm: MiniRuntimeClientSync,
+    args: dict[str, Any],
+    tracker: GroundingTracker,
+    protected_files: set[str],
+    skill_loader: Any | None,
+) -> str:
+    path = args.get("path", "")
+    normalized = _normalize_path(path)
+
+    if normalized in protected_files:
+        log.warning("REFUSED: delete %s (protected policy file)", path)
+        return json.dumps(
+            {"error": f"Cannot delete protected file: {path}"},
+            ensure_ascii=False,
+        )
+
+    resp = vm.delete(DeleteRequest(path=path))
+    return json.dumps(MessageToDict(resp), ensure_ascii=False)
+
+
+def _handle_search(
+    vm: MiniRuntimeClientSync,
+    args: dict[str, Any],
+    tracker: GroundingTracker,
+    protected_files: set[str],
+    skill_loader: Any | None,
+) -> str:
+    pattern = args.get("pattern", "")
+    path = args.get("path", "/")
+    count = args.get("count", 5)
+    resp = vm.search(SearchRequest(path=path, pattern=pattern, count=count))
+    return json.dumps(MessageToDict(resp), ensure_ascii=False)
+
+
+def _handle_report_completion(
+    vm: MiniRuntimeClientSync,
+    args: dict[str, Any],
+    tracker: GroundingTracker,
+    protected_files: set[str],
+    skill_loader: Any | None,
+) -> str:
+    answer = args.get("answer", "")
+    llm_refs = args.get("grounding_refs", [])
+    # Trust the LLM's refs when provided; fall back to tracker only when empty
+    if llm_refs:
+        refs = llm_refs
+    else:
+        refs = tracker.merge([])
+    resp = vm.answer(AnswerRequest(answer=answer, refs=refs))
+    return json.dumps(MessageToDict(resp), ensure_ascii=False)
+
+
+def _handle_load_skill(
+    vm: MiniRuntimeClientSync,
+    args: dict[str, Any],
+    tracker: GroundingTracker,
+    protected_files: set[str],
+    skill_loader: Any | None,
+) -> str:
+    name = args.get("name", "")
+    if skill_loader is None:
+        return json.dumps(
+            {"error": "No skill loader available. Skills are not configured."},
+            ensure_ascii=False,
+        )
+    content = skill_loader.get_content(name)
+    return content
+
+
+# ---------------------------------------------------------------------------
+# Dispatch map: tool name -> handler (Req 12.2)
+# ---------------------------------------------------------------------------
+
+DISPATCH_MAP: dict[str, Callable] = {
+    "tree": _handle_tree,
+    "list_dir": _handle_list_dir,
+    "read_file": _handle_read_file,
+    "write_file": _handle_write_file,
+    "delete_file": _handle_delete_file,
+    "search": _handle_search,
+    "report_completion": _handle_report_completion,
+    "load_skill": _handle_load_skill,
+}
+
+
+# ---------------------------------------------------------------------------
+# Public dispatch functions
+# ---------------------------------------------------------------------------
+
+def dispatch_tool(
+    vm: MiniRuntimeClientSync,
+    tool_name: str,
+    args: dict[str, Any],
+    tracker: GroundingTracker,
+    protected_files: set[str],
+    skill_loader: Any | None = None,
+) -> str:
+    """Dispatch a single tool call and return the result as a JSON string.
+
+    Raises ValueError if the tool_name is not recognized.
+    """
+    handler = DISPATCH_MAP.get(tool_name)
+    if handler is None:
+        raise ValueError(f"Unknown tool: {tool_name}")
+
+    try:
+        return handler(vm, args, tracker, protected_files, skill_loader)
+    except ConnectError as exc:
+        log.warning("Tool %s error: %s %s", tool_name, exc.code, exc.message)
+        return json.dumps(
+            {"error": f"{exc.code}: {exc.message}"},
+            ensure_ascii=False,
+        )
+
+
+def dispatch_parallel(
+    vm: MiniRuntimeClientSync,
+    tool_calls: list[ToolCall],
+    tracker: GroundingTracker,
+    protected_files: set[str],
+    skill_loader: Any | None = None,
+    max_workers: int = 4,
+) -> list[tuple[str, str]]:
+    """Execute multiple tool calls concurrently.
+
+    Returns a list of (tool_call_id, result_json) tuples.
+    """
+    if not tool_calls:
+        return []
+
+    results: list[tuple[str, str]] = []
+
+    def _execute(tc: ToolCall) -> tuple[str, str]:
+        result = dispatch_tool(
+            vm, tc.name, tc.arguments,
+            tracker, protected_files, skill_loader,
+        )
+        return (tc.id, result)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_execute, tc) for tc in tool_calls]
+        for future in futures:
+            results.append(future.result())
+
+    return results

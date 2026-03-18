@@ -1,0 +1,29 @@
+{
+  "featureName": "agent-hardening",
+  "description": "Rewrite the sandbox agent: multi-phase architecture (scout + executor), LiteLLM for provider-agnostic model access, programmatic grounding tracking, prompt injection defense, standard tool-use pattern — targeting 100% on BitGN benchmark.",
+  "codeName": "agent-hardening",
+  "language": "en",
+  "createdAt": "2026-03-17T00:00:00Z",
+  "updatedAt": "2026-03-17T14:00:00Z",
+  "status": "tasks-generated",
+  "phases": {
+    "requirements": "generated",
+    "design": "generated",
+    "tasks": "generated",
+    "implementation": "completed"
+  },
+  "approvals": {
+    "requirements": {
+      "generated": true,
+      "approved": true
+    },
+    "design": {
+      "generated": true,
+      "approved": true
+    },
+    "tasks": {
+      "generated": true,
+      "approved": false
+    }
+  }
+}
