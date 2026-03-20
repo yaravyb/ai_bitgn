@@ -1,0 +1,29 @@
+{
+  "featureName": "agent-observability",
+  "description": "Add minimal observability to the sandbox agents using LiteLLM's native callback mechanism. Maximum visibility with minimum code changes: callback registration for automatic LLM call tracing (tokens, cost, latency), optional @observe() decorator or metadata-based trace grouping per task, environment-variable-only activation, and an optional dependency group. No custom ObservabilityContext classes, no new packages, no deep span hierarchy. Includes deep research on 10+ observability tools.",
+  "codeName": "agent-observability",
+  "language": "en",
+  "createdAt": "2026-03-18T00:00:00Z",
+  "updatedAt": "2026-03-18T20:00:00Z",
+  "status": "completed",
+  "phases": {
+    "requirements": "generated",
+    "design": "generated",
+    "tasks": "generated",
+    "implementation": "completed"
+  },
+  "approvals": {
+    "requirements": {
+      "generated": true,
+      "approved": true
+    },
+    "design": {
+      "generated": true,
+      "approved": true
+    },
+    "tasks": {
+      "generated": true,
+      "approved": false
+    }
+  }
+}

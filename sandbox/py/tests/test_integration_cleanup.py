@@ -120,10 +120,10 @@ class TestCircularImports:
             f"dispatch.py imports beyond allowed set: {imports - allowed}"
         )
 
-    def test_scout_only_imports_dag_dispatch_tracker(self):
-        """scout.py should only import from dag, dispatch, tracker."""
+    def test_scout_imports_from_allowed_modules(self):
+        """scout.py imports from llm, dispatch, tracker, tools, prompt (two-phase architecture)."""
         imports = self._get_agent_imports("scout")
-        allowed = {"dag", "dispatch", "tracker"}
+        allowed = {"llm", "dispatch", "tracker", "tools", "prompt"}
         assert imports.issubset(allowed), (
             f"scout.py imports beyond allowed set: {imports - allowed}"
         )

@@ -7,12 +7,13 @@ from bitgn.harness_pb2 import StatusRequest, GetBenchmarkRequest, StartPlaygroun
 from connectrpc.errors import ConnectError
 
 from agent import run_agent
+from agent.observability import configure_observability
 
 BITGN_URL = os.getenv("BENCHMARK_HOST") or "https://api.bitgn.com"
 
 # Model configuration: LiteLLM provider/model format
 MODEL_ID = os.getenv("MODEL_ID") or os.getenv("EXECUTOR_MODEL") or "openai/gpt-4.1"
-SCOUT_MODEL = os.getenv("SCOUT_MODEL")  # optional: None = LLM-free scout
+SCOUT_MODEL = os.getenv("SCOUT_MODEL") or MODEL_ID  # defaults to executor model
 SKILLS_DIR = Path(__file__).parent / "skills"
 
 CLI_RED = "\x1B[31m"
@@ -21,6 +22,7 @@ CLI_CLR = "\x1B[0m"
 
 
 def main() -> None:
+    configure_observability()
 
     # optional task ids could be included as tasks to run, e.g. `python main.py task1 task2`
     task_filter = os.sys.argv[1:]

@@ -1,12 +1,10 @@
-"""Tests for agent.scout -- Reactive DAG scout phase.
+"""Tests for agent.scout -- Two-phase LLM scout.
 
-TDD: Tests written BEFORE implementation.
-Task 9.1: ScoutSummary dataclass, imports from dag/dispatch/tracker only
-Task 9.2: run_scout() wave loop with seed, ready, execute, react
-Task 9.3: Reactor rules (tree -> read/list, list -> read/list, read -> read redirect)
-Task 9.4: Meta-file detection regex patterns
-Task 9.5: Numbered file detection (group by prefix+ext, 3+ sequential, read highest)
-Task 9.6: Wave observability logging
+Task 9: Rewritten for two-phase architecture.
+Tests for: ScoutConfig, BootstrapContext, ScoutSummary (new fields),
+_run_bootstrap, _run_llm_explorer, run_scout, SCOUT_TOOL_SCHEMAS,
+build_scout_prompt, module import assertions.
+TestMetaFileDetection retained unchanged.
 """
 
 import json
@@ -22,20 +20,13 @@ from unittest.mock import MagicMock, patch, call
 # ---------------------------------------------------------------------------
 
 def _tree_response(folders: list[str], files: list[str]) -> str:
-    """Build a JSON tree response matching OutlineResponse protobuf format.
-
-    OutlineResponse has: path (str), folders (list[str]), files (list[Outline])
-    where Outline has: path (str), headers (list[str])
-    """
+    """Build a JSON tree response matching OutlineResponse protobuf format."""
     file_entries = [{"path": f, "headers": []} for f in files]
     return json.dumps({"path": "/", "folders": folders, "files": file_entries})
 
 
 def _list_response(folders: list[str], files: list[str]) -> str:
-    """Build a JSON list_dir response matching ListResponse protobuf format.
-
-    ListResponse has: folders (list[str]), files (list[str])
-    """
+    """Build a JSON list_dir response matching ListResponse protobuf format."""
     return json.dumps({"folders": folders, "files": files})
 
 
@@ -45,19 +36,14 @@ def _read_response(content: str) -> str:
 
 
 def _make_dispatch_side_effect(responses: dict[str, str]):
-    """Create a side_effect function for dispatch_tool that returns canned responses.
-
-    responses: dict mapping (tool_name, path) -> response_json
-    """
+    """Create a side_effect function for dispatch_tool that returns canned responses."""
     def side_effect(vm, tool_name, args, tracker, protected_files, skill_loader=None):
         path = args.get("path", "/")
         key = (tool_name, path)
         if key in responses:
-            # Track the file if it's a read (tree is directory op, not tracked)
             if tool_name == "read_file":
                 tracker.add(path)
             return responses[key]
-        # Default empty responses
         if tool_name == "tree":
             return _tree_response([], [])
         if tool_name == "list_dir":
@@ -69,283 +55,865 @@ def _make_dispatch_side_effect(responses: dict[str, str]):
     return side_effect
 
 
+def _make_llm_response(content=None, tool_calls=None):
+    """Create a mock LLMResponse."""
+    mock = MagicMock()
+    mock.content = content
+    mock.tool_calls = tool_calls or []
+    mock.raw = None
+    return mock
+
+
+def _make_tool_call(tc_id, name, arguments):
+    """Create a mock ToolCall."""
+    mock = MagicMock()
+    mock.id = tc_id
+    mock.name = name
+    mock.arguments = arguments
+    return mock
+
+
 # ---------------------------------------------------------------------------
-# Task 9.1: ScoutSummary dataclass
+# Task 9: ScoutConfig dataclass
+# ---------------------------------------------------------------------------
+
+class TestScoutConfig:
+    """ScoutConfig has correct fields, defaults, and required params."""
+
+    def test_scout_config_exists(self):
+        from agent.scout import ScoutConfig
+        assert ScoutConfig is not None
+
+    def test_scout_config_fields(self):
+        from agent.scout import ScoutConfig
+        field_names = {f.name for f in dc_fields(ScoutConfig)}
+        assert field_names == {"model", "task_instruction", "max_steps", "max_workers"}
+
+    def test_scout_config_required_params(self):
+        from agent.scout import ScoutConfig
+        # model and task_instruction are required
+        with pytest.raises(TypeError):
+            ScoutConfig()
+        with pytest.raises(TypeError):
+            ScoutConfig(model="test-model")
+        with pytest.raises(TypeError):
+            ScoutConfig(task_instruction="test task")
+
+    def test_scout_config_defaults(self):
+        from agent.scout import ScoutConfig
+        config = ScoutConfig(model="openai/gpt-4.1", task_instruction="do something")
+        assert config.max_steps == 20
+        assert config.max_workers == 4
+
+    def test_scout_config_custom_values(self):
+        from agent.scout import ScoutConfig
+        config = ScoutConfig(
+            model="openai/gpt-4.1-mini",
+            task_instruction="find invoices",
+            max_steps=10,
+            max_workers=2,
+        )
+        assert config.model == "openai/gpt-4.1-mini"
+        assert config.task_instruction == "find invoices"
+        assert config.max_steps == 10
+        assert config.max_workers == 2
+
+
+# ---------------------------------------------------------------------------
+# Task 9: BootstrapContext dataclass
+# ---------------------------------------------------------------------------
+
+class TestBootstrapContext:
+    """BootstrapContext has correct fields and construction."""
+
+    def test_bootstrap_context_exists(self):
+        from agent.scout import BootstrapContext
+        assert BootstrapContext is not None
+
+    def test_bootstrap_context_fields(self):
+        from agent.scout import BootstrapContext
+        field_names = {f.name for f in dc_fields(BootstrapContext)}
+        expected = {
+            "directory_tree", "root_policy_files", "root_vault_skills",
+            "files_read", "folders_discovered",
+        }
+        assert field_names == expected
+
+    def test_bootstrap_context_construction(self):
+        from agent.scout import BootstrapContext
+        ctx = BootstrapContext(
+            directory_tree="tree output",
+            root_policy_files={"AGENTS.MD": "policy"},
+            root_vault_skills={"skill-todo.md": "skill"},
+            files_read={"AGENTS.MD", "skill-todo.md"},
+            folders_discovered=["workspace"],
+        )
+        assert ctx.directory_tree == "tree output"
+        assert "AGENTS.MD" in ctx.root_policy_files
+        assert "skill-todo.md" in ctx.root_vault_skills
+        assert len(ctx.files_read) == 2
+        assert "workspace" in ctx.folders_discovered
+
+
+# ---------------------------------------------------------------------------
+# Task 9: ScoutSummary -- existing + new fields
 # ---------------------------------------------------------------------------
 
 class TestScoutSummaryDataclass:
-    """Task 9.1: ScoutSummary has the expected fields."""
+    """ScoutSummary has existing fields + new LLM metadata fields."""
 
     def test_scout_summary_exists(self):
         from agent.scout import ScoutSummary
         assert ScoutSummary is not None
 
-    def test_scout_summary_fields(self):
+    def test_scout_summary_existing_fields(self):
         from agent.scout import ScoutSummary
         field_names = {f.name for f in dc_fields(ScoutSummary)}
-        expected = {"directory_tree", "policy_files", "vault_skills", "files_read", "folders_explored"}
-        assert field_names == expected
+        existing = {"directory_tree", "policy_files", "vault_skills", "files_read", "folders_explored"}
+        assert existing.issubset(field_names)
 
-    def test_scout_summary_construction(self):
+    def test_scout_summary_new_fields(self):
+        from agent.scout import ScoutSummary
+        field_names = {f.name for f in dc_fields(ScoutSummary)}
+        new_fields = {"llm_summary", "mode", "total_llm_steps", "completed_fully"}
+        assert new_fields.issubset(field_names)
+
+    def test_scout_summary_backward_compat(self):
+        """Constructing with only existing fields still works."""
         from agent.scout import ScoutSummary
         summary = ScoutSummary(
-            directory_tree="root\n  workspace/\n  skills/",
-            policy_files={"AGENTS.MD": "See README.MD"},
-            vault_skills={"skills/skill-todo.md": "todo skill content"},
-            files_read={"AGENTS.MD", "README.MD"},
-            folders_explored=["workspace", "skills"],
+            directory_tree="tree",
+            policy_files={"p.md": "content"},
+            vault_skills={},
+            files_read={"p.md"},
+            folders_explored=["workspace"],
         )
-        assert summary.directory_tree.startswith("root")
-        assert "AGENTS.MD" in summary.policy_files
-        assert "skills/skill-todo.md" in summary.vault_skills
-        assert "AGENTS.MD" in summary.files_read
-        assert "workspace" in summary.folders_explored
+        assert summary.directory_tree == "tree"
+        assert summary.llm_summary is None
+        assert summary.mode == "llm"
+        assert summary.total_llm_steps == 0
+        assert summary.completed_fully is False
 
+    def test_scout_summary_all_fields(self):
+        from agent.scout import ScoutSummary
+        summary = ScoutSummary(
+            directory_tree="tree",
+            policy_files={"p.md": "content"},
+            vault_skills={"skill-a.md": "skill"},
+            files_read={"p.md", "skill-a.md"},
+            folders_explored=["workspace"],
+            llm_summary="Found 3 policy files",
+            mode="llm",
+            total_llm_steps=5,
+            completed_fully=True,
+        )
+        assert summary.llm_summary == "Found 3 policy files"
+        assert summary.mode == "llm"
+        assert summary.total_llm_steps == 5
+        assert summary.completed_fully is True
 
-class TestScoutModuleDependencies:
-    """Task 9.1: scout.py imports from dag, dispatch, tracker only."""
-
-    def test_no_llm_import(self):
-        import agent.scout as mod
-        with open(mod.__file__) as f:
-            source = f.read()
-        agent_imports = re.findall(r"from\s+agent\.(\w+)", source)
-        forbidden = {"llm", "prompt", "skills", "loop"}
-        for imp in agent_imports:
-            assert imp not in forbidden, (
-                f"scout.py imports from agent.{imp}, "
-                f"only dag, dispatch, tracker are allowed"
-            )
-
-    def test_allowed_imports_only(self):
-        import agent.scout as mod
-        with open(mod.__file__) as f:
-            source = f.read()
-        agent_imports = re.findall(r"from\s+agent\.(\w+)", source)
-        allowed = {"dag", "dispatch", "tracker"}
-        for imp in agent_imports:
-            assert imp in allowed, (
-                f"scout.py imports from agent.{imp}, "
-                f"only {allowed} are allowed"
-            )
-
-
-# ---------------------------------------------------------------------------
-# Task 9.2: run_scout wave loop
-# ---------------------------------------------------------------------------
-
-class TestRunScoutBasic:
-    """Task 9.2: run_scout creates graph, seeds with tree, runs wave loop."""
-
-    @patch("agent.scout.dispatch_tool")
-    def test_run_scout_returns_scout_summary(self, mock_dispatch):
-        from agent.scout import run_scout, ScoutSummary
-        from agent.tracker import GroundingTracker
-
-        mock_dispatch.side_effect = _make_dispatch_side_effect({
-            ("tree", "/"): _tree_response([], []),
-        })
-
-        vm = MagicMock()
-        tracker = GroundingTracker()
-        result = run_scout(vm, tracker)
-        assert isinstance(result, ScoutSummary)
-
-    @patch("agent.scout.dispatch_tool")
-    def test_run_scout_calls_tree_root(self, mock_dispatch):
-        from agent.scout import run_scout
-        from agent.tracker import GroundingTracker
-
-        mock_dispatch.side_effect = _make_dispatch_side_effect({
-            ("tree", "/"): _tree_response([], []),
-        })
-
-        vm = MagicMock()
-        tracker = GroundingTracker()
-        run_scout(vm, tracker)
-
-        # Should have called dispatch_tool with tree and path "/"
-        tree_calls = [
-            c for c in mock_dispatch.call_args_list
-            if c[0][1] == "tree" or (len(c[0]) > 1 and c[0][1] == "tree")
-        ]
-        assert len(tree_calls) >= 1
-
-    @patch("agent.scout.dispatch_tool")
-    def test_run_scout_populates_directory_tree(self, mock_dispatch):
-        from agent.scout import run_scout
-        from agent.tracker import GroundingTracker
-
-        tree_output = _tree_response(["workspace", "skills"], ["AGENTS.MD"])
-        mock_dispatch.side_effect = _make_dispatch_side_effect({
-            ("tree", "/"): tree_output,
-        })
-
-        vm = MagicMock()
-        tracker = GroundingTracker()
-        result = run_scout(vm, tracker)
-        assert result.directory_tree != ""
-
-    @patch("agent.scout.dispatch_tool")
-    def test_run_scout_terminates_on_empty_workspace(self, mock_dispatch):
-        """Scout should terminate when no pending tasks remain."""
-        from agent.scout import run_scout
-        from agent.tracker import GroundingTracker
-
-        mock_dispatch.side_effect = _make_dispatch_side_effect({
-            ("tree", "/"): _tree_response([], []),
-        })
-
-        vm = MagicMock()
-        tracker = GroundingTracker()
-        result = run_scout(vm, tracker)
-        assert isinstance(result.files_read, set)
+    def test_scout_summary_default_construction(self):
+        """Empty ScoutSummary() should work with all defaults."""
+        from agent.scout import ScoutSummary
+        summary = ScoutSummary()
+        assert summary.directory_tree == ""
+        assert summary.policy_files == {}
+        assert summary.vault_skills == {}
+        assert isinstance(summary.files_read, set)
+        assert isinstance(summary.folders_explored, list)
+        assert summary.llm_summary is None
+        assert summary.mode == "llm"
+        assert summary.total_llm_steps == 0
+        assert summary.completed_fully is False
 
 
 # ---------------------------------------------------------------------------
-# Task 9.3: Reactor rules
+# Task 9: _run_bootstrap tests
 # ---------------------------------------------------------------------------
 
-class TestReactorTreeCompletion:
-    """Task 9.3: tree completion spawns read for AGENTS.MD and list for folders."""
+class TestRunBootstrap:
+    """Phase 1: _run_bootstrap calls tree, reads root files, returns BootstrapContext."""
 
     @patch("agent.scout.dispatch_tool")
-    def test_tree_spawns_read_for_agents_md(self, mock_dispatch):
-        from agent.scout import run_scout
+    def test_calls_tree_root(self, mock_dispatch):
+        from agent.scout import _run_bootstrap
         from agent.tracker import GroundingTracker
 
         mock_dispatch.side_effect = _make_dispatch_side_effect({
             ("tree", "/"): _tree_response(["workspace"], ["AGENTS.MD"]),
-            ("read_file", "/AGENTS.MD"): _read_response("Agent policies here"),
-            ("list_dir", "/workspace"): _list_response([], []),
         })
 
         vm = MagicMock()
         tracker = GroundingTracker()
-        result = run_scout(vm, tracker)
+        _run_bootstrap(vm, tracker, set())
 
-        # AGENTS.MD should have been read
-        assert "AGENTS.MD" in result.policy_files or any(
-            "agents" in k.lower() for k in result.policy_files
-        )
-
-    @patch("agent.scout.dispatch_tool")
-    def test_tree_spawns_list_for_each_folder(self, mock_dispatch):
-        from agent.scout import run_scout
-        from agent.tracker import GroundingTracker
-
-        mock_dispatch.side_effect = _make_dispatch_side_effect({
-            ("tree", "/"): _tree_response(["workspace", "data", "skills"], ["AGENTS.MD"]),
-            ("read_file", "/AGENTS.MD"): _read_response("Policies"),
-            ("list_dir", "/workspace"): _list_response([], []),
-            ("list_dir", "/data"): _list_response([], []),
-            ("list_dir", "/skills"): _list_response([], []),
-        })
-
-        vm = MagicMock()
-        tracker = GroundingTracker()
-        result = run_scout(vm, tracker)
-
-        # All three folders should be explored
-        assert len(result.folders_explored) >= 3
-
-
-class TestReactorListCompletion:
-    """Task 9.3: list completion spawns read for meta-files and list for subfolders."""
-
-    @patch("agent.scout.dispatch_tool")
-    def test_list_spawns_read_for_meta_files(self, mock_dispatch):
-        from agent.scout import run_scout
-        from agent.tracker import GroundingTracker
-
-        mock_dispatch.side_effect = _make_dispatch_side_effect({
-            ("tree", "/"): _tree_response(["workspace"], []),
-            ("list_dir", "/workspace"): _list_response(
-                [], ["RULES.md", "data.txt"]
-            ),
-            ("read_file", "/workspace/RULES.md"): _read_response("Some rules"),
-        })
-
-        vm = MagicMock()
-        tracker = GroundingTracker()
-        result = run_scout(vm, tracker)
-
-        # RULES.md should be in policy_files
-        matching = [k for k in result.policy_files if "RULES" in k.upper()]
-        assert len(matching) >= 1
-
-    @patch("agent.scout.dispatch_tool")
-    def test_list_spawns_list_for_subfolders(self, mock_dispatch):
-        from agent.scout import run_scout
-        from agent.tracker import GroundingTracker
-
-        mock_dispatch.side_effect = _make_dispatch_side_effect({
-            ("tree", "/"): _tree_response(["workspace"], []),
-            ("list_dir", "/workspace"): _list_response(["subfolder"], []),
-            ("list_dir", "/workspace/subfolder"): _list_response([], []),
-        })
-
-        vm = MagicMock()
-        tracker = GroundingTracker()
-        result = run_scout(vm, tracker)
-
-        # The subfolder should have been listed
-        # We verify by checking that list_dir was called for the subfolder
-        list_calls = [
+        tree_calls = [
             c for c in mock_dispatch.call_args_list
-            if c[0][1] == "list_dir" and "subfolder" in str(c[0][2])
+            if c[0][1] == "tree"
         ]
-        assert len(list_calls) >= 1
+        assert len(tree_calls) >= 1
 
     @patch("agent.scout.dispatch_tool")
-    def test_list_spawns_read_for_skill_files(self, mock_dispatch):
-        """Files matching skill-*.* should be read as vault skills."""
-        from agent.scout import run_scout
+    def test_reads_root_md_files(self, mock_dispatch):
+        from agent.scout import _run_bootstrap
         from agent.tracker import GroundingTracker
 
         mock_dispatch.side_effect = _make_dispatch_side_effect({
-            ("tree", "/"): _tree_response(["skills"], []),
-            ("list_dir", "/skills"): _list_response(
-                [], ["skill-todo.md", "_rules.txt"]
-            ),
-            ("read_file", "/skills/skill-todo.md"): _read_response("Todo skill"),
-            ("read_file", "/skills/_rules.txt"): _read_response("Rules here"),
+            ("tree", "/"): _tree_response(["workspace"], ["AGENTS.MD", "README.txt"]),
+            ("read_file", "/AGENTS.MD"): _read_response("Policy content"),
+            ("read_file", "/README.txt"): _read_response("Readme content"),
         })
 
         vm = MagicMock()
         tracker = GroundingTracker()
-        result = run_scout(vm, tracker)
+        ctx = _run_bootstrap(vm, tracker, set())
 
-        # skill-todo.md should be in vault_skills
-        matching = [k for k in result.vault_skills if "skill-todo" in k]
-        assert len(matching) >= 1
-
-
-class TestReactorReadCompletion:
-    """Task 9.3: read completion spawns read for redirect targets."""
+        read_calls = [
+            c for c in mock_dispatch.call_args_list
+            if c[0][1] == "read_file"
+        ]
+        assert len(read_calls) >= 2
 
     @patch("agent.scout.dispatch_tool")
-    def test_read_spawns_read_for_redirect(self, mock_dispatch):
-        from agent.scout import run_scout
+    def test_classifies_policy_files(self, mock_dispatch):
+        from agent.scout import _run_bootstrap
         from agent.tracker import GroundingTracker
 
         mock_dispatch.side_effect = _make_dispatch_side_effect({
-            ("tree", "/"): _tree_response([], ["AGENTS.MD"]),
-            ("read_file", "/AGENTS.MD"): _read_response("See README.MD"),
-            ("read_file", "/README.MD"): _read_response("Actual policies here"),
+            ("tree", "/"): _tree_response(["workspace"], ["AGENTS.MD"]),
+            ("read_file", "/AGENTS.MD"): _read_response("Policy"),
         })
 
         vm = MagicMock()
         tracker = GroundingTracker()
-        result = run_scout(vm, tracker)
+        ctx = _run_bootstrap(vm, tracker, set())
 
-        # README.MD should also have been read as a policy file
-        readme_found = any("README" in k for k in result.policy_files)
-        assert readme_found, f"Expected README.MD in policy_files, got: {list(result.policy_files.keys())}"
+        # AGENTS.MD is a meta-file, should be in root_policy_files
+        assert any("AGENTS" in k for k in ctx.root_policy_files)
+
+    @patch("agent.scout.dispatch_tool")
+    def test_classifies_vault_skills(self, mock_dispatch):
+        from agent.scout import _run_bootstrap
+        from agent.tracker import GroundingTracker
+
+        mock_dispatch.side_effect = _make_dispatch_side_effect({
+            ("tree", "/"): _tree_response([], ["skill-todo.md"]),
+            ("read_file", "/skill-todo.md"): _read_response("Todo skill"),
+        })
+
+        vm = MagicMock()
+        tracker = GroundingTracker()
+        ctx = _run_bootstrap(vm, tracker, set())
+
+        assert any("skill-todo" in k for k in ctx.root_vault_skills)
+
+    @patch("agent.scout.dispatch_tool")
+    def test_returns_bootstrap_context(self, mock_dispatch):
+        from agent.scout import _run_bootstrap, BootstrapContext
+        from agent.tracker import GroundingTracker
+
+        mock_dispatch.side_effect = _make_dispatch_side_effect({
+            ("tree", "/"): _tree_response(["workspace", "data"], ["AGENTS.MD"]),
+            ("read_file", "/AGENTS.MD"): _read_response("Policy"),
+        })
+
+        vm = MagicMock()
+        tracker = GroundingTracker()
+        ctx = _run_bootstrap(vm, tracker, set())
+
+        assert isinstance(ctx, BootstrapContext)
+        assert ctx.directory_tree != ""
+        assert "workspace" in ctx.folders_discovered
+        assert "data" in ctx.folders_discovered
+
+    @patch("agent.scout.dispatch_tool")
+    def test_handles_empty_tree(self, mock_dispatch):
+        from agent.scout import _run_bootstrap
+        from agent.tracker import GroundingTracker
+
+        mock_dispatch.side_effect = _make_dispatch_side_effect({
+            ("tree", "/"): _tree_response([], []),
+        })
+
+        vm = MagicMock()
+        tracker = GroundingTracker()
+        ctx = _run_bootstrap(vm, tracker, set())
+
+        assert ctx.root_policy_files == {}
+        assert ctx.root_vault_skills == {}
+        assert ctx.folders_discovered == []
+
+    @patch("agent.scout.dispatch_tool")
+    def test_handles_tree_error(self, mock_dispatch):
+        from agent.scout import _run_bootstrap, BootstrapContext
+        from agent.tracker import GroundingTracker
+
+        mock_dispatch.side_effect = _make_dispatch_side_effect({
+            ("tree", "/"): json.dumps({"error": "connection refused"}),
+        })
+
+        vm = MagicMock()
+        tracker = GroundingTracker()
+        ctx = _run_bootstrap(vm, tracker, set())
+
+        assert isinstance(ctx, BootstrapContext)
+
+    @patch("agent.scout.dispatch_tool")
+    def test_skips_non_text_root_files(self, mock_dispatch):
+        from agent.scout import _run_bootstrap
+        from agent.tracker import GroundingTracker
+
+        mock_dispatch.side_effect = _make_dispatch_side_effect({
+            ("tree", "/"): _tree_response([], ["AGENTS.MD", "data.csv", "image.png"]),
+            ("read_file", "/AGENTS.MD"): _read_response("Policy"),
+        })
+
+        vm = MagicMock()
+        tracker = GroundingTracker()
+        ctx = _run_bootstrap(vm, tracker, set())
+
+        # Only AGENTS.MD should be read, not data.csv or image.png
+        read_calls = [
+            c for c in mock_dispatch.call_args_list
+            if c[0][1] == "read_file"
+        ]
+        assert len(read_calls) == 1
 
 
 # ---------------------------------------------------------------------------
-# Task 9.4: Meta-file detection
+# Task 9: _format_bootstrap_for_prompt tests
+# ---------------------------------------------------------------------------
+
+class TestFormatBootstrapForPrompt:
+    """_format_bootstrap_for_prompt produces readable string."""
+
+    def test_includes_tree(self):
+        from agent.scout import _format_bootstrap_for_prompt, BootstrapContext
+        ctx = BootstrapContext(
+            directory_tree='{"path": "/", "folders": ["workspace"]}',
+            root_policy_files={},
+            root_vault_skills={},
+            files_read=set(),
+            folders_discovered=["workspace"],
+        )
+        result = _format_bootstrap_for_prompt(ctx)
+        assert "workspace" in result
+
+    def test_includes_policy_file_contents(self):
+        from agent.scout import _format_bootstrap_for_prompt, BootstrapContext
+        ctx = BootstrapContext(
+            directory_tree="tree",
+            root_policy_files={"AGENTS.MD": "Follow the rules"},
+            root_vault_skills={},
+            files_read={"AGENTS.MD"},
+            folders_discovered=[],
+        )
+        result = _format_bootstrap_for_prompt(ctx)
+        assert "AGENTS.MD" in result
+        assert "Follow the rules" in result
+
+
+# ---------------------------------------------------------------------------
+# Task 9: _run_llm_explorer tests
+# ---------------------------------------------------------------------------
+
+class TestRunLlmExplorer:
+    """Phase 2: LLM explorer loop."""
+
+    @patch("agent.scout.dispatch_parallel")
+    @patch("agent.scout.call_llm")
+    @patch("agent.scout.build_scout_prompt")
+    def test_calls_call_llm_with_scout_tool_schemas(
+        self, mock_prompt, mock_call_llm, mock_dispatch,
+    ):
+        from agent.scout import _run_llm_explorer, ScoutConfig, BootstrapContext
+        from agent.tools import SCOUT_TOOL_SCHEMAS
+        from agent.tracker import GroundingTracker
+
+        mock_prompt.return_value = "scout prompt"
+        mock_call_llm.return_value = _make_llm_response(content="Done exploring")
+
+        config = ScoutConfig(model="openai/gpt-4.1", task_instruction="test task")
+        bootstrap = BootstrapContext(
+            directory_tree="tree", root_policy_files={},
+            root_vault_skills={}, files_read=set(),
+            folders_discovered=[],
+        )
+
+        vm = MagicMock()
+        tracker = GroundingTracker()
+        _run_llm_explorer(vm, tracker, config, bootstrap, set())
+
+        # Verify call_llm was called with SCOUT_TOOL_SCHEMAS
+        llm_call = mock_call_llm.call_args
+        tools_arg = llm_call[1].get("tools") or llm_call[0][2]
+        assert tools_arg is SCOUT_TOOL_SCHEMAS
+
+    @patch("agent.scout.dispatch_parallel")
+    @patch("agent.scout.call_llm")
+    @patch("agent.scout.build_scout_prompt")
+    def test_terminates_on_text_response(
+        self, mock_prompt, mock_call_llm, mock_dispatch,
+    ):
+        from agent.scout import _run_llm_explorer, ScoutConfig, BootstrapContext
+        from agent.tracker import GroundingTracker
+
+        mock_prompt.return_value = "scout prompt"
+        mock_call_llm.return_value = _make_llm_response(content="Exploration summary")
+
+        config = ScoutConfig(model="openai/gpt-4.1", task_instruction="test")
+        bootstrap = BootstrapContext(
+            directory_tree="tree", root_policy_files={},
+            root_vault_skills={}, files_read=set(),
+            folders_discovered=[],
+        )
+
+        vm = MagicMock()
+        tracker = GroundingTracker()
+        result = _run_llm_explorer(vm, tracker, config, bootstrap, set())
+
+        llm_summary, total_steps, completed_fully, reads, folders = result
+        assert llm_summary == "Exploration summary"
+        assert completed_fully is True
+        assert total_steps == 1
+
+    @patch("agent.scout.dispatch_parallel")
+    @patch("agent.scout.call_llm")
+    @patch("agent.scout.build_scout_prompt")
+    def test_terminates_on_step_limit(
+        self, mock_prompt, mock_call_llm, mock_dispatch,
+    ):
+        from agent.scout import _run_llm_explorer, ScoutConfig, BootstrapContext
+        from agent.tracker import GroundingTracker
+
+        mock_prompt.return_value = "scout prompt"
+
+        # Always return tool calls (never text-only)
+        tc = _make_tool_call("tc1", "read_file", {"path": "/test.md"})
+        mock_call_llm.return_value = _make_llm_response(content=None, tool_calls=[tc])
+        mock_dispatch.return_value = [("tc1", _read_response("content"))]
+
+        config = ScoutConfig(model="openai/gpt-4.1", task_instruction="test", max_steps=3)
+        bootstrap = BootstrapContext(
+            directory_tree="tree", root_policy_files={},
+            root_vault_skills={}, files_read=set(),
+            folders_discovered=[],
+        )
+
+        vm = MagicMock()
+        tracker = GroundingTracker()
+        result = _run_llm_explorer(vm, tracker, config, bootstrap, set())
+
+        llm_summary, total_steps, completed_fully, reads, folders = result
+        assert completed_fully is False
+        assert total_steps == 3
+        assert llm_summary is None
+
+    @patch("agent.scout.dispatch_parallel")
+    @patch("agent.scout.call_llm")
+    @patch("agent.scout.build_scout_prompt")
+    def test_accumulates_read_file_results(
+        self, mock_prompt, mock_call_llm, mock_dispatch,
+    ):
+        from agent.scout import _run_llm_explorer, ScoutConfig, BootstrapContext
+        from agent.tracker import GroundingTracker
+
+        mock_prompt.return_value = "scout prompt"
+
+        tc1 = _make_tool_call("tc1", "read_file", {"path": "/workspace/rules.md"})
+        tc2 = _make_tool_call("tc2", "read_file", {"path": "/data/report.md"})
+
+        mock_call_llm.side_effect = [
+            _make_llm_response(content=None, tool_calls=[tc1, tc2]),
+            _make_llm_response(content="Done"),
+        ]
+        mock_dispatch.return_value = [
+            ("tc1", _read_response("rules content")),
+            ("tc2", _read_response("report content")),
+        ]
+
+        config = ScoutConfig(model="openai/gpt-4.1", task_instruction="test")
+        bootstrap = BootstrapContext(
+            directory_tree="tree", root_policy_files={},
+            root_vault_skills={}, files_read=set(),
+            folders_discovered=[],
+        )
+
+        vm = MagicMock()
+        tracker = GroundingTracker()
+        result = _run_llm_explorer(vm, tracker, config, bootstrap, set())
+
+        llm_summary, total_steps, completed_fully, reads, folders = result
+        assert len(reads) >= 2
+
+    @patch("agent.scout.dispatch_parallel")
+    @patch("agent.scout.call_llm")
+    @patch("agent.scout.build_scout_prompt")
+    def test_tracks_list_dir_folders(
+        self, mock_prompt, mock_call_llm, mock_dispatch,
+    ):
+        from agent.scout import _run_llm_explorer, ScoutConfig, BootstrapContext
+        from agent.tracker import GroundingTracker
+
+        mock_prompt.return_value = "scout prompt"
+
+        tc1 = _make_tool_call("tc1", "list_dir", {"path": "/workspace"})
+
+        mock_call_llm.side_effect = [
+            _make_llm_response(content=None, tool_calls=[tc1]),
+            _make_llm_response(content="Done"),
+        ]
+        mock_dispatch.return_value = [
+            ("tc1", _list_response(["sub"], ["file.md"])),
+        ]
+
+        config = ScoutConfig(model="openai/gpt-4.1", task_instruction="test")
+        bootstrap = BootstrapContext(
+            directory_tree="tree", root_policy_files={},
+            root_vault_skills={}, files_read=set(),
+            folders_discovered=[],
+        )
+
+        vm = MagicMock()
+        tracker = GroundingTracker()
+        result = _run_llm_explorer(vm, tracker, config, bootstrap, set())
+
+        llm_summary, total_steps, completed_fully, reads, folders = result
+        assert "/workspace" in folders
+
+    @patch("agent.scout.dispatch_parallel")
+    @patch("agent.scout.call_llm")
+    @patch("agent.scout.build_scout_prompt")
+    def test_uses_separate_trace_metadata(
+        self, mock_prompt, mock_call_llm, mock_dispatch,
+    ):
+        from agent.scout import _run_llm_explorer, ScoutConfig, BootstrapContext
+        from agent.tracker import GroundingTracker
+
+        mock_prompt.return_value = "scout prompt"
+        mock_call_llm.return_value = _make_llm_response(content="Done")
+
+        config = ScoutConfig(model="openai/gpt-4.1", task_instruction="test")
+        bootstrap = BootstrapContext(
+            directory_tree="tree", root_policy_files={},
+            root_vault_skills={}, files_read=set(),
+            folders_discovered=[],
+        )
+
+        vm = MagicMock()
+        tracker = GroundingTracker()
+        _run_llm_explorer(vm, tracker, config, bootstrap, set())
+
+        llm_call = mock_call_llm.call_args
+        metadata = llm_call[1].get("metadata", {})
+        assert "trace_id" in metadata
+        assert metadata.get("trace_name") == "scout_llm_explorer"
+
+    @patch("agent.scout.dispatch_parallel")
+    @patch("agent.scout.call_llm")
+    @patch("agent.scout.build_scout_prompt")
+    def test_uses_dispatch_parallel_with_max_workers(
+        self, mock_prompt, mock_call_llm, mock_dispatch,
+    ):
+        from agent.scout import _run_llm_explorer, ScoutConfig, BootstrapContext
+        from agent.tracker import GroundingTracker
+
+        mock_prompt.return_value = "scout prompt"
+
+        tc = _make_tool_call("tc1", "read_file", {"path": "/test.md"})
+        mock_call_llm.side_effect = [
+            _make_llm_response(content=None, tool_calls=[tc]),
+            _make_llm_response(content="Done"),
+        ]
+        mock_dispatch.return_value = [("tc1", _read_response("content"))]
+
+        config = ScoutConfig(model="openai/gpt-4.1", task_instruction="test", max_workers=2)
+        bootstrap = BootstrapContext(
+            directory_tree="tree", root_policy_files={},
+            root_vault_skills={}, files_read=set(),
+            folders_discovered=[],
+        )
+
+        vm = MagicMock()
+        tracker = GroundingTracker()
+        _run_llm_explorer(vm, tracker, config, bootstrap, set())
+
+        dp_call = mock_dispatch.call_args
+        assert dp_call[1].get("max_workers") == 2 or (len(dp_call[0]) >= 5 and dp_call[0][4] == 2)
+
+
+# ---------------------------------------------------------------------------
+# Task 9: run_scout (two-phase orchestration)
+# ---------------------------------------------------------------------------
+
+class TestRunScoutBasic:
+    """run_scout orchestrates Phase 1 -> Phase 2 -> summary build."""
+
+    @patch("agent.scout.dispatch_parallel")
+    @patch("agent.scout.call_llm")
+    @patch("agent.scout.build_scout_prompt")
+    @patch("agent.scout.dispatch_tool")
+    def test_run_scout_returns_scout_summary(
+        self, mock_dispatch_tool, mock_prompt, mock_call_llm, mock_dispatch_parallel,
+    ):
+        from agent.scout import run_scout, ScoutSummary, ScoutConfig
+        from agent.tracker import GroundingTracker
+
+        mock_dispatch_tool.side_effect = _make_dispatch_side_effect({
+            ("tree", "/"): _tree_response([], []),
+        })
+        mock_prompt.return_value = "scout prompt"
+        mock_call_llm.return_value = _make_llm_response(content="Done exploring")
+
+        vm = MagicMock()
+        tracker = GroundingTracker()
+        config = ScoutConfig(model="openai/gpt-4.1", task_instruction="test task")
+        result = run_scout(vm, tracker, config)
+        assert isinstance(result, ScoutSummary)
+
+    @patch("agent.scout.dispatch_parallel")
+    @patch("agent.scout.call_llm")
+    @patch("agent.scout.build_scout_prompt")
+    @patch("agent.scout.dispatch_tool")
+    def test_run_scout_populates_directory_tree(
+        self, mock_dispatch_tool, mock_prompt, mock_call_llm, mock_dispatch_parallel,
+    ):
+        from agent.scout import run_scout, ScoutConfig
+        from agent.tracker import GroundingTracker
+
+        tree_output = _tree_response(["workspace", "skills"], ["AGENTS.MD"])
+        mock_dispatch_tool.side_effect = _make_dispatch_side_effect({
+            ("tree", "/"): tree_output,
+            ("read_file", "/AGENTS.MD"): _read_response("Policy"),
+        })
+        mock_prompt.return_value = "scout prompt"
+        mock_call_llm.return_value = _make_llm_response(content="Done")
+
+        vm = MagicMock()
+        tracker = GroundingTracker()
+        config = ScoutConfig(model="openai/gpt-4.1", task_instruction="test")
+        result = run_scout(vm, tracker, config)
+        assert result.directory_tree != ""
+
+    @patch("agent.scout.dispatch_parallel")
+    @patch("agent.scout.call_llm")
+    @patch("agent.scout.build_scout_prompt")
+    @patch("agent.scout.dispatch_tool")
+    def test_run_scout_has_llm_metadata(
+        self, mock_dispatch_tool, mock_prompt, mock_call_llm, mock_dispatch_parallel,
+    ):
+        from agent.scout import run_scout, ScoutConfig
+        from agent.tracker import GroundingTracker
+
+        mock_dispatch_tool.side_effect = _make_dispatch_side_effect({
+            ("tree", "/"): _tree_response([], []),
+        })
+        mock_prompt.return_value = "scout prompt"
+        mock_call_llm.return_value = _make_llm_response(content="Summary text")
+
+        vm = MagicMock()
+        tracker = GroundingTracker()
+        config = ScoutConfig(model="openai/gpt-4.1", task_instruction="test")
+        result = run_scout(vm, tracker, config)
+
+        assert result.llm_summary == "Summary text"
+        assert result.mode == "llm"
+        assert result.total_llm_steps >= 1
+        assert result.completed_fully is True
+
+    @patch("agent.scout.dispatch_parallel")
+    @patch("agent.scout.call_llm")
+    @patch("agent.scout.build_scout_prompt")
+    @patch("agent.scout.dispatch_tool")
+    def test_run_scout_merges_files_read(
+        self, mock_dispatch_tool, mock_prompt, mock_call_llm, mock_dispatch_parallel,
+    ):
+        from agent.scout import run_scout, ScoutConfig
+        from agent.tracker import GroundingTracker
+
+        mock_dispatch_tool.side_effect = _make_dispatch_side_effect({
+            ("tree", "/"): _tree_response([], ["AGENTS.MD"]),
+            ("read_file", "/AGENTS.MD"): _read_response("Policy"),
+        })
+        mock_prompt.return_value = "scout prompt"
+
+        tc = _make_tool_call("tc1", "read_file", {"path": "/data.md"})
+        mock_call_llm.side_effect = [
+            _make_llm_response(content=None, tool_calls=[tc]),
+            _make_llm_response(content="Done"),
+        ]
+        mock_dispatch_parallel.return_value = [("tc1", _read_response("data content"))]
+
+        vm = MagicMock()
+        tracker = GroundingTracker()
+        config = ScoutConfig(model="openai/gpt-4.1", task_instruction="test")
+        result = run_scout(vm, tracker, config)
+
+        # files_read should include files from both phases
+        assert len(result.files_read) >= 1  # at least AGENTS.MD from Phase 1
+
+
+# ---------------------------------------------------------------------------
+# Task 9: Integration test
+# ---------------------------------------------------------------------------
+
+class TestScoutFullScenario:
+    """Integration test: scout explores a realistic workspace."""
+
+    @patch("agent.scout.dispatch_parallel")
+    @patch("agent.scout.call_llm")
+    @patch("agent.scout.build_scout_prompt")
+    @patch("agent.scout.dispatch_tool")
+    def test_full_workspace_exploration(
+        self, mock_dispatch_tool, mock_prompt, mock_call_llm, mock_dispatch_parallel,
+    ):
+        from agent.scout import run_scout, ScoutConfig
+        from agent.tracker import GroundingTracker
+
+        mock_dispatch_tool.side_effect = _make_dispatch_side_effect({
+            ("tree", "/"): _tree_response(
+                ["workspace", "skills", "data"], ["AGENTS.MD"]
+            ),
+            ("read_file", "/AGENTS.MD"): _read_response("See README.MD"),
+        })
+        mock_prompt.return_value = "scout prompt"
+
+        # LLM explorer reads additional files
+        tc_readme = _make_tool_call("tc1", "read_file", {"path": "/README.MD"})
+        tc_rules = _make_tool_call("tc2", "read_file", {"path": "/workspace/RULES.md"})
+        tc_skill = _make_tool_call("tc3", "read_file", {"path": "/skills/skill-todo.md"})
+        tc_list = _make_tool_call("tc4", "list_dir", {"path": "/workspace"})
+
+        mock_call_llm.side_effect = [
+            _make_llm_response(content=None, tool_calls=[tc_readme, tc_rules, tc_skill, tc_list]),
+            _make_llm_response(content="Exploration complete. Found policy files and skills."),
+        ]
+        mock_dispatch_parallel.return_value = [
+            ("tc1", _read_response("# Main Policy\nDo good things.")),
+            ("tc2", _read_response("Naming: PAY-N.md")),
+            ("tc3", _read_response("Todo skill content")),
+            ("tc4", _list_response([], ["PAY-1.md", "PAY-12.md"])),
+        ]
+
+        vm = MagicMock()
+        tracker = GroundingTracker()
+        config = ScoutConfig(model="openai/gpt-4.1", task_instruction="Find invoices")
+        result = run_scout(vm, tracker, config)
+
+        assert result.directory_tree != ""
+        assert result.llm_summary is not None
+        assert result.mode == "llm"
+        assert result.completed_fully is True
+        assert result.total_llm_steps == 2
+
+        # Policy files should include AGENTS.MD from Phase 1
+        assert any("AGENTS" in p for p in result.policy_files)
+        # Vault skills from Phase 2
+        assert any("skill-todo" in p for p in result.vault_skills)
+        # Folders explored from Phase 2
+        assert "/workspace" in result.folders_explored or "workspace" in result.folders_explored
+
+    @patch("agent.scout.dispatch_parallel")
+    @patch("agent.scout.call_llm")
+    @patch("agent.scout.build_scout_prompt")
+    @patch("agent.scout.dispatch_tool")
+    def test_scout_handles_empty_workspace(
+        self, mock_dispatch_tool, mock_prompt, mock_call_llm, mock_dispatch_parallel,
+    ):
+        from agent.scout import run_scout, ScoutConfig
+        from agent.tracker import GroundingTracker
+
+        mock_dispatch_tool.side_effect = _make_dispatch_side_effect({
+            ("tree", "/"): _tree_response([], []),
+        })
+        mock_prompt.return_value = "scout prompt"
+        mock_call_llm.return_value = _make_llm_response(content="Empty workspace")
+
+        vm = MagicMock()
+        tracker = GroundingTracker()
+        config = ScoutConfig(model="openai/gpt-4.1", task_instruction="test")
+        result = run_scout(vm, tracker, config)
+
+        assert result.policy_files == {}
+        assert result.vault_skills == {}
+
+
+# ---------------------------------------------------------------------------
+# Task 9: SCOUT_TOOL_SCHEMAS test
+# ---------------------------------------------------------------------------
+
+class TestScoutToolSchemas:
+    """SCOUT_TOOL_SCHEMAS contains exactly the read-only tools."""
+
+    def test_contains_exactly_four_tools(self):
+        from agent.tools import SCOUT_TOOL_SCHEMAS
+        names = {s["function"]["name"] for s in SCOUT_TOOL_SCHEMAS}
+        assert names == {"tree", "list_dir", "read_file", "search"}
+
+    def test_is_subset_of_tool_schemas(self):
+        from agent.tools import TOOL_SCHEMAS, SCOUT_TOOL_SCHEMAS
+        for s in SCOUT_TOOL_SCHEMAS:
+            assert s in TOOL_SCHEMAS
+
+
+# ---------------------------------------------------------------------------
+# Task 9: build_scout_prompt test
+# ---------------------------------------------------------------------------
+
+class TestBuildScoutPromptFromScout:
+    """build_scout_prompt() accepts params and produces correct prompt."""
+
+    def test_accepts_parameters(self):
+        from agent.prompt import build_scout_prompt
+        result = build_scout_prompt(
+            task_instruction="Find invoices",
+            bootstrap_context="tree output",
+        )
+        assert isinstance(result, str)
+        assert "Find invoices" in result
+        assert "tree output" in result
+
+    def test_contains_role_section(self):
+        from agent.prompt import build_scout_prompt
+        result = build_scout_prompt(
+            task_instruction="test",
+            bootstrap_context="tree",
+        )
+        assert "reconnaissance" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# Task 9: Module import assertions
+# ---------------------------------------------------------------------------
+
+class TestScoutModuleDependencies:
+    """scout.py imports from llm, tools, prompt, dispatch, tracker; NOT dag, skills, loop."""
+
+    def test_imports_required_modules(self):
+        import agent.scout as mod
+        with open(mod.__file__) as f:
+            source = f.read()
+        agent_imports = re.findall(r"from\s+agent\.(\w+)", source)
+        required = {"llm", "tools", "prompt", "dispatch", "tracker"}
+        for req in required:
+            assert req in agent_imports, (
+                f"scout.py must import from agent.{req}"
+            )
+
+    def test_no_forbidden_imports(self):
+        import agent.scout as mod
+        with open(mod.__file__) as f:
+            source = f.read()
+        agent_imports = re.findall(r"from\s+agent\.(\w+)", source)
+        forbidden = {"dag", "skills", "loop"}
+        for imp in agent_imports:
+            assert imp not in forbidden, (
+                f"scout.py must NOT import from agent.{imp}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Task 9: Meta-file detection (RETAINED UNCHANGED)
 # ---------------------------------------------------------------------------
 
 class TestMetaFileDetection:
@@ -384,222 +952,3 @@ class TestMetaFileDetection:
         from agent.scout import is_meta_file
         result = is_meta_file(filename)
         assert result == expected, f"is_meta_file('{filename}') should be {expected}"
-
-
-# ---------------------------------------------------------------------------
-# Task 9.5: Numbered file detection
-# ---------------------------------------------------------------------------
-
-class TestNumberedFileDetection:
-    """Task 9.5: Group files by prefix+ext, 3+ sequential -> read highest only."""
-
-    def test_detect_numbered_group(self):
-        from agent.scout import detect_numbered_files
-        files = ["PAY-1.md", "PAY-2.md", "PAY-3.md", "PAY-12.md", "RULES.md"]
-        result = detect_numbered_files(files)
-        # Should return a dict: {prefix_key: highest_filename}
-        assert isinstance(result, dict)
-        # PAY group should exist with highest being PAY-12.md
-        assert any("PAY-12.md" in v for v in result.values())
-
-    def test_no_numbered_group_when_fewer_than_three(self):
-        from agent.scout import detect_numbered_files
-        files = ["PAY-1.md", "PAY-2.md", "RULES.md"]
-        result = detect_numbered_files(files)
-        # PAY group has only 2 members, should not be in result
-        assert len(result) == 0
-
-    def test_multiple_numbered_groups(self):
-        from agent.scout import detect_numbered_files
-        files = [
-            "PAY-1.md", "PAY-2.md", "PAY-3.md",
-            "LOG-001.txt", "LOG-002.txt", "LOG-003.txt",
-            "README.md",
-        ]
-        result = detect_numbered_files(files)
-        assert len(result) == 2  # Two groups: PAY and LOG
-        # Each group should have its highest
-        values = list(result.values())
-        assert "PAY-3.md" in values
-        assert "LOG-003.txt" in values
-
-    def test_non_numbered_files_ignored(self):
-        from agent.scout import detect_numbered_files
-        files = ["README.md", "RULES.md", "config.yaml"]
-        result = detect_numbered_files(files)
-        assert len(result) == 0
-
-    @patch("agent.scout.dispatch_tool")
-    def test_scout_reads_only_highest_numbered(self, mock_dispatch):
-        """When a numbered group is detected, scout reads only the highest."""
-        from agent.scout import run_scout
-        from agent.tracker import GroundingTracker
-
-        mock_dispatch.side_effect = _make_dispatch_side_effect({
-            ("tree", "/"): _tree_response(["workspace"], []),
-            ("list_dir", "/workspace"): _list_response(
-                [], ["PAY-1.md", "PAY-2.md", "PAY-3.md", "PAY-12.md"]
-            ),
-            ("read_file", "/workspace/PAY-12.md"): _read_response("Payment 12"),
-        })
-
-        vm = MagicMock()
-        tracker = GroundingTracker()
-        result = run_scout(vm, tracker)
-
-        # Should have read PAY-12.md (highest) but not PAY-1, PAY-2, PAY-3
-        read_calls = [
-            c for c in mock_dispatch.call_args_list
-            if c[0][1] == "read_file"
-        ]
-        read_paths = [c[0][2].get("path", "") for c in read_calls]
-        assert any("PAY-12" in p for p in read_paths), f"Should read PAY-12.md, got: {read_paths}"
-        # Should NOT have read PAY-1, PAY-2, PAY-3
-        for p in read_paths:
-            assert "PAY-1.md" not in p or "PAY-12" in p, f"Should not read PAY-1.md, got: {read_paths}"
-            assert "PAY-2" not in p, f"Should not read PAY-2.md, got: {read_paths}"
-            assert "PAY-3" not in p, f"Should not read PAY-3.md, got: {read_paths}"
-
-
-# ---------------------------------------------------------------------------
-# Task 9.6: Wave observability logging
-# ---------------------------------------------------------------------------
-
-class TestWaveObservability:
-    """Task 9.6: Logging of wave number, tasks, spawned provenance, cancellations."""
-
-    @patch("agent.scout.dispatch_tool")
-    def test_logs_wave_number(self, mock_dispatch, capsys):
-        from agent.scout import run_scout
-        from agent.tracker import GroundingTracker
-
-        mock_dispatch.side_effect = _make_dispatch_side_effect({
-            ("tree", "/"): _tree_response([], []),
-        })
-
-        vm = MagicMock()
-        tracker = GroundingTracker()
-        run_scout(vm, tracker)
-
-        captured = capsys.readouterr()
-        assert "wave 1" in captured.out.lower(), (
-            f"Expected wave logging in stdout, got: {captured.out[:500]}"
-        )
-
-    @patch("agent.scout.dispatch_tool")
-    def test_logs_spawned_tasks(self, mock_dispatch, capsys):
-        from agent.scout import run_scout
-        from agent.tracker import GroundingTracker
-
-        mock_dispatch.side_effect = _make_dispatch_side_effect({
-            ("tree", "/"): _tree_response(["workspace"], ["AGENTS.MD"]),
-            ("read_file", "/AGENTS.MD"): _read_response("Policy"),
-            ("list_dir", "/workspace"): _list_response([], []),
-        })
-
-        vm = MagicMock()
-        tracker = GroundingTracker()
-        run_scout(vm, tracker)
-
-        captured = capsys.readouterr()
-        assert "spawn" in captured.out.lower(), (
-            f"Expected spawn logging in stdout, got: {captured.out[:500]}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Integration: full workspace scenario
-# ---------------------------------------------------------------------------
-
-class TestScoutFullScenario:
-    """Integration test: scout explores a realistic workspace."""
-
-    @patch("agent.scout.dispatch_tool")
-    def test_full_workspace_exploration(self, mock_dispatch):
-        """Simulate a workspace with AGENTS.MD redirect, meta-files, skills, numbered files."""
-        from agent.scout import run_scout
-        from agent.tracker import GroundingTracker
-
-        mock_dispatch.side_effect = _make_dispatch_side_effect({
-            # Wave 1: tree root
-            ("tree", "/"): _tree_response(
-                ["workspace", "skills", "data"], ["AGENTS.MD"]
-            ),
-            # Wave 2: read AGENTS.MD (redirect), list folders
-            ("read_file", "/AGENTS.MD"): _read_response("See README.MD"),
-            ("list_dir", "/workspace"): _list_response(
-                [], ["RULES.md", "PAY-1.md", "PAY-2.md", "PAY-3.md", "PAY-12.md"]
-            ),
-            ("list_dir", "/skills"): _list_response(
-                [], ["skill-todo.md", "_rules.txt"]
-            ),
-            ("list_dir", "/data"): _list_response([], ["report.csv"]),
-            # Wave 3: follow redirect, read meta-files, read highest numbered
-            ("read_file", "/README.MD"): _read_response("# Main Policy\nDo good things."),
-            ("read_file", "/workspace/RULES.md"): _read_response("Naming: PAY-N.md"),
-            ("read_file", "/workspace/PAY-12.md"): _read_response("Payment 12 content"),
-            ("read_file", "/skills/skill-todo.md"): _read_response("Todo skill content"),
-            ("read_file", "/skills/_rules.txt"): _read_response("Skills rules"),
-        })
-
-        vm = MagicMock()
-        tracker = GroundingTracker()
-        result = run_scout(vm, tracker)
-
-        # Verify ScoutSummary
-        assert result.directory_tree != ""
-
-        # Policy files should include AGENTS.MD, README.MD, RULES.md, _rules.txt
-        policy_paths = set(result.policy_files.keys())
-        assert any("AGENTS" in p for p in policy_paths), f"Missing AGENTS.MD in {policy_paths}"
-        assert any("README" in p for p in policy_paths), f"Missing README.MD in {policy_paths}"
-        assert any("RULES" in p for p in policy_paths), f"Missing RULES in {policy_paths}"
-
-        # Vault skills should include skill-todo.md
-        assert any("skill-todo" in p for p in result.vault_skills), (
-            f"Missing skill-todo in vault_skills: {list(result.vault_skills.keys())}"
-        )
-
-        # files_read should have all read files
-        assert len(result.files_read) >= 5  # At least AGENTS, README, RULES, PAY-12, skill-todo
-
-        # folders_explored should have all three top-level folders
-        assert len(result.folders_explored) >= 3
-
-    @patch("agent.scout.dispatch_tool")
-    def test_scout_populates_tracker(self, mock_dispatch):
-        """The tracker should contain all files read during scout."""
-        from agent.scout import run_scout
-        from agent.tracker import GroundingTracker
-
-        mock_dispatch.side_effect = _make_dispatch_side_effect({
-            ("tree", "/"): _tree_response(["workspace"], ["AGENTS.MD"]),
-            ("read_file", "/AGENTS.MD"): _read_response("Policy"),
-            ("list_dir", "/workspace"): _list_response([], ["RULES.md"]),
-            ("read_file", "/workspace/RULES.md"): _read_response("Rules"),
-        })
-
-        vm = MagicMock()
-        tracker = GroundingTracker()
-        run_scout(vm, tracker)
-
-        # Tracker should have files added during scout (read operations only)
-        assert len(tracker) >= 2  # At least AGENTS.MD and RULES.md
-
-    @patch("agent.scout.dispatch_tool")
-    def test_scout_handles_empty_tree(self, mock_dispatch):
-        """Scout should handle gracefully when tree returns nothing."""
-        from agent.scout import run_scout
-        from agent.tracker import GroundingTracker
-
-        mock_dispatch.side_effect = _make_dispatch_side_effect({
-            ("tree", "/"): _tree_response([], []),
-        })
-
-        vm = MagicMock()
-        tracker = GroundingTracker()
-        result = run_scout(vm, tracker)
-
-        assert result.policy_files == {}
-        assert result.vault_skills == {}
-        assert result.folders_explored == []

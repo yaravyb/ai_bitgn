@@ -9,13 +9,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import posixpath
+import uuid
 from pathlib import Path
 from typing import Any
 
 from bitgn.vm.mini_connect import MiniRuntimeClientSync
 
-from agent.scout import run_scout, ScoutSummary
+from agent.scout import run_scout, ScoutSummary, ScoutConfig
 from agent.llm import call_llm, LLMResponse
 from agent.dispatch import dispatch_parallel
 from agent.prompt import build_system_prompt
@@ -63,6 +65,24 @@ def _format_scout_context(summary: ScoutSummary) -> str:
         for f in sorted(summary.files_read):
             parts.append(f"- {f}")
 
+    # New: Scout Analysis section from LLM explorer (additive)
+    llm_summary = getattr(summary, "llm_summary", None)
+    completed_fully = getattr(summary, "completed_fully", True)
+    total_llm_steps = getattr(summary, "total_llm_steps", 0)
+
+    if llm_summary and llm_summary.strip():
+        parts.append("\n## Scout Analysis")
+        parts.append(llm_summary)
+
+    if not completed_fully:
+        if not (llm_summary and llm_summary.strip()):
+            parts.append("\n## Scout Analysis")
+        parts.append(
+            f"\n**Warning: Scout exploration was truncated by the step limit. "
+            f"Some areas may not have been fully explored. The scout completed "
+            f"{total_llm_steps} LLM rounds.**"
+        )
+
     parts.append("</scout-summary>")
     return "\n".join(parts)
 
@@ -97,10 +117,14 @@ def run_agent(
     print(f"Agent initialized: model={executor_model}")
 
     # ------------------------------------------------------------------
-    # 2. Scout Phase (LLM-free)
+    # 2. Scout Phase (two-phase: bootstrap + LLM explorer)
     # ------------------------------------------------------------------
     print("Scout phase starting...", flush=True)
-    summary = run_scout(vm, tracker)
+    scout_config = ScoutConfig(
+        model=scout_model or executor_model,
+        task_instruction=task_text,
+    )
+    summary = run_scout(vm, tracker, scout_config)
 
     # Expand protected_files with scout-discovered policy files
     for policy_path in summary.policy_files:
@@ -137,6 +161,16 @@ def run_agent(
     # ------------------------------------------------------------------
     # 4. Executor Phase (LLM-driven tool-use loop)
     # ------------------------------------------------------------------
+    trace_metadata = {
+        "trace_id": str(uuid.uuid4()),
+        "trace_name": "run_agent",
+        "session_id": os.environ.get("SESSION_ID", ""),
+        "trace_metadata": {
+            "model": executor_model,
+            "task": task_text[:200],
+        },
+    }
+
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
     ]
@@ -165,7 +199,7 @@ def run_agent(
         step_num = step + 1
         print(f"\nStep {step_num}... ", end="", flush=True)
 
-        response = call_llm(executor_model, messages, tools=TOOL_SCHEMAS)
+        response = call_llm(executor_model, messages, tools=TOOL_SCHEMAS, metadata=trace_metadata)
 
         # Build assistant message
         assistant_msg: dict[str, Any] = {"role": "assistant", "content": response.content}

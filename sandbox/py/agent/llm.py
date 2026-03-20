@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import time
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import litellm
@@ -78,6 +78,7 @@ def call_llm(
     messages: list[dict],
     tools: list[dict] | None = None,
     max_tokens: int = 16384,
+    metadata: dict | None = None,
 ) -> LLMResponse:
     """Call an LLM via LiteLLM with retry logic for transient failures.
 
@@ -86,6 +87,7 @@ def call_llm(
         messages: Conversation messages in OpenAI format.
         tools: OpenAI-compatible function schemas, or None.
         max_tokens: Maximum completion tokens.
+        metadata: Optional metadata dict for observability (e.g., Langfuse trace grouping).
 
     Returns:
         Parsed LLMResponse with content, tool_calls, and raw response.
@@ -102,6 +104,8 @@ def call_llm(
     if tools:
         kwargs["tools"] = tools
         kwargs["parallel_tool_calls"] = True
+    if metadata is not None:
+        kwargs["metadata"] = metadata
 
     last_exception: BaseException | None = None
     for attempt in range(_MAX_RETRIES):

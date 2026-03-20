@@ -2,6 +2,7 @@
 
 All dependencies (vm, llm, scout, dispatch, skills, prompt) are mocked.
 Tests verify the lifecycle flow: init -> scout -> prompt -> executor loop -> completion.
+Updated for two-phase scout architecture (Task 10).
 """
 
 from __future__ import annotations
@@ -13,6 +14,27 @@ from unittest.mock import MagicMock, patch, call
 import pytest
 
 from agent.llm import ToolCall
+
+
+# ---------------------------------------------------------------------------
+# Helper: create ScoutSummary-compatible mock
+# ---------------------------------------------------------------------------
+
+def _make_scout_summary_mock(**overrides):
+    """Create a mock ScoutSummary with all fields (including new LLM metadata)."""
+    defaults = dict(
+        policy_files={},
+        vault_skills={},
+        directory_tree="",
+        files_read=set(),
+        folders_explored=[],
+        llm_summary=None,
+        mode="llm",
+        total_llm_steps=0,
+        completed_fully=True,
+    )
+    defaults.update(overrides)
+    return MagicMock(**defaults)
 
 
 # ---------------------------------------------------------------------------
@@ -58,11 +80,7 @@ class TestLoopInitialization:
         """The VM client is created with the harness_url."""
         from agent.loop import run_agent
 
-        mock_run_scout.return_value = MagicMock(
-            policy_files={}, vault_skills={}, directory_tree="",
-            files_read=set(), folders_explored=[],
-        )
-        # LLM returns text-only (no tool calls) to end the loop immediately
+        mock_run_scout.return_value = _make_scout_summary_mock()
         mock_call_llm.return_value = MagicMock(
             content="done", tool_calls=[], raw=None,
         )
@@ -84,10 +102,7 @@ class TestLoopInitialization:
         """protected_files starts with 'agents.md'."""
         from agent.loop import run_agent
 
-        mock_run_scout.return_value = MagicMock(
-            policy_files={}, vault_skills={}, directory_tree="",
-            files_read=set(), folders_explored=[],
-        )
+        mock_run_scout.return_value = _make_scout_summary_mock()
         mock_call_llm.return_value = MagicMock(
             content="done", tool_calls=[], raw=None,
         )
@@ -127,10 +142,7 @@ class TestLoopInitialization:
         skills_dir = tmp_path / "skills"
         skills_dir.mkdir()
 
-        mock_run_scout.return_value = MagicMock(
-            policy_files={}, vault_skills={}, directory_tree="",
-            files_read=set(), folders_explored=[],
-        )
+        mock_run_scout.return_value = _make_scout_summary_mock()
         mock_call_llm.return_value = MagicMock(
             content="done", tool_calls=[], raw=None,
         )
@@ -157,10 +169,7 @@ class TestLoopInitialization:
         """When skills_dir is None, no SkillLoader error occurs."""
         from agent.loop import run_agent
 
-        mock_run_scout.return_value = MagicMock(
-            policy_files={}, vault_skills={}, directory_tree="",
-            files_read=set(), folders_explored=[],
-        )
+        mock_run_scout.return_value = _make_scout_summary_mock()
         mock_call_llm.return_value = MagicMock(
             content="done", tool_calls=[], raw=None,
         )
@@ -175,24 +184,22 @@ class TestLoopInitialization:
 
 
 # ---------------------------------------------------------------------------
-# Test 10.3: Scout phase invocation and protected_files expansion
+# Test 10.3: Scout phase invocation with ScoutConfig
 # ---------------------------------------------------------------------------
 
 class TestLoopScoutPhase:
-    """Verify the scout phase is called and protected_files are expanded."""
+    """Verify the scout phase is called with ScoutConfig and protected_files are expanded."""
 
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
     @patch("agent.loop.MiniRuntimeClientSync")
-    def test_run_scout_is_called(
+    def test_run_scout_called_with_scout_config(
         self, mock_vm_cls, mock_call_llm, mock_run_scout,
     ):
         from agent.loop import run_agent
+        from agent.scout import ScoutConfig
 
-        mock_run_scout.return_value = MagicMock(
-            policy_files={}, vault_skills={}, directory_tree="",
-            files_read=set(), folders_explored=[],
-        )
+        mock_run_scout.return_value = _make_scout_summary_mock()
         mock_call_llm.return_value = MagicMock(
             content="done", tool_calls=[], raw=None,
         )
@@ -201,12 +208,42 @@ class TestLoopScoutPhase:
             executor_model="openai/gpt-4.1",
             harness_url="http://test:1234",
             task_text="do something",
+            scout_model="openai/gpt-4.1-mini",
         )
 
         mock_run_scout.assert_called_once()
-        # First arg should be the VM instance
         args = mock_run_scout.call_args[0]
-        assert args[0] == mock_vm_cls.return_value
+        # First arg is VM, second is tracker, third is ScoutConfig
+        assert len(args) == 3
+        config = args[2]
+        assert isinstance(config, ScoutConfig)
+        assert config.model == "openai/gpt-4.1-mini"
+        assert config.task_instruction == "do something"
+
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    @patch("agent.loop.MiniRuntimeClientSync")
+    def test_scout_model_defaults_to_executor_model(
+        self, mock_vm_cls, mock_call_llm, mock_run_scout,
+    ):
+        from agent.loop import run_agent
+        from agent.scout import ScoutConfig
+
+        mock_run_scout.return_value = _make_scout_summary_mock()
+        mock_call_llm.return_value = MagicMock(
+            content="done", tool_calls=[], raw=None,
+        )
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            harness_url="http://test:1234",
+            task_text="test task",
+            scout_model=None,  # Should default to executor model
+        )
+
+        config = mock_run_scout.call_args[0][2]
+        assert isinstance(config, ScoutConfig)
+        assert config.model == "openai/gpt-4.1"
 
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
@@ -218,15 +255,11 @@ class TestLoopScoutPhase:
         """Policy files from scout summary expand protected_files."""
         from agent.loop import run_agent
 
-        mock_run_scout.return_value = MagicMock(
+        mock_run_scout.return_value = _make_scout_summary_mock(
             policy_files={
                 "workspace/RULES.md": "some rules",
                 "skills/_rules.txt": "skill rules",
             },
-            vault_skills={},
-            directory_tree="",
-            files_read=set(),
-            folders_explored=[],
         )
 
         tc = ToolCall(id="tc1", name="read_file", arguments={"path": "x.md"})
@@ -266,10 +299,7 @@ class TestLoopSystemPrompt:
     ):
         from agent.loop import run_agent
 
-        mock_run_scout.return_value = MagicMock(
-            policy_files={}, vault_skills={}, directory_tree="",
-            files_read=set(), folders_explored=[],
-        )
+        mock_run_scout.return_value = _make_scout_summary_mock()
         mock_call_llm.return_value = MagicMock(
             content="done", tool_calls=[], raw=None,
         )
@@ -298,9 +328,8 @@ class TestLoopSystemPrompt:
         skills_dir = tmp_path / "skills"
         skills_dir.mkdir()
 
-        mock_run_scout.return_value = MagicMock(
+        mock_run_scout.return_value = _make_scout_summary_mock(
             policy_files={"p.md": "content"},
-            vault_skills={},
             directory_tree="tree output",
             files_read={"p.md"},
             folders_explored=["workspace"],
@@ -343,10 +372,7 @@ class TestLoopExecutorPhase:
         """The task text is wrapped in <task> delimiters in the user message."""
         from agent.loop import run_agent
 
-        mock_run_scout.return_value = MagicMock(
-            policy_files={}, vault_skills={}, directory_tree="",
-            files_read=set(), folders_explored=[],
-        )
+        mock_run_scout.return_value = _make_scout_summary_mock()
         mock_call_llm.return_value = MagicMock(
             content="done", tool_calls=[], raw=None,
         )
@@ -380,10 +406,7 @@ class TestLoopExecutorPhase:
         """When LLM returns tool calls, they are dispatched and results appended."""
         from agent.loop import run_agent
 
-        mock_run_scout.return_value = MagicMock(
-            policy_files={}, vault_skills={}, directory_tree="",
-            files_read=set(), folders_explored=[],
-        )
+        mock_run_scout.return_value = _make_scout_summary_mock()
 
         tc1 = ToolCall(id="tc_1", name="read_file", arguments={"path": "a.md"})
         tc2 = ToolCall(id="tc_2", name="list_dir", arguments={"path": "/"})
@@ -424,10 +447,7 @@ class TestLoopExecutorPhase:
         """Loop breaks when report_completion tool is called."""
         from agent.loop import run_agent
 
-        mock_run_scout.return_value = MagicMock(
-            policy_files={}, vault_skills={}, directory_tree="",
-            files_read=set(), folders_explored=[],
-        )
+        mock_run_scout.return_value = _make_scout_summary_mock()
 
         tc = ToolCall(
             id="tc_1", name="report_completion",
@@ -457,10 +477,7 @@ class TestLoopExecutorPhase:
         """Loop breaks when LLM returns text only (no tool calls)."""
         from agent.loop import run_agent
 
-        mock_run_scout.return_value = MagicMock(
-            policy_files={}, vault_skills={}, directory_tree="",
-            files_read=set(), folders_explored=[],
-        )
+        mock_run_scout.return_value = _make_scout_summary_mock()
         mock_call_llm.return_value = MagicMock(
             content="I'm done", tool_calls=[], raw=None,
         )
@@ -484,10 +501,7 @@ class TestLoopExecutorPhase:
         """Executor loop stops after 30 steps."""
         from agent.loop import run_agent
 
-        mock_run_scout.return_value = MagicMock(
-            policy_files={}, vault_skills={}, directory_tree="",
-            files_read=set(), folders_explored=[],
-        )
+        mock_run_scout.return_value = _make_scout_summary_mock()
 
         tc = ToolCall(id="tc1", name="read_file", arguments={"path": "x.md"})
         mock_call_llm.return_value = MagicMock(
@@ -514,10 +528,7 @@ class TestLoopExecutorPhase:
         """Assistant message appended to history has proper tool_calls format."""
         from agent.loop import run_agent
 
-        mock_run_scout.return_value = MagicMock(
-            policy_files={}, vault_skills={}, directory_tree="",
-            files_read=set(), folders_explored=[],
-        )
+        mock_run_scout.return_value = _make_scout_summary_mock()
 
         tc = ToolCall(id="tc_1", name="read_file", arguments={"path": "a.md"})
         mock_call_llm.side_effect = [
@@ -533,12 +544,10 @@ class TestLoopExecutorPhase:
         )
 
         # Check the second call_llm's messages for the assistant message
-        # The first assistant message (from step 1) should have tool_calls
         second_call = mock_call_llm.call_args_list[1]
         messages = second_call[0][1] if len(second_call[0]) > 1 else second_call[1]["messages"]
         assistant_msgs = [m for m in messages if m.get("role") == "assistant"]
         assert len(assistant_msgs) >= 1
-        # The first assistant message should have tool_calls (it was the one with tools)
         first_asst = assistant_msgs[0]
         assert "tool_calls" in first_asst
         assert first_asst["tool_calls"][0]["type"] == "function"
@@ -556,10 +565,7 @@ class TestLoopExecutorPhase:
         from agent.loop import run_agent
         from agent.tools import TOOL_SCHEMAS
 
-        mock_run_scout.return_value = MagicMock(
-            policy_files={}, vault_skills={}, directory_tree="",
-            files_read=set(), folders_explored=[],
-        )
+        mock_run_scout.return_value = _make_scout_summary_mock()
         mock_call_llm.return_value = MagicMock(
             content="done", tool_calls=[], raw=None,
         )
@@ -585,10 +591,7 @@ class TestLoopExecutorPhase:
         """The executor_model parameter is forwarded to call_llm."""
         from agent.loop import run_agent
 
-        mock_run_scout.return_value = MagicMock(
-            policy_files={}, vault_skills={}, directory_tree="",
-            files_read=set(), folders_explored=[],
-        )
+        mock_run_scout.return_value = _make_scout_summary_mock()
         mock_call_llm.return_value = MagicMock(
             content="done", tool_calls=[], raw=None,
         )
@@ -637,7 +640,7 @@ class TestLoopScoutContextInjection:
     ):
         from agent.loop import run_agent
 
-        mock_run_scout.return_value = MagicMock(
+        mock_run_scout.return_value = _make_scout_summary_mock(
             policy_files={"AGENTS.MD": "policy content"},
             vault_skills={"skills/skill-todo.md": "todo skill"},
             directory_tree='{"entries": []}',
@@ -660,6 +663,133 @@ class TestLoopScoutContextInjection:
         # There should be a message containing scout summary info
         all_content = " ".join(m.get("content", "") or "" for m in messages)
         assert "<scout-summary>" in all_content or "scout" in all_content.lower()
+
+
+# ---------------------------------------------------------------------------
+# Test: _format_scout_context with llm_summary and truncation warning (Task 10)
+# ---------------------------------------------------------------------------
+
+class TestFormatScoutContext:
+    """Test _format_scout_context with new ScoutSummary fields."""
+
+    def test_includes_scout_analysis_when_llm_summary_present(self):
+        from agent.loop import _format_scout_context
+        from agent.scout import ScoutSummary
+
+        summary = ScoutSummary(
+            directory_tree="tree output",
+            policy_files={"AGENTS.MD": "policy"},
+            vault_skills={},
+            files_read={"AGENTS.MD"},
+            folders_explored=["workspace"],
+            llm_summary="Found 3 policy files and 2 skills.",
+            mode="llm",
+            total_llm_steps=5,
+            completed_fully=True,
+        )
+
+        result = _format_scout_context(summary)
+        assert "## Scout Analysis" in result
+        assert "Found 3 policy files and 2 skills." in result
+
+    def test_includes_truncation_warning_when_not_completed_fully(self):
+        from agent.loop import _format_scout_context
+        from agent.scout import ScoutSummary
+
+        summary = ScoutSummary(
+            directory_tree="tree output",
+            policy_files={},
+            vault_skills={},
+            files_read=set(),
+            folders_explored=[],
+            llm_summary=None,
+            mode="llm",
+            total_llm_steps=20,
+            completed_fully=False,
+        )
+
+        result = _format_scout_context(summary)
+        assert "truncat" in result.lower() or "Warning" in result
+        assert "20" in result
+
+    def test_no_scout_analysis_when_llm_summary_none(self):
+        from agent.loop import _format_scout_context
+        from agent.scout import ScoutSummary
+
+        summary = ScoutSummary(
+            directory_tree="tree output",
+            policy_files={},
+            vault_skills={},
+            files_read=set(),
+            folders_explored=[],
+            llm_summary=None,
+            mode="llm",
+            total_llm_steps=0,
+            completed_fully=True,
+        )
+
+        result = _format_scout_context(summary)
+        assert "## Scout Analysis" not in result
+
+    def test_no_scout_analysis_when_llm_summary_empty(self):
+        from agent.loop import _format_scout_context
+        from agent.scout import ScoutSummary
+
+        summary = ScoutSummary(
+            directory_tree="tree output",
+            policy_files={},
+            vault_skills={},
+            files_read=set(),
+            folders_explored=[],
+            llm_summary="",
+            mode="llm",
+            total_llm_steps=0,
+            completed_fully=True,
+        )
+
+        result = _format_scout_context(summary)
+        assert "## Scout Analysis" not in result
+
+    def test_truncation_warning_even_without_llm_summary(self):
+        """When step limit hit (no summary), truncation warning should appear."""
+        from agent.loop import _format_scout_context
+        from agent.scout import ScoutSummary
+
+        summary = ScoutSummary(
+            directory_tree="tree output",
+            policy_files={},
+            vault_skills={},
+            files_read=set(),
+            folders_explored=[],
+            llm_summary=None,
+            mode="llm",
+            total_llm_steps=20,
+            completed_fully=False,
+        )
+
+        result = _format_scout_context(summary)
+        assert "truncat" in result.lower() or "Warning" in result
+
+    def test_backward_compat_with_old_summary(self):
+        """Using getattr pattern, old-style summary without new fields should work."""
+        from agent.loop import _format_scout_context
+
+        # Simulate an old-style summary without new fields
+        old_summary = MagicMock()
+        old_summary.directory_tree = "tree"
+        old_summary.policy_files = {}
+        old_summary.vault_skills = {}
+        old_summary.files_read = set()
+        old_summary.folders_explored = []
+        # MagicMock will return a MagicMock for any attribute access,
+        # so we explicitly test the getattr default behavior
+        del old_summary.llm_summary
+        del old_summary.completed_fully
+        del old_summary.total_llm_steps
+
+        result = _format_scout_context(old_summary)
+        assert "<scout-summary>" in result
+        assert "</scout-summary>" in result
 
 
 # ---------------------------------------------------------------------------

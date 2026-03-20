@@ -1,0 +1,29 @@
+{
+  "featureName": "scout-phase-optimization",
+  "description": "Two-Phase LLM Scout: Replace deterministic DAG scout with fast bootstrap (tree + root meta-files) followed by LLM-driven tool-use explorer reusing call_llm, dispatch_parallel, and TOOL_SCHEMAS for task-aware, quality-first workspace discovery. Scout model defaults to executor model.",
+  "codeName": "scout-phase-optimization",
+  "language": "en",
+  "createdAt": "2026-03-20T00:00:00Z",
+  "updatedAt": "2026-03-20T21:00:00Z",
+  "status": "implementation-complete",
+  "phases": {
+    "requirements": "generated",
+    "design": "generated",
+    "tasks": "generated",
+    "implementation": "complete"
+  },
+  "approvals": {
+    "requirements": {
+      "generated": true,
+      "approved": true
+    },
+    "design": {
+      "generated": true,
+      "approved": true
+    },
+    "tasks": {
+      "generated": true,
+      "approved": false
+    }
+  }
+}
