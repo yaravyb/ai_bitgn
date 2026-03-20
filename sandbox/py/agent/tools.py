@@ -176,3 +176,11 @@ TOOL_SCHEMAS: list[dict] = [
 ]
 
 TOOL_NAMES: set[str] = {s["function"]["name"] for s in TOOL_SCHEMAS}
+
+# Read-only tool subset for the scout phase (Task 1)
+_SCOUT_TOOL_NAMES: frozenset[str] = frozenset({"tree", "list_dir", "read_file", "search"})
+
+SCOUT_TOOL_SCHEMAS: list[dict] = [
+    s for s in TOOL_SCHEMAS
+    if s["function"]["name"] in _SCOUT_TOOL_NAMES
+]

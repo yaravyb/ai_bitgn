@@ -171,6 +171,54 @@ class TestSpecificToolSchemas:
         assert props["count"]["default"] == 5
 
 
+# ---------------------------------------------------------------------------
+# SCOUT_TOOL_SCHEMAS tests (Task 1)
+# ---------------------------------------------------------------------------
+
+class TestScoutToolSchemas:
+    """Task 1: SCOUT_TOOL_SCHEMAS is a read-only subset of TOOL_SCHEMAS."""
+
+    def test_scout_tool_schemas_exists(self):
+        from agent.tools import SCOUT_TOOL_SCHEMAS
+        assert isinstance(SCOUT_TOOL_SCHEMAS, list)
+
+    def test_scout_tool_schemas_has_four_entries(self):
+        from agent.tools import SCOUT_TOOL_SCHEMAS
+        assert len(SCOUT_TOOL_SCHEMAS) == 4
+
+    def test_scout_tool_schemas_contains_correct_tools(self):
+        from agent.tools import SCOUT_TOOL_SCHEMAS
+        names = {s["function"]["name"] for s in SCOUT_TOOL_SCHEMAS}
+        assert names == {"tree", "list_dir", "read_file", "search"}
+
+    def test_scout_tool_schemas_is_subset_of_tool_schemas(self):
+        """SCOUT_TOOL_SCHEMAS entries must be the same objects from TOOL_SCHEMAS."""
+        from agent.tools import TOOL_SCHEMAS, SCOUT_TOOL_SCHEMAS
+        for scout_schema in SCOUT_TOOL_SCHEMAS:
+            assert scout_schema in TOOL_SCHEMAS, (
+                f"Scout schema {scout_schema['function']['name']} not in TOOL_SCHEMAS"
+            )
+
+    def test_scout_tool_schemas_derived_by_filtering(self):
+        """Schemas must be the exact same dict objects (not copies)."""
+        from agent.tools import TOOL_SCHEMAS, SCOUT_TOOL_SCHEMAS
+        tool_map = {id(s): s for s in TOOL_SCHEMAS}
+        for scout_schema in SCOUT_TOOL_SCHEMAS:
+            assert id(scout_schema) in tool_map, (
+                "SCOUT_TOOL_SCHEMAS must reference same objects as TOOL_SCHEMAS"
+            )
+
+    def test_scout_tool_names_is_frozenset(self):
+        from agent.tools import _SCOUT_TOOL_NAMES
+        assert isinstance(_SCOUT_TOOL_NAMES, frozenset)
+
+    def test_existing_exports_unchanged(self):
+        """TOOL_SCHEMAS and TOOL_NAMES must still be present and correct."""
+        from agent.tools import TOOL_SCHEMAS, TOOL_NAMES
+        assert len(TOOL_SCHEMAS) == 8
+        assert len(TOOL_NAMES) == 8
+
+
 class TestToolsModuleIsLeaf:
     """Task 1.2: tools.py must have zero imports from other agent/ modules."""
 

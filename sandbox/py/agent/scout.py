@@ -1,27 +1,31 @@
-"""Scout phase: reactive DAG-based workspace discovery.
+"""Scout phase: two-phase LLM-driven workspace discovery.
 
-Imports from dag, dispatch, and tracker only (no LLM, no prompt, no skills).
-Drives a deterministic (LLM-free) exploration of the workspace using
-dispatch_tool for VM operations and a reactive TaskGraph.
+Phase 1 (Deterministic Bootstrap): tree("/") + read root meta-files.
+Phase 2 (LLM Explorer): tool-use loop using call_llm + dispatch_parallel.
+
+Imports from llm, dispatch, tracker, tools, and prompt.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
-from concurrent.futures import ThreadPoolExecutor
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from agent.dag import Task, TaskGraph, TaskStatus, TaskType
-from agent.dispatch import dispatch_tool
+from agent.dispatch import dispatch_tool, dispatch_parallel
+from agent.llm import call_llm
+from agent.prompt import build_scout_prompt
+from agent.tools import SCOUT_TOOL_SCHEMAS
 from agent.tracker import GroundingTracker
 
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Meta-file detection patterns (design section 5.2)
+# Meta-file detection patterns (retained from original)
 # ---------------------------------------------------------------------------
 
 META_PATTERNS: list[re.Pattern[str]] = [
@@ -39,11 +43,7 @@ META_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r".*config.*\..*$", re.IGNORECASE),
 ]
 
-# Regex for detecting numbered files: prefix + number + extension
-_NUMBERED_FILE_RE = re.compile(r"^(.+?)(\d+)(\.\w+)$")
-
-# Redirect patterns in read content
-# Handles: "See CLAUDE.MD", "See 'CLAUDE.MD'", 'See "CLAUDE.MD"', "refer to README.md"
+# Redirect patterns in read content (retained)
 _REDIRECT_RE = re.compile(
     r"(?:see|refer to|check|read)\s+['\"`]?(\S+\.(?:md|txt))['\"`]?",
     re.IGNORECASE,
@@ -55,17 +55,45 @@ _REDIRECT_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 @dataclass
+class ScoutConfig:
+    """Configuration for the two-phase scout."""
+
+    model: str                  # Required: LiteLLM model identifier for scout LLM
+    task_instruction: str       # Required: user's task text for task-aware exploration
+    max_steps: int = 20        # Maximum LLM call rounds in Phase 2
+    max_workers: int = 4       # Thread pool size for parallel tool dispatch
+
+
+@dataclass
+class BootstrapContext:
+    """Internal: results from Phase 1 deterministic bootstrap."""
+
+    directory_tree: str                 # Raw JSON output from tree("/")
+    root_policy_files: dict[str, str]   # path -> content for root .md/.txt files
+    root_vault_skills: dict[str, str]   # path -> content for root skill-*.* files
+    files_read: set[str]                # All files read during bootstrap
+    folders_discovered: list[str]       # Top-level folders from tree output
+
+
+@dataclass
 class ScoutSummary:
     """Summary returned by the scout phase, injected into executor context.
 
     All fields are plain Python types (no protobuf or LLM dependency).
     """
 
+    # Existing fields (backward-compatible)
     directory_tree: str = ""
     policy_files: dict[str, str] = field(default_factory=dict)
     vault_skills: dict[str, str] = field(default_factory=dict)
     files_read: set[str] = field(default_factory=set)
     folders_explored: list[str] = field(default_factory=list)
+
+    # New additive fields
+    llm_summary: str | None = None       # LLM's final structured text analysis
+    mode: str = "llm"                    # Always "llm" in new architecture
+    total_llm_steps: int = 0             # Number of LLM call rounds in Phase 2
+    completed_fully: bool = False        # True if LLM returned text naturally
 
 
 # ---------------------------------------------------------------------------
@@ -77,269 +105,274 @@ def is_meta_file(filename: str) -> bool:
     return any(p.match(filename) for p in META_PATTERNS)
 
 
-def detect_numbered_files(filenames: list[str]) -> dict[str, str]:
-    """Detect groups of numbered files and return the highest in each group.
+# ---------------------------------------------------------------------------
+# Phase 1: Deterministic Bootstrap
+# ---------------------------------------------------------------------------
 
-    Groups files by (prefix, extension). If a group has 3+ members with
-    numeric suffixes, returns {group_key: highest_filename}.
+def _run_bootstrap(
+    vm: Any,
+    tracker: GroundingTracker,
+    protected_files: set[str],
+) -> BootstrapContext:
+    """Phase 1: tree("/") + read root-level text files.
+
+    Args:
+        vm: MiniRuntimeClientSync instance.
+        tracker: GroundingTracker to record files read.
+        protected_files: Set of protected file paths.
 
     Returns:
-        dict mapping group key to the highest-numbered filename.
+        BootstrapContext with directory tree, root files, and folder list.
     """
-    groups: dict[tuple[str, str], list[tuple[int, str]]] = {}
+    # Step 1: Get full directory tree
+    tree_result = dispatch_tool(vm, "tree", {"path": "/"}, tracker, protected_files)
 
-    for fname in filenames:
-        m = _NUMBERED_FILE_RE.match(fname)
-        if not m:
-            continue
-        prefix = m.group(1)
-        number = int(m.group(2))
-        ext = m.group(3)
-        key = (prefix, ext)
-        if key not in groups:
-            groups[key] = []
-        groups[key].append((number, fname))
+    directory_tree = tree_result
+    folders_discovered: list[str] = []
+    root_files: list[str] = []
 
-    result: dict[str, str] = {}
-    for key, members in groups.items():
-        if len(members) >= 3:
-            members.sort(key=lambda x: x[0])
-            highest_fname = members[-1][1]
-            group_key = f"{key[0]}*{key[1]}"
-            result[group_key] = highest_fname
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Internal collector for accumulating results during exploration
-# ---------------------------------------------------------------------------
-
-class _ScoutCollector:
-    """Mutable accumulator for scout results during wave execution."""
-
-    def __init__(self) -> None:
-        self.directory_tree: str = ""
-        self.policy_files: dict[str, str] = {}
-        self.vault_skills: dict[str, str] = {}
-        self.files_read: set[str] = set()
-        self.folders_explored: list[str] = []
-
-
-# ---------------------------------------------------------------------------
-# Reactor rules (deterministic, no LLM)
-# ---------------------------------------------------------------------------
-
-def _react_tree(
-    task: Task,
-    result_json: str,
-    graph: TaskGraph,
-    collector: _ScoutCollector,
-) -> None:
-    """React to a completed tree task: spawn reads and lists."""
     try:
-        data = json.loads(result_json)
-    except (json.JSONDecodeError, TypeError):
-        return
-
-    collector.directory_tree = result_json
-
-    # OutlineResponse format: {"path": "/", "folders": ["dir1", ...], "files": [{"path": "f.md", "headers": [...]}]}
-    folders: list[str] = data.get("folders", [])
-    raw_files = data.get("files", [])
-    files: list[str] = []
-    for f in raw_files:
-        if isinstance(f, dict):
-            files.append(f.get("path", ""))
-        else:
-            files.append(str(f))
-
-    # Spawn read for all root-level text files (AGENTS.MD, README.MD, etc.)
-    # Root files are likely policy/config files and should be read during scout
-    for f in files:
-        ext = f.rsplit(".", 1)[-1].lower() if "." in f else ""
-        if ext in ("md", "txt"):
-            tid = graph.add(Task(
-                id="",
-                type=TaskType.READ,
-                args={"path": f"/{f}"},
-                parent_id=task.id,
-                spawn_reason=f"tree found root file {f}",
-            ))
-            log.debug("Spawned read(%s) from %s: tree found root file", tid, task.id)
-
-    # Spawn list for each top-level folder
-    for folder in folders:
-        tid = graph.add(Task(
-            id="",
-            type=TaskType.LIST,
-            args={"path": f"/{folder}"},
-            parent_id=task.id,
-            spawn_reason=f"tree found folder /{folder}",
-        ))
-        collector.folders_explored.append(folder)
-        log.debug("Spawned list(%s) from %s: tree found folder /%s", tid, task.id, folder)
-
-
-def _react_list(
-    task: Task,
-    result_json: str,
-    graph: TaskGraph,
-    collector: _ScoutCollector,
-) -> None:
-    """React to a completed list task: spawn reads for meta-files, lists for subfolders."""
-    try:
-        data = json.loads(result_json)
-    except (json.JSONDecodeError, TypeError):
-        return
-
-    parent_path = task.args.get("path", "/")
-
-    # ListResponse format: {"folders": ["dir1", ...], "files": ["file1.md", ...]}
-    folders: list[str] = data.get("folders", [])
-    files: list[str] = data.get("files", [])
-
-    # Detect numbered file groups
-    numbered = detect_numbered_files(files)
-    numbered_highest = set(numbered.values())
-
-    # Build set of all files that belong to a numbered group
-    numbered_group_members: set[str] = set()
-    for fname in files:
-        m = _NUMBERED_FILE_RE.match(fname)
-        if m:
-            prefix = m.group(1)
-            ext = m.group(3)
-            key = f"{prefix}*{ext}"
-            if key in numbered:
-                numbered_group_members.add(fname)
-
-    for f in files:
-        file_path = f"{parent_path.rstrip('/')}/{f}"
-
-        if is_meta_file(f):
-            # Always read meta-files
-            tid = graph.add(Task(
-                id="",
-                type=TaskType.READ,
-                args={"path": file_path},
-                parent_id=task.id,
-                spawn_reason=f"meta-file detected: {f}",
-            ))
-            log.debug("Spawned read(%s) from %s: meta-file %s", tid, task.id, f)
-        elif f in numbered_highest:
-            # Highest numbered file in a group
-            tid = graph.add(Task(
-                id="",
-                type=TaskType.READ,
-                args={"path": file_path},
-                parent_id=task.id,
-                spawn_reason=f"highest numbered file in group: {f}",
-            ))
-            log.debug(
-                "Spawned read(%s) from %s: highest numbered %s", tid, task.id, f,
-            )
-        elif f in numbered_group_members:
-            # Skip non-highest members of numbered groups
-            log.debug("Skipping %s (member of numbered group, not highest)", f)
-
-    # Spawn list for subfolders
-    for folder in folders:
-        folder_path = f"{parent_path.rstrip('/')}/{folder}"
-        tid = graph.add(Task(
-            id="",
-            type=TaskType.LIST,
-            args={"path": folder_path},
-            parent_id=task.id,
-            spawn_reason=f"subfolder found: {folder}",
-        ))
-        log.debug("Spawned list(%s) from %s: subfolder %s", tid, task.id, folder)
-
-
-def _react_read(
-    task: Task,
-    result_json: str,
-    graph: TaskGraph,
-    collector: _ScoutCollector,
-) -> None:
-    """React to a completed read task: detect redirects, classify content."""
-    try:
-        data = json.loads(result_json)
-    except (json.JSONDecodeError, TypeError):
-        return
-
-    file_path = task.args.get("path", "")
-    content = data.get("content", "")
-
-    # Classify the file
-    filename = file_path.rsplit("/", 1)[-1] if "/" in file_path else file_path
-    is_skill = filename.lower().startswith("skill-")
-    is_meta = is_meta_file(filename)
-    # Redirect targets of policy files are also policy files
-    is_redirect_target = task.spawn_reason is not None and "redirect" in task.spawn_reason.lower()
-    # Root-level files read by the tree reactor are potential policy files
-    is_root_file = file_path.lstrip("/").count("/") == 0
-
-    if is_meta or is_redirect_target or is_root_file:
-        collector.policy_files[file_path.lstrip("/")] = content
-    if is_skill:
-        collector.vault_skills[file_path.lstrip("/")] = content
-
-    collector.files_read.add(file_path.lstrip("/"))
-
-    # Detect redirects in content
-    if content:
-        redirect_match = _REDIRECT_RE.search(content)
-        if redirect_match:
-            target = redirect_match.group(1).strip("'\"` ")
-            if not target.startswith("/"):
-                target_path = f"/{target}"
+        data = json.loads(tree_result)
+        folders_discovered = data.get("folders", [])
+        raw_files = data.get("files", [])
+        for f in raw_files:
+            if isinstance(f, dict):
+                root_files.append(f.get("path", ""))
             else:
-                target_path = target
+                root_files.append(str(f))
+    except (json.JSONDecodeError, TypeError):
+        log.warning("Failed to parse tree response, proceeding with empty bootstrap")
 
-            try:
-                tid = graph.add(Task(
-                    id="",
-                    type=TaskType.READ,
-                    args={"path": target_path},
-                    parent_id=task.id,
-                    spawn_reason=(
-                        f"redirect from {file_path}: "
-                        f"'{redirect_match.group(0).strip()}'"
-                    ),
-                ))
-                log.debug(
-                    "Spawned read(%s) from %s: redirect to %s",
-                    tid, task.id, target_path,
-                )
-            except ValueError:
-                pass
+    # Step 2: Read root-level .md and .txt files
+    root_policy_files: dict[str, str] = {}
+    root_vault_skills: dict[str, str] = {}
+    files_read: set[str] = set()
+
+    for filename in root_files:
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        if ext not in ("md", "txt"):
+            continue
+
+        file_path = f"/{filename}"
+        read_result = dispatch_tool(vm, "read_file", {"path": file_path}, tracker, protected_files)
+
+        try:
+            read_data = json.loads(read_result)
+            content = read_data.get("content", "")
+        except (json.JSONDecodeError, TypeError):
+            content = ""
+
+        files_read.add(filename)
+
+        # Classify
+        basename = filename.rsplit("/", 1)[-1] if "/" in filename else filename
+        if basename.lower().startswith("skill-"):
+            root_vault_skills[filename] = content
+        if is_meta_file(basename):
+            root_policy_files[filename] = content
+
+    log.debug(
+        "Bootstrap: %d folders, %d policy files, %d vault skills",
+        len(folders_discovered), len(root_policy_files), len(root_vault_skills),
+    )
+
+    return BootstrapContext(
+        directory_tree=directory_tree,
+        root_policy_files=root_policy_files,
+        root_vault_skills=root_vault_skills,
+        files_read=files_read,
+        folders_discovered=folders_discovered,
+    )
+
+
+def _format_bootstrap_for_prompt(ctx: BootstrapContext) -> str:
+    """Format bootstrap context as a human-readable string for the scout prompt.
+
+    Includes the directory tree and each root policy file's content.
+    """
+    parts: list[str] = []
+
+    parts.append("## Directory Tree")
+    parts.append(ctx.directory_tree)
+
+    if ctx.root_policy_files:
+        parts.append("\n## Root Policy Files")
+        for path, content in sorted(ctx.root_policy_files.items()):
+            parts.append(f"### {path}")
+            parts.append(content)
+
+    if ctx.root_vault_skills:
+        parts.append("\n## Root Vault Skills")
+        for path, content in sorted(ctx.root_vault_skills.items()):
+            parts.append(f"### {path}")
+            parts.append(content)
+
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
-# Reactor dispatch table
+# Phase 2: LLM Explorer
 # ---------------------------------------------------------------------------
 
-_REACTORS = {
-    TaskType.TREE: _react_tree,
-    TaskType.LIST: _react_list,
-    TaskType.READ: _react_read,
-}
+def _run_llm_explorer(
+    vm: Any,
+    tracker: GroundingTracker,
+    config: ScoutConfig,
+    bootstrap: BootstrapContext,
+    protected_files: set[str],
+) -> tuple[str | None, int, bool, list[tuple[str, str, str]], list[str]]:
+    """Phase 2: LLM-driven exploration loop.
+
+    Returns:
+        (llm_summary, total_steps, completed_fully, accumulated_reads, phase2_folders)
+        where accumulated_reads is a list of (tool_name, file_path, result_json) tuples.
+    """
+    # Build scout prompt
+    formatted_context = _format_bootstrap_for_prompt(bootstrap)
+    scout_prompt = build_scout_prompt(config.task_instruction, formatted_context)
+
+    # Initialize messages (user message required by some providers like Bedrock)
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": scout_prompt},
+        {"role": "user", "content": "Begin workspace exploration."},
+    ]
+
+    # Scout-specific trace metadata
+    trace_metadata = {
+        "trace_id": str(uuid.uuid4()),
+        "trace_name": "scout_llm_explorer",
+        "session_id": os.environ.get("SESSION_ID", ""),
+        "trace_metadata": {
+            "model": config.model,
+            "phase": "scout",
+        },
+    }
+
+    llm_summary: str | None = None
+    completed_fully = False
+    total_steps = 0
+    accumulated_reads: list[tuple[str, str, str]] = []
+    phase2_folders: list[str] = []
+
+    for step in range(config.max_steps):
+        total_steps += 1
+
+        response = call_llm(
+            config.model,
+            messages,
+            tools=SCOUT_TOOL_SCHEMAS,
+            metadata=trace_metadata,
+        )
+
+        # Build assistant message
+        assistant_msg: dict[str, Any] = {"role": "assistant", "content": response.content}
+        if response.tool_calls:
+            assistant_msg["tool_calls"] = [
+                {
+                    "type": "function",
+                    "id": tc.id,
+                    "function": {
+                        "name": tc.name,
+                        "arguments": json.dumps(tc.arguments),
+                    },
+                }
+                for tc in response.tool_calls
+            ]
+        messages.append(assistant_msg)
+
+        # Check for natural completion (text response, no tool calls)
+        if not response.tool_calls:
+            llm_summary = response.content
+            completed_fully = True
+            log.debug("Scout LLM completed naturally at step %d", total_steps)
+            break
+
+        # Track list_dir calls for folders_explored
+        for tc in response.tool_calls:
+            if tc.name == "list_dir":
+                path = tc.arguments.get("path", "/")
+                phase2_folders.append(path)
+
+        # Dispatch tool calls
+        results = dispatch_parallel(
+            vm, response.tool_calls, tracker, protected_files,
+            max_workers=config.max_workers,
+        )
+
+        # Accumulate read_file results for later classification
+        for tc in response.tool_calls:
+            if tc.name == "read_file":
+                file_path = tc.arguments.get("path", "")
+                # Find the matching result
+                for result_id, result_json in results:
+                    if result_id == tc.id:
+                        accumulated_reads.append((tc.name, file_path, result_json))
+                        break
+
+        # Append tool result messages
+        for tool_call_id, result_text in results:
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": result_text,
+            })
+
+    if not completed_fully:
+        log.warning(
+            "Scout LLM hit step limit (%d steps)", config.max_steps,
+        )
+
+    return (llm_summary, total_steps, completed_fully, accumulated_reads, phase2_folders)
 
 
 # ---------------------------------------------------------------------------
-# Tool name mapping
+# Summary builder
 # ---------------------------------------------------------------------------
 
-def _tool_name(task_type: TaskType) -> str:
-    """Map a DAG TaskType to the dispatch tool name."""
-    if task_type == TaskType.LIST:
-        return "list_dir"
-    if task_type == TaskType.READ:
-        return "read_file"
-    if task_type == TaskType.TREE:
-        return "tree"
-    return task_type.value
+def _build_summary(
+    bootstrap: BootstrapContext,
+    tracker: GroundingTracker,
+    llm_summary: str | None,
+    total_steps: int,
+    completed_fully: bool,
+    accumulated_reads: list[tuple[str, str, str]],
+    phase2_folders: list[str],
+) -> ScoutSummary:
+    """Merge Phase 1 and Phase 2 results into a ScoutSummary."""
+    # Start with bootstrap data
+    policy_files = dict(bootstrap.root_policy_files)
+    vault_skills = dict(bootstrap.root_vault_skills)
+
+    # Classify Phase 2 read_file results
+    for tool_name, file_path, result_json in accumulated_reads:
+        try:
+            data = json.loads(result_json)
+            content = data.get("content", "")
+        except (json.JSONDecodeError, TypeError):
+            content = ""
+
+        basename = file_path.rsplit("/", 1)[-1] if "/" in file_path else file_path
+        normalized_path = file_path.lstrip("/")
+
+        if is_meta_file(basename):
+            policy_files[normalized_path] = content
+        if basename.lower().startswith("skill-"):
+            vault_skills[normalized_path] = content
+
+    # Merge folders
+    folders_explored = list(bootstrap.folders_discovered) + phase2_folders
+
+    return ScoutSummary(
+        directory_tree=bootstrap.directory_tree,
+        policy_files=policy_files,
+        vault_skills=vault_skills,
+        files_read=bootstrap.files_read | tracker.all(),
+        folders_explored=folders_explored,
+        llm_summary=llm_summary,
+        mode="llm",
+        total_llm_steps=total_steps,
+        completed_fully=completed_fully,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -349,116 +382,42 @@ def _tool_name(task_type: TaskType) -> str:
 def run_scout(
     vm: Any,
     tracker: GroundingTracker,
+    config: ScoutConfig,
 ) -> ScoutSummary:
-    """Run the LLM-free scout phase to discover workspace contents.
-
-    Creates a TaskGraph, seeds it with tree("/"), runs waves until
-    no pending tasks remain, and returns a ScoutSummary.
+    """Run the two-phase scout: deterministic bootstrap + LLM-driven explorer.
 
     Args:
         vm: MiniRuntimeClientSync instance for VM operations.
-        tracker: GroundingTracker to record all files read.
+        tracker: GroundingTracker to record all files read during both phases.
+        config: ScoutConfig with model, task_instruction, max_steps, max_workers.
 
     Returns:
         ScoutSummary with directory tree, policy files, vault skills,
-        files read, and folders explored.
+        files read, folders explored, LLM summary, and completion metadata.
     """
-    graph = TaskGraph()
-    collector = _ScoutCollector()
-
-    # Seed with tree root
-    seed_id = graph.add(Task(
-        id="tree-root",
-        type=TaskType.TREE,
-        args={"path": "/"},
-        spawn_reason="seed: initial workspace tree",
-    ))
-    log.debug("Scout seeded with %s", seed_id)
-
-    wave_number = 0
     protected_files: set[str] = set()
 
-    while graph.has_pending():
-        wave_number += 1
-        ready = graph.ready_tasks()
-        if not ready:
-            print(f"  Scout wave {wave_number}: WARNING no ready tasks but pending exist. Breaking.")
-            break
+    # Phase 1: Deterministic Bootstrap
+    print("  Scout Phase 1: Bootstrap (tree + root files)...", flush=True)
+    bootstrap = _run_bootstrap(vm, tracker, protected_files)
+    print(
+        f"  Bootstrap: {len(bootstrap.folders_discovered)} folders, "
+        f"{len(bootstrap.root_policy_files)} policy files, "
+        f"{len(bootstrap.root_vault_skills)} vault skills",
+    )
 
-        # Log wave info
-        task_descs = [f"{t.type.value}({t.args.get('path', '?')})" for t in ready]
-        print(f"  Scout wave {wave_number}: {len(ready)} tasks [{', '.join(task_descs)}]")
+    # Phase 2: LLM Explorer
+    print(f"  Scout Phase 2: LLM Explorer (model={config.model}, max_steps={config.max_steps})...", flush=True)
+    llm_summary, total_steps, completed_fully, reads, folders = _run_llm_explorer(
+        vm, tracker, config, bootstrap, protected_files,
+    )
+    print(
+        f"  Explorer: {total_steps} steps, "
+        f"completed_fully={completed_fully}, "
+        f"{len(reads)} files classified",
+    )
 
-        # Mark all ready tasks as running
-        for t in ready:
-            t.status = TaskStatus.RUNNING
-
-        # Execute all ready tasks in parallel
-        results: list[tuple[Task, str]] = []
-
-        def _exec(task: Task) -> tuple[Task, str]:
-            tool = _tool_name(task.type)
-            result = dispatch_tool(
-                vm, tool, task.args, tracker, protected_files,
-            )
-            return (task, result)
-
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            futures = [pool.submit(_exec, t) for t in ready]
-            for future in futures:
-                results.append(future.result())
-
-        # Process results: complete tasks and run reactors
-        for task, result_json in results:
-            graph.complete(task.id, result_json)
-
-            # Print result summary
-            try:
-                rd = json.loads(result_json)
-                if task.type == TaskType.TREE:
-                    folders = rd.get("folders", [])
-                    raw_files = rd.get("files", [])
-                    fnames = [f.get("path", f) if isinstance(f, dict) else f for f in raw_files]
-                    print(f"    {task.type.value}({task.args.get('path','?')}) -> "
-                          f"folders={folders}, files={fnames}")
-                elif task.type == TaskType.LIST:
-                    folders = rd.get("folders", [])
-                    files = rd.get("files", [])
-                    print(f"    {task.type.value}({task.args.get('path','?')}) -> "
-                          f"folders={folders}, files={files}")
-                elif task.type == TaskType.READ:
-                    content = rd.get("content", "")
-                    preview = content[:80].replace("\n", "\\n") + ("..." if len(content) > 80 else "")
-                    print(f"    {task.type.value}({task.args.get('path','?')}) -> "
-                          f"\"{preview}\"")
-                else:
-                    print(f"    {task.type.value}({task.args.get('path','?')}) -> OK")
-            except Exception:
-                preview = result_json[:80]
-                print(f"    {task.type.value}({task.args.get('path','?')}) -> {preview}")
-
-            reactor = _REACTORS.get(task.type)
-            if reactor:
-                before_count = len(graph.all_tasks())
-                reactor(task, result_json, graph, collector)
-                after_count = len(graph.all_tasks())
-                spawned = after_count - before_count
-                if spawned > 0:
-                    # Show what was spawned
-                    new_tasks = graph.all_tasks()[-spawned:]
-                    for nt in new_tasks:
-                        print(f"      -> spawned {nt.type.value}({nt.args.get('path','?')}) "
-                              f"reason: {nt.spawn_reason}")
-
-    print(f"  Scout done: {wave_number} waves, "
-          f"{len(collector.files_read)} files read, "
-          f"{len(collector.policy_files)} policy files, "
-          f"{len(collector.vault_skills)} vault skills")
-
-    return ScoutSummary(
-        directory_tree=collector.directory_tree,
-        policy_files=collector.policy_files,
-        vault_skills=collector.vault_skills,
-        files_read=collector.files_read | tracker.all(),
-        folders_explored=collector.folders_explored,
+    # Build summary
+    return _build_summary(
+        bootstrap, tracker, llm_summary, total_steps, completed_fully, reads, folders,
     )

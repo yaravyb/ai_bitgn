@@ -82,14 +82,90 @@ def build_system_prompt(
     return "\n\n".join(sections)
 
 
-def build_scout_prompt() -> str:
-    """Build a minimal scout prompt, reserved for future LLM-based scout extension.
+def build_scout_prompt(
+    task_instruction: str,
+    bootstrap_context: str,
+) -> str:
+    """Build the scout LLM system prompt.
 
-    Currently the scout phase is LLM-free (deterministic). This prompt is
-    reserved for future use if a scout model is desired.
+    Args:
+        task_instruction: The user's task text (for task-aware exploration).
+        bootstrap_context: Pre-formatted string with directory tree and root policy contents.
+
+    Returns:
+        Complete system prompt string for the scout LLM.
     """
-    return (
-        "You are a workspace discovery assistant. Your sole purpose is to "
-        "systematically explore the workspace filesystem and report what you find. "
-        "You do not perform any tasks -- only discover and catalog the workspace contents."
+    sections: list[str] = []
+
+    # 1. Role definition
+    sections.append(
+        "## Role\n"
+        "\n"
+        "You are a workspace reconnaissance agent. Your mission is to discover "
+        "and catalog workspace contents to help a downstream executor agent. "
+        "You do NOT solve the task -- you only explore and report."
     )
+
+    # 2. Bootstrap context
+    sections.append(
+        "## Bootstrap Context\n"
+        "\n"
+        "The following workspace structure and root-level file contents were "
+        "discovered during the deterministic bootstrap phase:\n"
+        "\n"
+        "<bootstrap>\n"
+        f"{bootstrap_context}\n"
+        "</bootstrap>"
+    )
+
+    # 3. Task context
+    sections.append(
+        "## Task Context\n"
+        "\n"
+        "Use this to prioritize which areas of the workspace to explore. "
+        "Do NOT attempt to solve this task.\n"
+        "\n"
+        "<task>\n"
+        f"{task_instruction}\n"
+        "</task>"
+    )
+
+    # 4. Exploration instructions
+    sections.append(
+        "## Exploration Instructions\n"
+        "\n"
+        "1. Read policy/rules files first (AGENTS.MD, README.MD, _rules.*, etc.).\n"
+        "2. If a policy file redirects to another file (e.g., 'See CLAUDE.MD'), "
+        "follow the redirect and read that file.\n"
+        "3. Explore directories that are relevant to the task instruction.\n"
+        "4. Use `search()` when looking for specific content patterns.\n"
+        "5. Use parallel tool calls to batch multiple reads or listings.\n"
+        "6. Skip clearly irrelevant directories (e.g., `node_modules`, `.git`).\n"
+        "7. You have the full directory tree already -- jump directly to any "
+        "path at any depth. No level-by-level traversal needed."
+    )
+
+    # 5. Completion instructions
+    sections.append(
+        "## Completion Instructions\n"
+        "\n"
+        "When you have gathered sufficient context, end your exploration by "
+        "responding with a structured text summary containing:\n"
+        "\n"
+        "1. **Policy files found** and key rules from each.\n"
+        "2. **Files read** and why each was relevant.\n"
+        "3. **Areas explored vs. skipped** with reasons.\n"
+        "4. **Patterns detected** in the workspace.\n"
+        "5. **Recommended focus areas** for the executor agent."
+    )
+
+    # 6. Constraints
+    sections.append(
+        "## Constraints\n"
+        "\n"
+        "- You MUST NOT attempt to solve the task.\n"
+        "- You MUST NOT call write_file or delete_file. You are read-only.\n"
+        "- Your only purpose is to discover and catalog workspace contents."
+    )
+
+    return "\n\n".join(sections)

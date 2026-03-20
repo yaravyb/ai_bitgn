@@ -9,6 +9,7 @@ dependencies = [
     "bitgn-api-protocolbuffers-python==34.0.0.1.20260316101438+5e72a3f6bebf",
     "boto3>=1.42.69",
     "litellm>=1.82.3",
+    "protobuf>=7.34.0",
     "pydantic>=2.12.5",
 ]
 
@@ -18,6 +19,9 @@ url = "https://buf.build/gen/python"
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
+]
+observability = [
+    "langfuse>=2.0.0",
 ]
 
 [tool.uv]
