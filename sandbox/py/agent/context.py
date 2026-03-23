@@ -38,6 +38,10 @@ class ContextConfig:
     auto_compact_threshold: int = 80_000
     transcript_dir: str = ".transcripts/"
 
+    # Verification configuration (self-verification feature)
+    verification_enabled: bool = False
+    verification_max_attempts: int = 2
+
     @classmethod
     def from_env(cls) -> ContextConfig:
         """Create a ContextConfig reading from environment variables with fallback to defaults."""
@@ -47,6 +51,8 @@ class ContextConfig:
             micro_compact_min_length=int(os.environ.get("CTX_MICRO_COMPACT_MIN_LENGTH", "100")),
             auto_compact_threshold=int(os.environ.get("CTX_AUTO_COMPACT_THRESHOLD", "80000")),
             transcript_dir=os.environ.get("CTX_TRANSCRIPT_DIR", ".transcripts/"),
+            verification_enabled=os.environ.get("VERIFY_ENABLED", "").lower() in ("1", "true", "yes"),
+            verification_max_attempts=int(os.environ.get("VERIFY_MAX_ATTEMPTS", "2")),
         )
 
 

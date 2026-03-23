@@ -71,6 +71,9 @@ def configure_observability() -> None:
         if "langfuse" not in litellm.failure_callback:
             litellm.failure_callback.append("langfuse")
 
+        # Suppress noisy Langfuse HTTP errors from cluttering agent output
+        logging.getLogger("langfuse").setLevel(logging.CRITICAL)
+
         log.info("Observability active: Langfuse callbacks registered.")
     except Exception:
         log.exception("Unexpected error during observability configuration; skipping.")

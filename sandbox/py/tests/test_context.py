@@ -497,3 +497,94 @@ class TestMicroCompactMutatesInPlace:
         messages = [{"role": "system", "content": "system"}]
         result = micro_compact(messages, cfg)
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Verification configuration tests (Task 8 / self-verification)
+# ---------------------------------------------------------------------------
+
+class TestContextConfigVerificationDefaults:
+    """ContextConfig has verification fields with correct defaults."""
+
+    def test_verification_enabled_default_false(self):
+        from agent.context import ContextConfig
+        cfg = ContextConfig()
+        assert cfg.verification_enabled is False
+
+    def test_verification_max_attempts_default_two(self):
+        from agent.context import ContextConfig
+        cfg = ContextConfig()
+        assert cfg.verification_max_attempts == 2
+
+    def test_backward_compat_construction_without_verification_fields(self):
+        """Existing callers that construct ContextConfig without new fields still work."""
+        from agent.context import ContextConfig
+        cfg = ContextConfig(
+            truncation_limit=5000,
+            micro_compact_keep_batches=2,
+            micro_compact_min_length=50,
+            auto_compact_threshold=50_000,
+            transcript_dir="/tmp/t/",
+        )
+        assert cfg.truncation_limit == 5000
+        assert cfg.verification_enabled is False
+        assert cfg.verification_max_attempts == 2
+
+    def test_custom_verification_values(self):
+        from agent.context import ContextConfig
+        cfg = ContextConfig(verification_enabled=True, verification_max_attempts=5)
+        assert cfg.verification_enabled is True
+        assert cfg.verification_max_attempts == 5
+
+
+class TestContextConfigFromEnvVerification:
+    """from_env() reads VERIFY_ENABLED and VERIFY_MAX_ATTEMPTS env vars."""
+
+    def test_verify_enabled_true_from_1(self, monkeypatch):
+        from agent.context import ContextConfig
+        monkeypatch.setenv("VERIFY_ENABLED", "1")
+        monkeypatch.delenv("VERIFY_MAX_ATTEMPTS", raising=False)
+        cfg = ContextConfig.from_env()
+        assert cfg.verification_enabled is True
+
+    def test_verify_enabled_true_from_true(self, monkeypatch):
+        from agent.context import ContextConfig
+        monkeypatch.setenv("VERIFY_ENABLED", "true")
+        cfg = ContextConfig.from_env()
+        assert cfg.verification_enabled is True
+
+    def test_verify_enabled_true_from_yes(self, monkeypatch):
+        from agent.context import ContextConfig
+        monkeypatch.setenv("VERIFY_ENABLED", "yes")
+        cfg = ContextConfig.from_env()
+        assert cfg.verification_enabled is True
+
+    def test_verify_enabled_true_from_TRUE_uppercase(self, monkeypatch):
+        from agent.context import ContextConfig
+        monkeypatch.setenv("VERIFY_ENABLED", "TRUE")
+        cfg = ContextConfig.from_env()
+        assert cfg.verification_enabled is True
+
+    def test_verify_enabled_false_from_empty(self, monkeypatch):
+        from agent.context import ContextConfig
+        monkeypatch.delenv("VERIFY_ENABLED", raising=False)
+        cfg = ContextConfig.from_env()
+        assert cfg.verification_enabled is False
+
+    def test_verify_enabled_false_from_no(self, monkeypatch):
+        from agent.context import ContextConfig
+        monkeypatch.setenv("VERIFY_ENABLED", "no")
+        cfg = ContextConfig.from_env()
+        assert cfg.verification_enabled is False
+
+    def test_verify_max_attempts_from_env(self, monkeypatch):
+        from agent.context import ContextConfig
+        monkeypatch.setenv("VERIFY_MAX_ATTEMPTS", "5")
+        cfg = ContextConfig.from_env()
+        assert cfg.verification_max_attempts == 5
+
+    def test_verify_max_attempts_default(self, monkeypatch):
+        from agent.context import ContextConfig
+        monkeypatch.delenv("VERIFY_MAX_ATTEMPTS", raising=False)
+        cfg = ContextConfig.from_env()
+        assert cfg.verification_max_attempts == 2

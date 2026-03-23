@@ -1,0 +1,29 @@
+{
+  "featureName": "self-verification",
+  "description": "Pre-submission verification loop that intercepts report_completion to let the LLM double-check its answer against policy rules, verify file operations succeeded, and confirm answer format correctness before final submission. Targets improved accuracy for smaller/cheaper models that frequently produce near-correct but format-mismatched answers. Addresses weakness #9 (Single-Attempt Completion) from agent-analysis.md.",
+  "codeName": "self-verification",
+  "language": "en",
+  "createdAt": "2026-03-23T12:00:00Z",
+  "updatedAt": "2026-03-23T18:45:00Z",
+  "status": "tasks-generated",
+  "phases": {
+    "requirements": "generated",
+    "design": "generated",
+    "tasks": "generated",
+    "implementation": "completed"
+  },
+  "approvals": {
+    "requirements": {
+      "generated": true,
+      "approved": true
+    },
+    "design": {
+      "generated": true,
+      "approved": true
+    },
+    "tasks": {
+      "generated": true,
+      "approved": true
+    }
+  }
+}

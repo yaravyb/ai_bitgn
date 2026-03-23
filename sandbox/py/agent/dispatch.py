@@ -221,7 +221,11 @@ def dispatch_tool(
     """
     handler = DISPATCH_MAP.get(tool_name)
     if handler is None:
-        raise ValueError(f"Unknown tool: {tool_name}")
+        log.warning("Unknown tool: %s", tool_name)
+        return json.dumps(
+            {"error": f"Unknown tool: {tool_name}"},
+            ensure_ascii=False,
+        )
 
     try:
         result = handler(vm, args, tracker, protected_files, skill_loader)

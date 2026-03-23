@@ -1126,3 +1126,619 @@ class TestLoopContextConfigPassedToDispatch:
         context_config = dp_call[1].get("context_config")
         assert context_config is not None
         assert isinstance(context_config, ContextConfig)
+
+
+# ---------------------------------------------------------------------------
+# Text extraction tests (_try_extract_completion)
+# ---------------------------------------------------------------------------
+
+class TestTryExtractCompletion:
+    """_try_extract_completion extracts answer from structured text."""
+
+    def test_extracts_from_json_with_answer_key(self):
+        from agent.loop import _try_extract_completion
+        text = '{"answer": "TODO", "grounding_refs": ["HOME.MD"]}'
+        result = _try_extract_completion(text)
+        assert result is not None
+        assert result["answer"] == "TODO"
+        assert result["grounding_refs"] == ["HOME.MD"]
+
+    def test_extracts_from_report_completion_syntax(self):
+        from agent.loop import _try_extract_completion
+        text = 'report_completion({"answer": "done", "code": "completed"})'
+        result = _try_extract_completion(text)
+        assert result is not None
+        assert result["answer"] == "done"
+        assert result["code"] == "completed"
+
+    def test_returns_none_for_plain_text(self):
+        from agent.loop import _try_extract_completion
+        assert _try_extract_completion("just a plain answer") is None
+
+    def test_returns_none_for_json_without_answer(self):
+        from agent.loop import _try_extract_completion
+        assert _try_extract_completion('{"status": "ok"}') is None
+
+    def test_returns_none_for_empty_string(self):
+        from agent.loop import _try_extract_completion
+        assert _try_extract_completion("") is None
+
+    def test_returns_none_for_json_list(self):
+        from agent.loop import _try_extract_completion
+        assert _try_extract_completion('["a", "b"]') is None
+
+    def test_extracts_from_multiline_json(self):
+        from agent.loop import _try_extract_completion
+        text = '{\n  "answer": "multi\\nline",\n  "code": "completed"\n}'
+        result = _try_extract_completion(text)
+        assert result is not None
+        assert result["answer"] == "multi\nline"
+
+    def test_extracts_from_report_completion_with_spaces(self):
+        from agent.loop import _try_extract_completion
+        text = 'report_completion( {"answer": "test"} )'
+        result = _try_extract_completion(text)
+        assert result is not None
+        assert result["answer"] == "test"
+
+    def test_extracts_from_python_kwargs_syntax(self):
+        from agent.loop import _try_extract_completion
+        text = 'report_completion(answer="WIP", grounding_refs=["AGENTS.MD"], steps=["Read policy"], code="completed")'
+        result = _try_extract_completion(text)
+        assert result is not None
+        assert result["answer"] == "WIP"
+        assert result["code"] == "completed"
+        assert result["grounding_refs"] == ["AGENTS.MD"]
+
+    def test_extracts_kwargs_answer_only(self):
+        from agent.loop import _try_extract_completion
+        text = 'report_completion(answer="done")'
+        result = _try_extract_completion(text)
+        assert result is not None
+        assert result["answer"] == "done"
+
+    def test_extracts_kwargs_with_leading_text(self):
+        from agent.loop import _try_extract_completion
+        text = ' report_completion(answer="TODO", code="completed")'
+        result = _try_extract_completion(text)
+        assert result is not None
+        assert result["answer"] == "TODO"
+
+
+class TestTextExtractionInAutoSubmit:
+    """Text extraction is applied in the auto-submit path."""
+
+    @patch("agent.loop.dispatch_tool")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    @patch("agent.loop.MiniRuntimeClientSync")
+    def test_json_text_extracts_answer(
+        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        mock_dispatch_tool,
+    ):
+        """When LLM outputs JSON text with answer key, the answer is extracted."""
+        from agent.loop import run_agent
+
+        mock_run_scout.return_value = _make_scout_summary_mock()
+        mock_call_llm.return_value = MagicMock(
+            content='{"answer": "TODO", "grounding_refs": ["HOME.MD"], "code": "completed"}',
+            tool_calls=[], raw=None,
+        )
+        mock_dispatch_tool.return_value = '{"ok": true}'
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            harness_url="http://test:1234",
+            task_text="test task",
+        )
+
+        # dispatch_tool should have been called with extracted answer, not raw JSON
+        dt_call = mock_dispatch_tool.call_args
+        args = dt_call[0][2]  # third positional arg is the arguments dict
+        assert args["answer"] == "TODO"
+        assert args["grounding_refs"] == ["HOME.MD"]
+
+
+# ---------------------------------------------------------------------------
+# Verification integration tests (Task 9 / self-verification)
+# ---------------------------------------------------------------------------
+
+class TestVerificationInterceptsReportCompletion:
+    """report_completion is intercepted when verification is enabled."""
+
+    @patch("agent.loop.ContextConfig.from_env")
+    @patch("agent.loop.dispatch_tool")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    @patch("agent.loop.MiniRuntimeClientSync")
+    def test_report_completion_intercepted_on_first_call(
+        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        mock_dispatch_tool, mock_from_env,
+    ):
+        """When verification enabled, first report_completion is intercepted.
+
+        With max_attempts=1, the first call is intercepted (attempt 0 < 1),
+        and the second call dispatches normally (attempt 1 >= 1).
+        """
+        from agent.loop import run_agent
+        from agent.context import ContextConfig
+
+        mock_from_env.return_value = ContextConfig(
+            verification_enabled=True, verification_max_attempts=1,
+        )
+        mock_run_scout.return_value = _make_scout_summary_mock(
+            policy_files={"RULES.md": "always lowercase"},
+        )
+
+        tc_complete = ToolCall(
+            id="tc1", name="report_completion",
+            arguments={"answer": "first answer", "code": "completed",
+                       "grounding_refs": [], "steps": []},
+        )
+        tc_complete2 = ToolCall(
+            id="tc2", name="report_completion",
+            arguments={"answer": "first answer", "code": "completed",
+                       "grounding_refs": [], "steps": []},
+        )
+
+        mock_call_llm.side_effect = [
+            # Step 1: LLM calls report_completion -> intercepted (attempt 0 < 1)
+            MagicMock(content=None, tool_calls=[tc_complete], raw=None),
+            # Step 2: After verification prompt, LLM calls again -> dispatched (attempt 1 >= 1)
+            MagicMock(content=None, tool_calls=[tc_complete2], raw=None),
+        ]
+        mock_dispatch_tool.return_value = '{"ok": true}'
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            harness_url="http://test:1234",
+            task_text="test task",
+        )
+
+        # call_llm called 2 times: original + post-verification
+        assert mock_call_llm.call_count == 2
+        # dispatch_tool should be called once for the final report_completion dispatch
+        assert mock_dispatch_tool.call_count >= 1
+
+        # The second LLM call should have a verification prompt in messages
+        second_call = mock_call_llm.call_args_list[1]
+        messages = second_call[0][1]
+        user_msgs = [m for m in messages if m.get("role") == "user"]
+        verification_msgs = [m for m in user_msgs if "<verification>" in m.get("content", "")]
+        assert len(verification_msgs) >= 1
+
+
+class TestVerificationDisabledDispatchesImmediately:
+    """report_completion dispatches immediately when verification disabled."""
+
+    @patch("agent.loop.dispatch_tool")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    @patch("agent.loop.MiniRuntimeClientSync")
+    def test_no_interception_when_disabled(
+        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        mock_dispatch_tool,
+    ):
+        """With verification disabled (default), report_completion dispatches directly."""
+        from agent.loop import run_agent
+
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        tc = ToolCall(
+            id="tc1", name="report_completion",
+            arguments={"answer": "done", "code": "completed",
+                       "grounding_refs": [], "steps": []},
+        )
+        mock_call_llm.return_value = MagicMock(
+            content=None, tool_calls=[tc], raw=None,
+        )
+        mock_dispatch_tool.return_value = '{"ok": true}'
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            harness_url="http://test:1234",
+            task_text="test task",
+        )
+
+        # Only 1 LLM call (no verification loop)
+        assert mock_call_llm.call_count == 1
+        # dispatch_tool called for report_completion
+        mock_dispatch_tool.assert_called_once()
+
+
+class TestVerificationInterceptsTextOnlyAutosubmit:
+    """Text-only auto-submit is intercepted when verification enabled."""
+
+    @patch("agent.loop.ContextConfig.from_env")
+    @patch("agent.loop.dispatch_tool")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    @patch("agent.loop.MiniRuntimeClientSync")
+    def test_text_only_intercepted(
+        self, mock_vm_cls, mock_call_llm, mock_run_scout,
+        mock_dispatch_tool, mock_from_env,
+    ):
+        """Text-only response is intercepted for verification when enabled.
+
+        With max_attempts=1: step 1 text-only intercepted (0 < 1),
+        step 2 report_completion dispatched (1 >= 1).
+        """
+        from agent.loop import run_agent
+        from agent.context import ContextConfig
+
+        mock_from_env.return_value = ContextConfig(
+            verification_enabled=True, verification_max_attempts=1,
+        )
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        tc_final = ToolCall(
+            id="tc_final", name="report_completion",
+            arguments={"answer": "final answer", "code": "completed",
+                       "grounding_refs": [], "steps": []},
+        )
+        mock_call_llm.side_effect = [
+            # Step 1: text-only -> intercepted (attempt 0 < 1)
+            MagicMock(content="text answer", tool_calls=[], raw=None),
+            # Step 2: report_completion -> dispatched (attempt 1 >= 1)
+            MagicMock(content=None, tool_calls=[tc_final], raw=None),
+        ]
+        mock_dispatch_tool.return_value = '{"ok": true}'
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            harness_url="http://test:1234",
+            task_text="test task",
+        )
+
+        # call_llm called twice: text-only intercepted, then report_completion dispatched
+        assert mock_call_llm.call_count == 2
+
+        # The second call should have verification prompt in messages
+        second_call = mock_call_llm.call_args_list[1]
+        messages = second_call[0][1]
+        user_msgs = [m for m in messages if m.get("role") == "user"]
+        verification_msgs = [m for m in user_msgs if "<verification>" in m.get("content", "")]
+        assert len(verification_msgs) >= 1
+
+
+class TestVerificationDispatchesOtherToolsDuringIntercept:
+    """Non-completion tool calls are dispatched normally during verification."""
+
+    @patch("agent.loop.ContextConfig.from_env")
+    @patch("agent.loop.dispatch_tool")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    @patch("agent.loop.MiniRuntimeClientSync")
+    def test_other_tools_dispatched_with_completion(
+        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        mock_dispatch_tool, mock_from_env,
+    ):
+        """When report_completion is batched with other tools, others are dispatched."""
+        from agent.loop import run_agent
+        from agent.context import ContextConfig
+
+        mock_from_env.return_value = ContextConfig(
+            verification_enabled=True, verification_max_attempts=1,
+        )
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        tc_read = ToolCall(id="tc_read", name="read_file", arguments={"path": "x.md"})
+        tc_complete = ToolCall(
+            id="tc_complete", name="report_completion",
+            arguments={"answer": "ans", "code": "completed",
+                       "grounding_refs": [], "steps": []},
+        )
+
+        tc_final = ToolCall(
+            id="tc_final", name="report_completion",
+            arguments={"answer": "ans", "code": "completed",
+                       "grounding_refs": [], "steps": []},
+        )
+
+        mock_call_llm.side_effect = [
+            # Step 1: read_file + report_completion -> intercepted (0 < 1), read_file dispatched
+            MagicMock(content=None, tool_calls=[tc_read, tc_complete], raw=None),
+            # Step 2: after verification, report_completion -> dispatched (1 >= 1)
+            MagicMock(content=None, tool_calls=[tc_final], raw=None),
+        ]
+        mock_dp.return_value = [("tc_read", '{"content": "file data"}')]
+        mock_dispatch_tool.return_value = '{"ok": true}'
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            harness_url="http://test:1234",
+            task_text="test task",
+        )
+
+        # dispatch_parallel should have been called with only the read_file tool
+        mock_dp.assert_called_once()
+        dp_tool_calls = mock_dp.call_args[0][1]
+        assert len(dp_tool_calls) == 1
+        assert dp_tool_calls[0].name == "read_file"
+
+
+class TestVerificationMaxAttemptsThenDispatch:
+    """After max attempts, report_completion dispatches to harness."""
+
+    @patch("agent.loop.ContextConfig.from_env")
+    @patch("agent.loop.dispatch_tool")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    @patch("agent.loop.MiniRuntimeClientSync")
+    def test_dispatched_after_max_attempts(
+        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        mock_dispatch_tool, mock_from_env,
+    ):
+        """After 2 verification attempts, the next report_completion goes to harness."""
+        from agent.loop import run_agent
+        from agent.context import ContextConfig
+
+        mock_from_env.return_value = ContextConfig(
+            verification_enabled=True, verification_max_attempts=2,
+        )
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        tc1 = ToolCall(
+            id="tc1", name="report_completion",
+            arguments={"answer": "ans1", "code": "completed",
+                       "grounding_refs": [], "steps": []},
+        )
+        tc2 = ToolCall(
+            id="tc2", name="report_completion",
+            arguments={"answer": "ans2", "code": "completed",
+                       "grounding_refs": [], "steps": []},
+        )
+        tc3 = ToolCall(
+            id="tc3", name="report_completion",
+            arguments={"answer": "ans3", "code": "completed",
+                       "grounding_refs": [], "steps": []},
+        )
+
+        mock_call_llm.side_effect = [
+            MagicMock(content=None, tool_calls=[tc1], raw=None),  # attempt 1 intercepted
+            MagicMock(content=None, tool_calls=[tc2], raw=None),  # attempt 2 intercepted
+            MagicMock(content=None, tool_calls=[tc3], raw=None),  # at max -> dispatched
+        ]
+        mock_dispatch_tool.return_value = '{"ok": true}'
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            harness_url="http://test:1234",
+            task_text="test task",
+        )
+
+        # 3 LLM calls: 2 intercepted + 1 dispatched
+        assert mock_call_llm.call_count == 3
+        # dispatch_tool called once for the final dispatch
+        assert mock_dispatch_tool.call_count >= 1
+
+
+class TestVerificationStepsCountAgainstLimit:
+    """Verification steps count against the 30-step executor limit."""
+
+    @patch("agent.loop.ContextConfig.from_env")
+    @patch("agent.loop.dispatch_tool")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    @patch("agent.loop.MiniRuntimeClientSync")
+    def test_steps_capped_at_30(
+        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        mock_dispatch_tool, mock_from_env,
+    ):
+        """Verification cycles consume steps from the 30-step limit."""
+        from agent.loop import run_agent
+        from agent.context import ContextConfig
+
+        mock_from_env.return_value = ContextConfig(
+            verification_enabled=True, verification_max_attempts=100,
+        )
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        # Every call returns report_completion -> always intercepted (max_attempts=100)
+        # This will loop until the 30-step limit
+        def make_tc(n):
+            return ToolCall(
+                id=f"tc{n}", name="report_completion",
+                arguments={"answer": f"ans{n}", "code": "completed",
+                           "grounding_refs": [], "steps": []},
+            )
+
+        mock_call_llm.side_effect = [
+            MagicMock(content=None, tool_calls=[make_tc(i)], raw=None)
+            for i in range(35)  # More than 30 to test limit
+        ]
+        mock_dispatch_tool.return_value = '{"ok": true}'
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            harness_url="http://test:1234",
+            task_text="test task",
+        )
+
+        # Should be capped at 30 steps
+        assert mock_call_llm.call_count == 30
+
+
+class TestVerificationOutcomeConfirmedLog:
+    """Confirmed answer outcome is logged correctly."""
+
+    @patch("agent.loop.ContextConfig.from_env")
+    @patch("agent.loop.dispatch_tool")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    @patch("agent.loop.MiniRuntimeClientSync")
+    def test_confirmed_log_output(
+        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        mock_dispatch_tool, mock_from_env, capsys,
+    ):
+        """When verified answer matches original, CONFIRMED is printed."""
+        from agent.loop import run_agent
+        from agent.context import ContextConfig
+
+        mock_from_env.return_value = ContextConfig(
+            verification_enabled=True, verification_max_attempts=1,
+        )
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        same_answer = "the answer"
+        tc1 = ToolCall(
+            id="tc1", name="report_completion",
+            arguments={"answer": same_answer, "code": "completed",
+                       "grounding_refs": [], "steps": []},
+        )
+        tc2 = ToolCall(
+            id="tc2", name="report_completion",
+            arguments={"answer": same_answer, "code": "completed",
+                       "grounding_refs": [], "steps": []},
+        )
+
+        mock_call_llm.side_effect = [
+            # Step 1: intercepted (attempt 0 < 1)
+            MagicMock(content=None, tool_calls=[tc1], raw=None),
+            # Step 2: dispatched (attempt 1 >= 1), logs CONFIRMED
+            MagicMock(content=None, tool_calls=[tc2], raw=None),
+        ]
+        mock_dispatch_tool.return_value = '{"ok": true}'
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            harness_url="http://test:1234",
+            task_text="test task",
+        )
+
+        captured = capsys.readouterr()
+        assert "CONFIRMED" in captured.out
+
+
+class TestVerificationOutcomeRevisedLog:
+    """Revised answer outcome is logged correctly."""
+
+    @patch("agent.loop.ContextConfig.from_env")
+    @patch("agent.loop.dispatch_tool")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    @patch("agent.loop.MiniRuntimeClientSync")
+    def test_revised_log_output(
+        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        mock_dispatch_tool, mock_from_env, capsys,
+    ):
+        """When verified answer differs from original, REVISED is printed."""
+        from agent.loop import run_agent
+        from agent.context import ContextConfig
+
+        mock_from_env.return_value = ContextConfig(
+            verification_enabled=True, verification_max_attempts=1,
+        )
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        tc1 = ToolCall(
+            id="tc1", name="report_completion",
+            arguments={"answer": "original answer", "code": "completed",
+                       "grounding_refs": [], "steps": []},
+        )
+        tc2 = ToolCall(
+            id="tc2", name="report_completion",
+            arguments={"answer": "corrected answer", "code": "completed",
+                       "grounding_refs": [], "steps": []},
+        )
+
+        mock_call_llm.side_effect = [
+            # Step 1: intercepted (attempt 0 < 1)
+            MagicMock(content=None, tool_calls=[tc1], raw=None),
+            # Step 2: dispatched (attempt 1 >= 1), logs REVISED
+            MagicMock(content=None, tool_calls=[tc2], raw=None),
+        ]
+        mock_dispatch_tool.return_value = '{"ok": true}'
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            harness_url="http://test:1234",
+            task_text="test task",
+        )
+
+        captured = capsys.readouterr()
+        assert "REVISED" in captured.out
+
+
+class TestVerificationEmptyResponseFallback:
+    """Empty LLM response during verification submits captured answer."""
+
+    @patch("agent.loop.ContextConfig.from_env")
+    @patch("agent.loop.dispatch_tool")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    @patch("agent.loop.MiniRuntimeClientSync")
+    def test_empty_response_submits_captured_answer(
+        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        mock_dispatch_tool, mock_from_env,
+    ):
+        """When LLM returns empty during verification, captured answer is submitted."""
+        from agent.loop import run_agent
+        from agent.context import ContextConfig
+
+        mock_from_env.return_value = ContextConfig(
+            verification_enabled=True, verification_max_attempts=1,
+        )
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        tc = ToolCall(
+            id="tc1", name="report_completion",
+            arguments={"answer": "captured answer", "code": "completed",
+                       "grounding_refs": [], "steps": []},
+        )
+        mock_call_llm.side_effect = [
+            # Step 1: report_completion -> intercepted (attempt 0 < 1)
+            MagicMock(content=None, tool_calls=[tc], raw=None),
+            # Step 2: empty response -> fallback submits captured answer
+            MagicMock(content="", tool_calls=[], raw=None),
+        ]
+        mock_dispatch_tool.return_value = '{"ok": true}'
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            harness_url="http://test:1234",
+            task_text="test task",
+        )
+
+        # dispatch_tool should have been called with the captured answer
+        assert mock_dispatch_tool.call_count >= 1
+        last_dt_call = mock_dispatch_tool.call_args
+        args = last_dt_call[0][2]
+        assert args["answer"] == "captured answer"
+
+
+class TestExistingTestsPassWithVerificationDisabled:
+    """All existing tests still pass with verification disabled (default)."""
+
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    @patch("agent.loop.MiniRuntimeClientSync")
+    def test_backward_compat_text_only(
+        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+    ):
+        """Text-only response auto-submits normally with verification disabled."""
+        from agent.loop import run_agent
+
+        mock_run_scout.return_value = _make_scout_summary_mock()
+        mock_call_llm.return_value = MagicMock(
+            content="I'm done", tool_calls=[], raw=None,
+        )
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            harness_url="http://test:1234",
+            task_text="do something",
+        )
+
+        assert mock_call_llm.call_count == 1
+        mock_dp.assert_not_called()
