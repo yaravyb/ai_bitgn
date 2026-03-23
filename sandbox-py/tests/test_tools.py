@@ -222,6 +222,48 @@ class TestScoutToolSchemas:
         assert len(TOOL_NAMES) == 9
 
 
+class TestGetToolSchemas:
+    """get_tool_schemas returns runtime-appropriate schemas."""
+
+    def test_mini_returns_base_tools(self):
+        from agent.tools import get_tool_schemas
+        schemas = get_tool_schemas("mini")
+        names = {s["function"]["name"] for s in schemas}
+        assert "tree" in names
+        assert "find" not in names
+        assert "mkdir" not in names
+        assert "move" not in names
+
+    def test_pcm_includes_extra_tools(self):
+        from agent.tools import get_tool_schemas
+        schemas = get_tool_schemas("pcm")
+        names = {s["function"]["name"] for s in schemas}
+        assert "tree" in names
+        assert "find" in names
+        assert "mkdir" in names
+        assert "move" in names
+
+    def test_pcm_find_schema_has_required_params(self):
+        from agent.tools import get_tool_schemas
+        schemas = get_tool_schemas("pcm")
+        find_schema = next(s for s in schemas if s["function"]["name"] == "find")
+        props = find_schema["function"]["parameters"]["properties"]
+        assert "name" in props
+        assert "root" in props
+
+    def test_default_returns_mini(self):
+        from agent.tools import get_tool_schemas
+        schemas_default = get_tool_schemas()
+        schemas_mini = get_tool_schemas("mini")
+        assert len(schemas_default) == len(schemas_mini)
+
+    def test_pcm_has_more_schemas_than_mini(self):
+        from agent.tools import get_tool_schemas
+        mini = get_tool_schemas("mini")
+        pcm = get_tool_schemas("pcm")
+        assert len(pcm) == len(mini) + 3
+
+
 class TestToolsModuleIsLeaf:
     """Task 1.2: tools.py must have zero imports from other agent/ modules."""
 

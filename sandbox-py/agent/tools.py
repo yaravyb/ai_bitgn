@@ -199,3 +199,59 @@ SCOUT_TOOL_SCHEMAS: list[dict] = [
     s for s in TOOL_SCHEMAS
     if s["function"]["name"] in _SCOUT_TOOL_NAMES
 ]
+
+_PCM_EXTRA_SCHEMAS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "find",
+            "description": "Find files or directories by name.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Name pattern to find."},
+                    "root": {"type": "string", "description": "Root path to search from.", "default": "/"},
+                    "kind": {"type": "string", "enum": ["all", "files", "dirs"], "description": "Type filter.", "default": "all"},
+                    "limit": {"type": "integer", "description": "Maximum results.", "default": 10},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mkdir",
+            "description": "Create a directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory path to create."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "move",
+            "description": "Move or rename a file or directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "from_name": {"type": "string", "description": "Current path."},
+                    "to_name": {"type": "string", "description": "New path."},
+                },
+                "required": ["from_name", "to_name"],
+            },
+        },
+    },
+]
+
+
+def get_tool_schemas(runtime_type: str = "mini") -> list[dict]:
+    """Return tool schemas appropriate for the given runtime type."""
+    if runtime_type == "pcm":
+        return TOOL_SCHEMAS + _PCM_EXTRA_SCHEMAS
+    return TOOL_SCHEMAS
