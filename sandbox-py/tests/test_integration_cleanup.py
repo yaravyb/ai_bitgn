@@ -49,7 +49,7 @@ class TestMainImportsAgent:
         sig = inspect.signature(run_agent)
         params = list(sig.parameters.keys())
         assert params == [
-            "executor_model", "harness_url", "task_text",
+            "executor_model", "runtime", "task_text",
             "scout_model", "skills_dir",
         ]
 
@@ -145,8 +145,8 @@ class TestRunAgentSignature:
         # With from __future__ import annotations, annotations are strings
         assert "str" in str(params["executor_model"].annotation)
 
-        assert "harness_url" in params
-        assert "str" in str(params["harness_url"].annotation)
+        assert "runtime" in params
+        assert "Any" in str(params["runtime"].annotation)
 
         assert "task_text" in params
         assert "str" in str(params["task_text"].annotation)

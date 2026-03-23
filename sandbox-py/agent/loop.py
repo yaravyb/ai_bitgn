@@ -17,8 +17,6 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from bitgn.vm.mini_connect import MiniRuntimeClientSync
-
 from agent.scout import run_scout, ScoutSummary, ScoutConfig
 from agent.llm import call_llm, LLMResponse
 from agent.dispatch import dispatch_parallel, dispatch_tool
@@ -32,7 +30,7 @@ from agent.verify import (
 from agent.prompt import build_system_prompt
 from agent.skills import SkillLoader
 from agent.tracker import GroundingTracker
-from agent.tools import TOOL_SCHEMAS
+from agent.tools import get_tool_schemas
 from agent.context import (
     ContextConfig,
     estimate_tokens,
@@ -263,7 +261,7 @@ def _apply_auto_compact(
 
 def run_agent(
     executor_model: str,
-    harness_url: str,
+    runtime: Any,
     task_text: str,
     scout_model: str | None = None,
     skills_dir: Path | None = None,
@@ -272,7 +270,7 @@ def run_agent(
 
     Args:
         executor_model: LiteLLM model identifier for the executor phase.
-        harness_url: URL of the MiniRuntime harness.
+        runtime: RuntimeAdapter instance for VM operations.
         task_text: The task instruction text.
         scout_model: Optional model for future LLM-augmented scout (unused).
         skills_dir: Path to the skills directory, or None.
@@ -280,7 +278,6 @@ def run_agent(
     # ------------------------------------------------------------------
     # 1. Initialize
     # ------------------------------------------------------------------
-    vm = MiniRuntimeClientSync(harness_url)
     tracker = GroundingTracker()
     protected_files: set[str] = {"agents.md"}
     context_config = ContextConfig.from_env()
@@ -299,7 +296,7 @@ def run_agent(
         model=scout_model or executor_model,
         task_instruction=task_text,
     )
-    summary = run_scout(vm, tracker, scout_config, context_config=context_config)
+    summary = run_scout(runtime, tracker, scout_config, context_config=context_config)
 
     # Expand protected_files with scout-discovered policy files
     for policy_path in summary.policy_files:
@@ -393,7 +390,8 @@ def run_agent(
             )
             print(f"  [auto-compact] conversation compressed to {len(messages)} messages")
 
-        response = call_llm(executor_model, messages, tools=TOOL_SCHEMAS, metadata=trace_metadata)
+        tool_schemas = get_tool_schemas(runtime.runtime_type)
+        response = call_llm(executor_model, messages, tools=tool_schemas, metadata=trace_metadata)
 
         # Build assistant message
         assistant_msg: dict[str, Any] = {"role": "assistant", "content": response.content}
@@ -470,7 +468,7 @@ def run_agent(
                         "code": extracted.get("code", "completed") if extracted else "completed",
                     }
                     dispatch_tool(
-                        vm, "report_completion", submit_args,
+                        runtime, "report_completion", submit_args,
                         tracker, protected_files, skill_loader,
                         context_config=context_config,
                     )
@@ -503,7 +501,7 @@ def run_agent(
                 # Submit the captured answer rather than dropping it.
                 print(f"  (empty response during verification -- submitting captured answer)")
                 dispatch_tool(
-                    vm, "report_completion",
+                    runtime, "report_completion",
                     {"answer": verification_state.original_answer, "grounding_refs": [],
                      "steps": [], "code": verification_state.original_code},
                     tracker, protected_files, skill_loader,
@@ -526,7 +524,7 @@ def run_agent(
         compact_requested = False
         if other_tool_calls:
             results = dispatch_parallel(
-                vm, other_tool_calls, tracker, protected_files, skill_loader,
+                runtime, other_tool_calls, tracker, protected_files, skill_loader,
                 context_config=context_config,
             )
 
@@ -604,7 +602,7 @@ def run_agent(
             else:
                 # Dispatch report_completion normally (verification disabled or max attempts reached)
                 dispatch_tool(
-                    vm, "report_completion", completion_tc.arguments,
+                    runtime, "report_completion", completion_tc.arguments,
                     tracker, protected_files, skill_loader,
                     context_config=context_config,
                 )

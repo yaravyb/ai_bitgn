@@ -37,6 +37,14 @@ def _make_scout_summary_mock(**overrides):
     return MagicMock(**defaults)
 
 
+def _make_mock_runtime():
+    """Create a mock RuntimeAdapter for testing."""
+    rt = MagicMock()
+    rt.runtime_type = "mini"
+    rt.extra_tools = frozenset()
+    return rt
+
+
 # ---------------------------------------------------------------------------
 # Test 10.1: Module exists and exports run_agent
 # ---------------------------------------------------------------------------
@@ -58,7 +66,7 @@ class TestLoopModuleExists:
         sig = inspect.signature(run_agent)
         params = list(sig.parameters.keys())
         assert "executor_model" in params
-        assert "harness_url" in params
+        assert "runtime" in params
         assert "task_text" in params
         assert "scout_model" in params
         assert "skills_dir" in params
@@ -73,35 +81,13 @@ class TestLoopInitialization:
 
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
-    def test_creates_vm_client_with_harness_url(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout,
-    ):
-        """The VM client is created with the harness_url."""
-        from agent.loop import run_agent
-
-        mock_run_scout.return_value = _make_scout_summary_mock()
-        mock_call_llm.return_value = MagicMock(
-            content="done", tool_calls=[], raw=None,
-        )
-
-        run_agent(
-            executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
-            task_text="do something",
-        )
-
-        mock_vm_cls.assert_called_once_with("http://test:1234")
-
-    @patch("agent.loop.run_scout")
-    @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_protected_files_initialized_with_agents_md(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout,
+        self, mock_call_llm, mock_run_scout,
     ):
         """protected_files starts with 'agents.md'."""
         from agent.loop import run_agent
 
+        mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock()
         mock_call_llm.return_value = MagicMock(
             content="done", tool_calls=[], raw=None,
@@ -119,7 +105,7 @@ class TestLoopInitialization:
 
             run_agent(
                 executor_model="openai/gpt-4.1",
-                harness_url="http://test:1234",
+                runtime=mock_runtime,
                 task_text="do something",
             )
 
@@ -131,14 +117,14 @@ class TestLoopInitialization:
     @patch("agent.loop.SkillLoader")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_skill_loader_created_when_skills_dir_exists(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_sl_cls,
+        self, mock_call_llm, mock_run_scout, mock_sl_cls,
         tmp_path,
     ):
         """When skills_dir is provided and exists, SkillLoader is instantiated."""
         from agent.loop import run_agent
 
+        mock_runtime = _make_mock_runtime()
         skills_dir = tmp_path / "skills"
         skills_dir.mkdir()
 
@@ -153,7 +139,7 @@ class TestLoopInitialization:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="do something",
             skills_dir=skills_dir,
         )
@@ -162,13 +148,13 @@ class TestLoopInitialization:
 
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_skill_loader_not_created_when_no_skills_dir(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout,
+        self, mock_call_llm, mock_run_scout,
     ):
         """When skills_dir is None, no SkillLoader error occurs."""
         from agent.loop import run_agent
 
+        mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock()
         mock_call_llm.return_value = MagicMock(
             content="done", tool_calls=[], raw=None,
@@ -177,7 +163,7 @@ class TestLoopInitialization:
         # Should not raise
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="do something",
             skills_dir=None,
         )
@@ -192,13 +178,13 @@ class TestLoopScoutPhase:
 
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_run_scout_called_with_scout_config(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout,
+        self, mock_call_llm, mock_run_scout,
     ):
         from agent.loop import run_agent
         from agent.scout import ScoutConfig
 
+        mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock()
         mock_call_llm.return_value = MagicMock(
             content="done", tool_calls=[], raw=None,
@@ -206,7 +192,7 @@ class TestLoopScoutPhase:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="do something",
             scout_model="openai/gpt-4.1-mini",
         )
@@ -222,13 +208,13 @@ class TestLoopScoutPhase:
 
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_scout_model_defaults_to_executor_model(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout,
+        self, mock_call_llm, mock_run_scout,
     ):
         from agent.loop import run_agent
         from agent.scout import ScoutConfig
 
+        mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock()
         mock_call_llm.return_value = MagicMock(
             content="done", tool_calls=[], raw=None,
@@ -236,7 +222,7 @@ class TestLoopScoutPhase:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="test task",
             scout_model=None,  # Should default to executor model
         )
@@ -248,13 +234,13 @@ class TestLoopScoutPhase:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_protected_files_expanded_from_scout_policy_files(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
     ):
         """Policy files from scout summary expand protected_files."""
         from agent.loop import run_agent
 
+        mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock(
             policy_files={
                 "workspace/RULES.md": "some rules",
@@ -271,7 +257,7 @@ class TestLoopScoutPhase:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="do something",
         )
 
@@ -293,12 +279,12 @@ class TestLoopSystemPrompt:
     @patch("agent.loop.build_system_prompt")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_build_system_prompt_called(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_bsp,
+        self, mock_call_llm, mock_run_scout, mock_bsp,
     ):
         from agent.loop import run_agent
 
+        mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock()
         mock_call_llm.return_value = MagicMock(
             content="done", tool_calls=[], raw=None,
@@ -307,7 +293,7 @@ class TestLoopSystemPrompt:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="do something",
         )
 
@@ -317,14 +303,14 @@ class TestLoopSystemPrompt:
     @patch("agent.loop.build_system_prompt")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_system_prompt_uses_skills_metadata_and_scout_summary(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_bsp, mock_sl_cls,
+        self, mock_call_llm, mock_run_scout, mock_bsp, mock_sl_cls,
         tmp_path,
     ):
         """build_system_prompt gets skills_metadata, scout_summary, security_body."""
         from agent.loop import run_agent
 
+        mock_runtime = _make_mock_runtime()
         skills_dir = tmp_path / "skills"
         skills_dir.mkdir()
 
@@ -345,7 +331,7 @@ class TestLoopSystemPrompt:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="do something",
             skills_dir=skills_dir,
         )
@@ -365,13 +351,13 @@ class TestLoopExecutorPhase:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_task_wrapped_in_delimiters(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
     ):
         """The task text is wrapped in <task> delimiters in the user message."""
         from agent.loop import run_agent
 
+        mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock()
         mock_call_llm.return_value = MagicMock(
             content="done", tool_calls=[], raw=None,
@@ -379,7 +365,7 @@ class TestLoopExecutorPhase:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="do the thing",
         )
 
@@ -399,13 +385,13 @@ class TestLoopExecutorPhase:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_tool_calls_dispatched_and_results_appended(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
     ):
         """When LLM returns tool calls, they are dispatched and results appended."""
         from agent.loop import run_agent
 
+        mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock()
 
         tc1 = ToolCall(id="tc_1", name="read_file", arguments={"path": "a.md"})
@@ -422,7 +408,7 @@ class TestLoopExecutorPhase:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="do something",
         )
 
@@ -440,13 +426,13 @@ class TestLoopExecutorPhase:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_breaks_on_report_completion(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
     ):
         """Loop breaks when report_completion tool is called."""
         from agent.loop import run_agent
 
+        mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock()
 
         tc = ToolCall(
@@ -460,7 +446,7 @@ class TestLoopExecutorPhase:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="do something",
         )
 
@@ -470,13 +456,13 @@ class TestLoopExecutorPhase:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_breaks_on_no_tool_calls(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
     ):
         """Loop breaks when LLM returns text only (no tool calls)."""
         from agent.loop import run_agent
 
+        mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock()
         mock_call_llm.return_value = MagicMock(
             content="I'm done", tool_calls=[], raw=None,
@@ -484,7 +470,7 @@ class TestLoopExecutorPhase:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="do something",
         )
 
@@ -494,13 +480,13 @@ class TestLoopExecutorPhase:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_step_limit_30(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
     ):
         """Executor loop stops after 30 steps."""
         from agent.loop import run_agent
 
+        mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock()
 
         tc = ToolCall(id="tc1", name="read_file", arguments={"path": "x.md"})
@@ -511,7 +497,7 @@ class TestLoopExecutorPhase:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="do something",
         )
 
@@ -521,13 +507,13 @@ class TestLoopExecutorPhase:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_assistant_message_includes_tool_calls_structure(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
     ):
         """Assistant message appended to history has proper tool_calls format."""
         from agent.loop import run_agent
 
+        mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock()
 
         tc = ToolCall(id="tc_1", name="read_file", arguments={"path": "a.md"})
@@ -539,7 +525,7 @@ class TestLoopExecutorPhase:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="test",
         )
 
@@ -557,14 +543,14 @@ class TestLoopExecutorPhase:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_call_llm_receives_tool_schemas(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
     ):
-        """call_llm is called with TOOL_SCHEMAS."""
+        """call_llm is called with tool schemas from get_tool_schemas."""
         from agent.loop import run_agent
-        from agent.tools import TOOL_SCHEMAS
+        from agent.tools import get_tool_schemas
 
+        mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock()
         mock_call_llm.return_value = MagicMock(
             content="done", tool_calls=[], raw=None,
@@ -572,25 +558,25 @@ class TestLoopExecutorPhase:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="test",
         )
 
         llm_call = mock_call_llm.call_args
-        # tools should be TOOL_SCHEMAS
+        # tools should be get_tool_schemas("mini")
         tools_arg = llm_call[1].get("tools") or llm_call[0][2]
-        assert tools_arg == TOOL_SCHEMAS
+        assert tools_arg == get_tool_schemas("mini")
 
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_executor_model_passed_to_call_llm(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
     ):
         """The executor_model parameter is forwarded to call_llm."""
         from agent.loop import run_agent
 
+        mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock()
         mock_call_llm.return_value = MagicMock(
             content="done", tool_calls=[], raw=None,
@@ -598,7 +584,7 @@ class TestLoopExecutorPhase:
 
         run_agent(
             executor_model="anthropic/claude-sonnet-4-6",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="test",
         )
 
@@ -634,12 +620,12 @@ class TestLoopScoutContextInjection:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_scout_summary_injected_as_user_message(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
     ):
         from agent.loop import run_agent
 
+        mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock(
             policy_files={"AGENTS.MD": "policy content"},
             vault_skills={"skills/skill-todo.md": "todo skill"},
@@ -653,7 +639,7 @@ class TestLoopScoutContextInjection:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="do something",
         )
 
@@ -830,12 +816,12 @@ class TestLoopMicroCompactCalledBeforeLLM:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_micro_compact_called_before_llm(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp, mock_micro_compact,
+        self, mock_call_llm, mock_run_scout, mock_dp, mock_micro_compact,
     ):
         from agent.loop import run_agent
 
+        mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock()
 
         tc = ToolCall(id="tc1", name="read_file", arguments={"path": "x.md"})
@@ -847,7 +833,7 @@ class TestLoopMicroCompactCalledBeforeLLM:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="do something",
         )
 
@@ -863,13 +849,13 @@ class TestLoopAutoCompactTriggered:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_auto_compact_triggered_on_threshold(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
         mock_micro_compact, mock_estimate_tokens,
     ):
         from agent.loop import run_agent
 
+        mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock()
 
         # First call: return tool calls so loop continues
@@ -900,7 +886,7 @@ class TestLoopAutoCompactTriggered:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="do something",
         )
 
@@ -919,15 +905,15 @@ class TestLoopAutoCompactSavesTranscript:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_transcript_saved(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
         mock_micro_compact, mock_estimate_tokens,
         tmp_path,
     ):
         from agent.loop import run_agent
         import os
 
+        mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock()
 
         tc = ToolCall(id="tc1", name="read_file", arguments={"path": "x.md"})
@@ -951,7 +937,7 @@ class TestLoopAutoCompactSavesTranscript:
         try:
             run_agent(
                 executor_model="openai/gpt-4.1",
-                harness_url="http://test:1234",
+                runtime=mock_runtime,
                 task_text="do something",
             )
         finally:
@@ -973,13 +959,13 @@ class TestLoopAutoCompactPreservesSystemMessage:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_system_message_preserved(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
         mock_micro_compact, mock_estimate_tokens,
     ):
         from agent.loop import run_agent
 
+        mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock()
 
         tc = ToolCall(id="tc1", name="read_file", arguments={"path": "x.md"})
@@ -994,7 +980,7 @@ class TestLoopAutoCompactPreservesSystemMessage:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="do something",
         )
 
@@ -1012,13 +998,13 @@ class TestLoopAutoCompactReplacesMessages:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_messages_replaced(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
         mock_micro_compact, mock_estimate_tokens,
     ):
         from agent.loop import run_agent
 
+        mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock()
 
         tc = ToolCall(id="tc1", name="read_file", arguments={"path": "x.md"})
@@ -1033,7 +1019,7 @@ class TestLoopAutoCompactReplacesMessages:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="do something",
         )
 
@@ -1058,14 +1044,14 @@ class TestLoopCompactSentinelTriggersCompaction:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_compact_sentinel_triggers(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
         mock_micro_compact, mock_estimate_tokens,
     ):
         from agent.loop import run_agent
         from agent.context import COMPACT_SENTINEL
 
+        mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock()
 
         tc_compact = ToolCall(id="tc1", name="compact", arguments={})
@@ -1078,7 +1064,7 @@ class TestLoopCompactSentinelTriggersCompaction:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="do something",
         )
 
@@ -1097,14 +1083,14 @@ class TestLoopContextConfigPassedToDispatch:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_context_config_in_dispatch_call(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
         mock_micro_compact, mock_estimate_tokens,
     ):
         from agent.loop import run_agent
         from agent.context import ContextConfig
 
+        mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock()
 
         tc = ToolCall(id="tc1", name="read_file", arguments={"path": "x.md"})
@@ -1116,7 +1102,7 @@ class TestLoopContextConfigPassedToDispatch:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="do something",
         )
 
@@ -1212,14 +1198,14 @@ class TestTextExtractionInAutoSubmit:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_json_text_extracts_answer(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
         mock_dispatch_tool,
     ):
         """When LLM outputs JSON text with answer key, the answer is extracted."""
         from agent.loop import run_agent
 
+        mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock()
         mock_call_llm.return_value = MagicMock(
             content='{"answer": "TODO", "grounding_refs": ["HOME.MD"], "code": "completed"}',
@@ -1229,7 +1215,7 @@ class TestTextExtractionInAutoSubmit:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="test task",
         )
 
@@ -1252,9 +1238,8 @@ class TestVerificationInterceptsReportCompletion:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_report_completion_intercepted_on_first_call(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
         mock_dispatch_tool, mock_from_env,
     ):
         """When verification enabled, first report_completion is intercepted.
@@ -1265,6 +1250,7 @@ class TestVerificationInterceptsReportCompletion:
         from agent.loop import run_agent
         from agent.context import ContextConfig
 
+        mock_runtime = _make_mock_runtime()
         mock_from_env.return_value = ContextConfig(
             verification_enabled=True, verification_max_attempts=1,
         )
@@ -1293,7 +1279,7 @@ class TestVerificationInterceptsReportCompletion:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="test task",
         )
 
@@ -1317,14 +1303,14 @@ class TestVerificationDisabledDispatchesImmediately:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_no_interception_when_disabled(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
         mock_dispatch_tool,
     ):
         """With verification disabled (default), report_completion dispatches directly."""
         from agent.loop import run_agent
 
+        mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock()
 
         tc = ToolCall(
@@ -1339,7 +1325,7 @@ class TestVerificationDisabledDispatchesImmediately:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="test task",
         )
 
@@ -1356,9 +1342,8 @@ class TestVerificationInterceptsTextOnlyAutosubmit:
     @patch("agent.loop.dispatch_tool")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_text_only_intercepted(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout,
+        self, mock_call_llm, mock_run_scout,
         mock_dispatch_tool, mock_from_env,
     ):
         """Text-only response is intercepted for verification when enabled.
@@ -1369,6 +1354,7 @@ class TestVerificationInterceptsTextOnlyAutosubmit:
         from agent.loop import run_agent
         from agent.context import ContextConfig
 
+        mock_runtime = _make_mock_runtime()
         mock_from_env.return_value = ContextConfig(
             verification_enabled=True, verification_max_attempts=1,
         )
@@ -1389,7 +1375,7 @@ class TestVerificationInterceptsTextOnlyAutosubmit:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="test task",
         )
 
@@ -1412,15 +1398,15 @@ class TestVerificationDispatchesOtherToolsDuringIntercept:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_other_tools_dispatched_with_completion(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
         mock_dispatch_tool, mock_from_env,
     ):
         """When report_completion is batched with other tools, others are dispatched."""
         from agent.loop import run_agent
         from agent.context import ContextConfig
 
+        mock_runtime = _make_mock_runtime()
         mock_from_env.return_value = ContextConfig(
             verification_enabled=True, verification_max_attempts=1,
         )
@@ -1450,7 +1436,7 @@ class TestVerificationDispatchesOtherToolsDuringIntercept:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="test task",
         )
 
@@ -1469,15 +1455,15 @@ class TestVerificationMaxAttemptsThenDispatch:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_dispatched_after_max_attempts(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
         mock_dispatch_tool, mock_from_env,
     ):
         """After 2 verification attempts, the next report_completion goes to harness."""
         from agent.loop import run_agent
         from agent.context import ContextConfig
 
+        mock_runtime = _make_mock_runtime()
         mock_from_env.return_value = ContextConfig(
             verification_enabled=True, verification_max_attempts=2,
         )
@@ -1508,7 +1494,7 @@ class TestVerificationMaxAttemptsThenDispatch:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="test task",
         )
 
@@ -1526,15 +1512,15 @@ class TestVerificationStepsCountAgainstLimit:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_steps_capped_at_30(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
         mock_dispatch_tool, mock_from_env,
     ):
         """Verification cycles consume steps from the 30-step limit."""
         from agent.loop import run_agent
         from agent.context import ContextConfig
 
+        mock_runtime = _make_mock_runtime()
         mock_from_env.return_value = ContextConfig(
             verification_enabled=True, verification_max_attempts=100,
         )
@@ -1557,7 +1543,7 @@ class TestVerificationStepsCountAgainstLimit:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="test task",
         )
 
@@ -1573,15 +1559,15 @@ class TestVerificationOutcomeConfirmedLog:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_confirmed_log_output(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
         mock_dispatch_tool, mock_from_env, capsys,
     ):
         """When verified answer matches original, CONFIRMED is printed."""
         from agent.loop import run_agent
         from agent.context import ContextConfig
 
+        mock_runtime = _make_mock_runtime()
         mock_from_env.return_value = ContextConfig(
             verification_enabled=True, verification_max_attempts=1,
         )
@@ -1609,7 +1595,7 @@ class TestVerificationOutcomeConfirmedLog:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="test task",
         )
 
@@ -1625,15 +1611,15 @@ class TestVerificationOutcomeRevisedLog:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_revised_log_output(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
         mock_dispatch_tool, mock_from_env, capsys,
     ):
         """When verified answer differs from original, REVISED is printed."""
         from agent.loop import run_agent
         from agent.context import ContextConfig
 
+        mock_runtime = _make_mock_runtime()
         mock_from_env.return_value = ContextConfig(
             verification_enabled=True, verification_max_attempts=1,
         )
@@ -1660,7 +1646,7 @@ class TestVerificationOutcomeRevisedLog:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="test task",
         )
 
@@ -1676,15 +1662,15 @@ class TestVerificationEmptyResponseFallback:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_empty_response_submits_captured_answer(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
         mock_dispatch_tool, mock_from_env,
     ):
         """When LLM returns empty during verification, captured answer is submitted."""
         from agent.loop import run_agent
         from agent.context import ContextConfig
 
+        mock_runtime = _make_mock_runtime()
         mock_from_env.return_value = ContextConfig(
             verification_enabled=True, verification_max_attempts=1,
         )
@@ -1705,7 +1691,7 @@ class TestVerificationEmptyResponseFallback:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="test task",
         )
 
@@ -1722,13 +1708,13 @@ class TestExistingTestsPassWithVerificationDisabled:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_backward_compat_text_only(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
     ):
         """Text-only response auto-submits normally with verification disabled."""
         from agent.loop import run_agent
 
+        mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock()
         mock_call_llm.return_value = MagicMock(
             content="I'm done", tool_calls=[], raw=None,
@@ -1736,7 +1722,7 @@ class TestExistingTestsPassWithVerificationDisabled:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="do something",
         )
 

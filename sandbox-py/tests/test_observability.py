@@ -304,17 +304,24 @@ class TestCallLlmMetadataParameter:
 class TestLoopTraceMetadata:
     """Task 4.2: run_agent generates trace metadata and passes to call_llm."""
 
+    @staticmethod
+    def _make_mock_runtime():
+        rt = MagicMock()
+        rt.runtime_type = "mini"
+        rt.extra_tools = frozenset()
+        return rt
+
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_call_llm_receives_metadata_with_trace_id(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
     ):
         """call_llm should receive metadata containing a trace_id (UUID4)."""
         from agent.loop import run_agent
         import uuid
 
+        mock_runtime = self._make_mock_runtime()
         mock_run_scout.return_value = MagicMock(
             policy_files={}, vault_skills={}, directory_tree="",
             files_read=set(), folders_explored=[],
@@ -326,7 +333,7 @@ class TestLoopTraceMetadata:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="do something",
         )
 
@@ -340,13 +347,13 @@ class TestLoopTraceMetadata:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_call_llm_receives_metadata_with_trace_name(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
     ):
         """Metadata should contain trace_name = 'run_agent'."""
         from agent.loop import run_agent
 
+        mock_runtime = self._make_mock_runtime()
         mock_run_scout.return_value = MagicMock(
             policy_files={}, vault_skills={}, directory_tree="",
             files_read=set(), folders_explored=[],
@@ -358,7 +365,7 @@ class TestLoopTraceMetadata:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="do something",
         )
 
@@ -369,13 +376,13 @@ class TestLoopTraceMetadata:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_call_llm_receives_metadata_with_session_id_from_env(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
     ):
         """Metadata should contain session_id from SESSION_ID env var."""
         from agent.loop import run_agent
 
+        mock_runtime = self._make_mock_runtime()
         mock_run_scout.return_value = MagicMock(
             policy_files={}, vault_skills={}, directory_tree="",
             files_read=set(), folders_explored=[],
@@ -389,7 +396,7 @@ class TestLoopTraceMetadata:
         try:
             run_agent(
                 executor_model="openai/gpt-4.1",
-                harness_url="http://test:1234",
+                runtime=mock_runtime,
                 task_text="do something",
             )
         finally:
@@ -402,13 +409,13 @@ class TestLoopTraceMetadata:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_session_id_empty_when_env_not_set(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
     ):
         """When SESSION_ID is not set, session_id should be empty string."""
         from agent.loop import run_agent
 
+        mock_runtime = self._make_mock_runtime()
         mock_run_scout.return_value = MagicMock(
             policy_files={}, vault_skills={}, directory_tree="",
             files_read=set(), folders_explored=[],
@@ -421,7 +428,7 @@ class TestLoopTraceMetadata:
         os.environ.pop("SESSION_ID", None)
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="do something",
         )
 
@@ -432,13 +439,13 @@ class TestLoopTraceMetadata:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_trace_metadata_contains_model_and_task(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
     ):
         """trace_metadata should contain the executor model and truncated task text."""
         from agent.loop import run_agent
 
+        mock_runtime = self._make_mock_runtime()
         mock_run_scout.return_value = MagicMock(
             policy_files={}, vault_skills={}, directory_tree="",
             files_read=set(), folders_explored=[],
@@ -450,7 +457,7 @@ class TestLoopTraceMetadata:
 
         run_agent(
             executor_model="anthropic/claude-sonnet-4-6",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="A very long task description",
         )
 
@@ -463,13 +470,13 @@ class TestLoopTraceMetadata:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_task_text_truncated_at_200_chars(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
     ):
         """Task text in trace_metadata should be truncated to 200 chars."""
         from agent.loop import run_agent
 
+        mock_runtime = self._make_mock_runtime()
         mock_run_scout.return_value = MagicMock(
             policy_files={}, vault_skills={}, directory_tree="",
             files_read=set(), folders_explored=[],
@@ -482,7 +489,7 @@ class TestLoopTraceMetadata:
         long_task = "x" * 500
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text=long_task,
         )
 
@@ -493,14 +500,14 @@ class TestLoopTraceMetadata:
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    @patch("agent.loop.MiniRuntimeClientSync")
     def test_same_trace_id_for_all_calls_in_one_run(
-        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        self, mock_call_llm, mock_run_scout, mock_dp,
     ):
         """All call_llm calls within one run_agent must share the same trace_id."""
         from agent.loop import run_agent
         from agent.llm import ToolCall
 
+        mock_runtime = self._make_mock_runtime()
         mock_run_scout.return_value = MagicMock(
             policy_files={}, vault_skills={}, directory_tree="",
             files_read=set(), folders_explored=[],
@@ -516,7 +523,7 @@ class TestLoopTraceMetadata:
 
         run_agent(
             executor_model="openai/gpt-4.1",
-            harness_url="http://test:1234",
+            runtime=mock_runtime,
             task_text="do something",
         )
 
