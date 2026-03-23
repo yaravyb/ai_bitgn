@@ -7,10 +7,11 @@ from bitgn.harness_connect import HarnessServiceClientSync
 from bitgn.harness_pb2 import StatusRequest, GetBenchmarkRequest, StartPlaygroundRequest, EvalPolicy, EndTrialRequest
 from connectrpc.errors import ConnectError
 
-from agent import run_agent
+from agent import run_agent, create_runtime
 from agent.observability import configure_observability
 
 BITGN_URL = os.getenv("BENCHMARK_HOST") or "https://api.bitgn.com"
+BENCHMARK_ID = os.getenv("BENCHMARK_ID") or "bitgn/sandbox"
 
 # Model configuration: LiteLLM provider/model format
 MODEL_ID = os.getenv("MODEL_ID") or os.getenv("EXECUTOR_MODEL") or "openai/gpt-4.1"
@@ -32,11 +33,11 @@ def main() -> None:
 
     scores = []
     run_start = time.time()
-    print(f"Model: {MODEL_ID}  (scout: {SCOUT_MODEL})")
+    print(f"Model: {MODEL_ID}  (scout: {SCOUT_MODEL})  benchmark: {BENCHMARK_ID}")
     try:
         client = HarnessServiceClientSync(BITGN_URL)
         print("Connecting to BitGN", client.status(StatusRequest()))
-        res = client.get_benchmark(GetBenchmarkRequest(benchmark_id="bitgn/sandbox"))
+        res = client.get_benchmark(GetBenchmarkRequest(benchmark_id=BENCHMARK_ID))
         print(f"{EvalPolicy.Name(res.policy)} benchmark: {res.benchmark_id} with {len(res.tasks)} tasks.\n{CLI_GREEN}{res.description}{CLI_CLR}")
 
 
@@ -46,17 +47,18 @@ def main() -> None:
             print(f"{'='*30} Starting task: {t.task_id} {'='*30}")
 
             trial = client.start_playground(StartPlaygroundRequest(
-                benchmark_id="bitgn/sandbox",
+                benchmark_id=BENCHMARK_ID,
                 task_id=t.task_id,
             ))
 
             print(f"{CLI_BLUE}{trial.instruction}{CLI_CLR}\n{'-'*80}")
 
+            runtime = create_runtime(BENCHMARK_ID, trial.harness_url)
             task_start = time.time()
             try:
                 run_agent(
                     executor_model=MODEL_ID,
-                    harness_url=trial.harness_url,
+                    runtime=runtime,
                     task_text=trial.instruction,
                     scout_model=SCOUT_MODEL,
                     skills_dir=SKILLS_DIR,
