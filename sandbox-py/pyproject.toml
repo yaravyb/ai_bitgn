@@ -9,7 +9,6 @@ dependencies = [
     "bitgn-api-protocolbuffers-python==34.1.0.1.20260323140311+cbbd8b9c3c20",
     "boto3>=1.42.69",
     "litellm>=1.82.3",
-    "openai>=2.26.0",
     "pydantic>=2.12.5",
     # AICODE-NOTE: Keep the protobuf runtime floor aligned with the generated Buf
     # SDK version; otherwise the sample imports fail before any agent logic runs.
