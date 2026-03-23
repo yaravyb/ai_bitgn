@@ -38,6 +38,8 @@ for _mod in [
     "bitgn.vm",
     "bitgn.vm.mini_connect",
     "bitgn.vm.mini_pb2",
+    "bitgn.vm.pcm_connect",
+    "bitgn.vm.pcm_pb2",
     "bitgn.harness_connect",
     "bitgn.harness_pb2",
 ]:
