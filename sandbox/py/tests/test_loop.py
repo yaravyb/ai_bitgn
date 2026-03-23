@@ -812,8 +812,317 @@ class TestLoopModuleDependencies:
                 if node.module.startswith("agent."):
                     imported_modules.add(node.module.replace("agent.", ""))
 
-        # loop.py should import from these modules
-        expected = {"scout", "llm", "dispatch", "prompt", "skills", "tracker", "tools"}
+        # loop.py should import from these modules (including context)
+        expected = {"scout", "llm", "dispatch", "prompt", "skills", "tracker", "tools", "context"}
         assert expected.issubset(imported_modules), (
             f"Missing imports: {expected - imported_modules}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Context management integration tests (Task 10.2)
+# ---------------------------------------------------------------------------
+
+class TestLoopMicroCompactCalledBeforeLLM:
+    """micro_compact is called before each call_llm() in the executor loop."""
+
+    @patch("agent.loop.micro_compact")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    @patch("agent.loop.MiniRuntimeClientSync")
+    def test_micro_compact_called_before_llm(
+        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp, mock_micro_compact,
+    ):
+        from agent.loop import run_agent
+
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        tc = ToolCall(id="tc1", name="read_file", arguments={"path": "x.md"})
+        mock_call_llm.side_effect = [
+            MagicMock(content=None, tool_calls=[tc], raw=None),
+            MagicMock(content="done", tool_calls=[], raw=None),
+        ]
+        mock_dp.return_value = [("tc1", '{"content": "ok"}')]
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            harness_url="http://test:1234",
+            task_text="do something",
+        )
+
+        # micro_compact should have been called at least twice (once per call_llm)
+        assert mock_micro_compact.call_count >= 2
+
+
+class TestLoopAutoCompactTriggered:
+    """Auto-compact triggers when token threshold is exceeded."""
+
+    @patch("agent.loop.estimate_tokens")
+    @patch("agent.loop.micro_compact")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    @patch("agent.loop.MiniRuntimeClientSync")
+    def test_auto_compact_triggered_on_threshold(
+        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        mock_micro_compact, mock_estimate_tokens,
+    ):
+        from agent.loop import run_agent
+
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        # First call: return tool calls so loop continues
+        tc = ToolCall(id="tc1", name="read_file", arguments={"path": "x.md"})
+        mock_call_llm.side_effect = [
+            # First iteration LLM call
+            MagicMock(content=None, tool_calls=[tc], raw=None),
+            # Auto-compact summarization call
+            MagicMock(content="Summary of conversation", tool_calls=[], raw=None),
+            # Second iteration LLM call (after compaction)
+            MagicMock(content="done", tool_calls=[], raw=None),
+        ]
+        mock_dp.return_value = [("tc1", '{"content": "ok"}')]
+
+        # estimate_tokens is called:
+        # 1. Pre-LLM check step 1: below threshold
+        # 2. Pre-LLM check step 2: above threshold -> trigger auto-compact
+        # 3. Inside _apply_auto_compact (tokens_before)
+        # 4. Inside _apply_auto_compact (tokens_after)
+        # Note: after auto_compact, messages are replaced and loop continues
+        # to call_llm (no re-check of estimate_tokens before that call_llm).
+        mock_estimate_tokens.side_effect = [
+            1000,     # Step 1 pre-LLM check: below threshold
+            100000,   # Step 2 pre-LLM check: above threshold -> trigger
+            100000,   # _apply_auto_compact tokens_before
+            500,      # _apply_auto_compact tokens_after
+        ]
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            harness_url="http://test:1234",
+            task_text="do something",
+        )
+
+        # call_llm should have been called 3 times:
+        # 1. Normal executor LLM call
+        # 2. Summarization call (auto-compact)
+        # 3. Normal executor LLM call after compaction
+        assert mock_call_llm.call_count == 3
+
+
+class TestLoopAutoCompactSavesTranscript:
+    """Auto-compact saves a transcript file."""
+
+    @patch("agent.loop.estimate_tokens")
+    @patch("agent.loop.micro_compact")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    @patch("agent.loop.MiniRuntimeClientSync")
+    def test_transcript_saved(
+        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        mock_micro_compact, mock_estimate_tokens,
+        tmp_path,
+    ):
+        from agent.loop import run_agent
+        import os
+
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        tc = ToolCall(id="tc1", name="read_file", arguments={"path": "x.md"})
+        mock_call_llm.side_effect = [
+            MagicMock(content=None, tool_calls=[tc], raw=None),
+            MagicMock(content="Summary", tool_calls=[], raw=None),
+            MagicMock(content="done", tool_calls=[], raw=None),
+        ]
+        mock_dp.return_value = [("tc1", '{"content": "ok"}')]
+
+        mock_estimate_tokens.side_effect = [
+            1000,
+            100000,  # Trigger auto-compact
+            100000,  # tokens_before in _apply_auto_compact
+            500,     # tokens_after in _apply_auto_compact
+        ]
+
+        transcript_dir = str(tmp_path / "transcripts")
+        os.environ["CTX_TRANSCRIPT_DIR"] = transcript_dir
+        os.environ["CTX_AUTO_COMPACT_THRESHOLD"] = "80000"
+        try:
+            run_agent(
+                executor_model="openai/gpt-4.1",
+                harness_url="http://test:1234",
+                task_text="do something",
+            )
+        finally:
+            os.environ.pop("CTX_TRANSCRIPT_DIR", None)
+            os.environ.pop("CTX_AUTO_COMPACT_THRESHOLD", None)
+
+        # A transcript file should exist in the transcript directory
+        if os.path.isdir(transcript_dir):
+            files = os.listdir(transcript_dir)
+            transcript_files = [f for f in files if f.startswith("transcript_")]
+            assert len(transcript_files) >= 1, "Expected at least one transcript file"
+
+
+class TestLoopAutoCompactPreservesSystemMessage:
+    """Auto-compact preserves the system message."""
+
+    @patch("agent.loop.estimate_tokens")
+    @patch("agent.loop.micro_compact")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    @patch("agent.loop.MiniRuntimeClientSync")
+    def test_system_message_preserved(
+        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        mock_micro_compact, mock_estimate_tokens,
+    ):
+        from agent.loop import run_agent
+
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        tc = ToolCall(id="tc1", name="read_file", arguments={"path": "x.md"})
+        mock_call_llm.side_effect = [
+            MagicMock(content=None, tool_calls=[tc], raw=None),
+            MagicMock(content="Summary of conversation", tool_calls=[], raw=None),
+            MagicMock(content="done", tool_calls=[], raw=None),
+        ]
+        mock_dp.return_value = [("tc1", '{"content": "ok"}')]
+
+        mock_estimate_tokens.side_effect = [1000, 100000, 100000, 500]
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            harness_url="http://test:1234",
+            task_text="do something",
+        )
+
+        # After auto-compact, the third call_llm should have messages starting with system msg
+        third_call = mock_call_llm.call_args_list[2]
+        messages = third_call[0][1] if len(third_call[0]) > 1 else third_call[1]["messages"]
+        assert messages[0]["role"] == "system"
+
+
+class TestLoopAutoCompactReplacesMessages:
+    """Auto-compact replaces messages with [system, summary, ack]."""
+
+    @patch("agent.loop.estimate_tokens")
+    @patch("agent.loop.micro_compact")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    @patch("agent.loop.MiniRuntimeClientSync")
+    def test_messages_replaced(
+        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        mock_micro_compact, mock_estimate_tokens,
+    ):
+        from agent.loop import run_agent
+
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        tc = ToolCall(id="tc1", name="read_file", arguments={"path": "x.md"})
+        mock_call_llm.side_effect = [
+            MagicMock(content=None, tool_calls=[tc], raw=None),
+            MagicMock(content="Compressed summary", tool_calls=[], raw=None),
+            MagicMock(content="done", tool_calls=[], raw=None),
+        ]
+        mock_dp.return_value = [("tc1", '{"content": "ok"}')]
+
+        mock_estimate_tokens.side_effect = [1000, 100000, 100000, 500]
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            harness_url="http://test:1234",
+            task_text="do something",
+        )
+
+        # After auto-compact, the compacted messages form the base of the conversation.
+        # Note: mock captures a reference to the mutable list, so by assertion time
+        # the assistant message from the 3rd call has been appended. We check the
+        # first 3 entries which are the compacted [system, summary, ack].
+        third_call = mock_call_llm.call_args_list[2]
+        messages = third_call[0][1] if len(third_call[0]) > 1 else third_call[1]["messages"]
+        assert messages[0]["role"] == "system"
+        assert messages[1]["role"] == "user"
+        assert "Compressed summary" in messages[1]["content"] or "compressed" in messages[1]["content"].lower()
+        assert messages[2]["role"] == "assistant"
+        assert "Understood" in messages[2]["content"]
+
+
+class TestLoopCompactSentinelTriggersCompaction:
+    """Compact sentinel in dispatch results triggers auto-compact."""
+
+    @patch("agent.loop.estimate_tokens", return_value=1000)
+    @patch("agent.loop.micro_compact")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    @patch("agent.loop.MiniRuntimeClientSync")
+    def test_compact_sentinel_triggers(
+        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        mock_micro_compact, mock_estimate_tokens,
+    ):
+        from agent.loop import run_agent
+        from agent.context import COMPACT_SENTINEL
+
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        tc_compact = ToolCall(id="tc1", name="compact", arguments={})
+        mock_call_llm.side_effect = [
+            MagicMock(content=None, tool_calls=[tc_compact], raw=None),
+            MagicMock(content="Summary after compact tool", tool_calls=[], raw=None),
+            MagicMock(content="done", tool_calls=[], raw=None),
+        ]
+        mock_dp.return_value = [("tc1", COMPACT_SENTINEL)]
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            harness_url="http://test:1234",
+            task_text="do something",
+        )
+
+        # call_llm should have been called 3 times:
+        # 1. Normal executor LLM call
+        # 2. Summarization call (triggered by compact sentinel)
+        # 3. Normal executor LLM call after compaction
+        assert mock_call_llm.call_count == 3
+
+
+class TestLoopContextConfigPassedToDispatch:
+    """context_config is passed to dispatch_parallel calls."""
+
+    @patch("agent.loop.estimate_tokens", return_value=1000)
+    @patch("agent.loop.micro_compact")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    @patch("agent.loop.MiniRuntimeClientSync")
+    def test_context_config_in_dispatch_call(
+        self, mock_vm_cls, mock_call_llm, mock_run_scout, mock_dp,
+        mock_micro_compact, mock_estimate_tokens,
+    ):
+        from agent.loop import run_agent
+        from agent.context import ContextConfig
+
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        tc = ToolCall(id="tc1", name="read_file", arguments={"path": "x.md"})
+        mock_call_llm.side_effect = [
+            MagicMock(content=None, tool_calls=[tc], raw=None),
+            MagicMock(content="done", tool_calls=[], raw=None),
+        ]
+        mock_dp.return_value = [("tc1", '{"content": "ok"}')]
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            harness_url="http://test:1234",
+            task_text="do something",
+        )
+
+        # dispatch_parallel should have received context_config
+        dp_call = mock_dp.call_args
+        # Check keyword argument
+        context_config = dp_call[1].get("context_config")
+        assert context_config is not None
+        assert isinstance(context_config, ContextConfig)

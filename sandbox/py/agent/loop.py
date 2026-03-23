@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import posixpath
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,12 @@ from agent.prompt import build_system_prompt
 from agent.skills import SkillLoader
 from agent.tracker import GroundingTracker
 from agent.tools import TOOL_SCHEMAS
+from agent.context import (
+    ContextConfig,
+    estimate_tokens,
+    micro_compact,
+    COMPACT_SENTINEL,
+)
 
 log = logging.getLogger(__name__)
 
@@ -87,6 +94,123 @@ def _format_scout_context(summary: ScoutSummary) -> str:
     return "\n".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Context management helpers (Task 7.1, 7.2)
+# ---------------------------------------------------------------------------
+
+def _apply_micro_compact(
+    messages: list[dict[str, Any]],
+    config: ContextConfig,
+) -> tuple[int, int]:
+    """Wrap micro_compact() and return (cleared_count, chars_saved)."""
+    # Snapshot content lengths before compaction
+    before: dict[int, int] = {}
+    for idx, msg in enumerate(messages):
+        if msg.get("role") == "tool":
+            content = msg.get("content")
+            if isinstance(content, str):
+                before[idx] = len(content)
+
+    micro_compact(messages, config)
+
+    # Compute what changed
+    cleared_count = 0
+    chars_saved = 0
+    for idx, old_len in before.items():
+        content = messages[idx].get("content", "")
+        new_len = len(content) if isinstance(content, str) else 0
+        if new_len < old_len:
+            cleared_count += 1
+            chars_saved += old_len - new_len
+
+    return (cleared_count, chars_saved)
+
+
+def _apply_auto_compact(
+    messages: list[dict[str, Any]],
+    config: ContextConfig,
+    model: str,
+    trace_metadata: dict[str, Any],
+    reason: str = "threshold_exceeded",
+) -> list[dict[str, Any]]:
+    """Summarize the conversation via LLM and return replacement messages.
+
+    Steps:
+    1. Save full transcript to disk as JSONL with metadata header.
+    2. Call LLM with summarization prompt.
+    3. Return [system_message, summary_user_message, assistant_ack].
+    """
+    tokens_before = estimate_tokens(messages)
+    messages_before = len(messages)
+
+    # Step 1: Save transcript
+    timestamp = int(time.time())
+    transcript_path = f"{config.transcript_dir}/transcript_{timestamp}.jsonl"
+    try:
+        os.makedirs(config.transcript_dir, exist_ok=True)
+        with open(transcript_path, "w", encoding="utf-8") as f:
+            meta = {
+                "_meta": {
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "trace_id": trace_metadata.get("trace_id", ""),
+                    "estimated_tokens": tokens_before,
+                    "reason": reason,
+                }
+            }
+            f.write(json.dumps(meta, default=str) + "\n")
+            for msg in messages:
+                f.write(json.dumps(msg, default=str) + "\n")
+    except OSError as exc:
+        log.warning("Failed to save transcript: %s", exc)
+        transcript_path = "(failed to save)"
+
+    # Step 2: Build summarization prompt and call LLM
+    conversation_text = str(messages)[:80_000]
+    summarization_prompt = (
+        "Summarize this conversation for continuity. Preserve:\n"
+        "1) What has been accomplished so far\n"
+        "2) Current state of the task\n"
+        "3) Key decisions and their rationale\n"
+        "4) Files read and modified\n"
+        "5) Pending actions or next steps\n"
+        "6) The original task instruction and system prompt rules\n\n"
+        "Be concise but preserve critical details for continued execution.\n\n"
+        f"Conversation:\n{conversation_text}"
+    )
+
+    summary_response = call_llm(
+        model,
+        [{"role": "user", "content": summarization_prompt}],
+        tools=None,
+        max_tokens=2000,
+        metadata=trace_metadata,
+    )
+    summary_text = summary_response.content or "Summary unavailable."
+
+    # Step 3: Build replacement messages
+    system_msg = messages[0]  # Preserve original system message
+    new_messages = [
+        system_msg,
+        {
+            "role": "user",
+            "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary_text}",
+        },
+        {
+            "role": "assistant",
+            "content": "Understood. I have the context from the summary. Continuing with the task.",
+        },
+    ]
+
+    tokens_after = estimate_tokens(new_messages)
+    log.info(
+        "Auto-compact (%s): tokens %d -> %d, messages %d -> %d, summary %d chars",
+        reason, tokens_before, tokens_after, messages_before, len(new_messages),
+        len(summary_text),
+    )
+
+    return new_messages
+
+
 def run_agent(
     executor_model: str,
     harness_url: str,
@@ -109,6 +233,7 @@ def run_agent(
     vm = MiniRuntimeClientSync(harness_url)
     tracker = GroundingTracker()
     protected_files: set[str] = {"agents.md"}
+    context_config = ContextConfig.from_env()
 
     skill_loader: SkillLoader | None = None
     if skills_dir is not None and skills_dir.is_dir():
@@ -124,7 +249,7 @@ def run_agent(
         model=scout_model or executor_model,
         task_instruction=task_text,
     )
-    summary = run_scout(vm, tracker, scout_config)
+    summary = run_scout(vm, tracker, scout_config, context_config=context_config)
 
     # Expand protected_files with scout-discovered policy files
     for policy_path in summary.policy_files:
@@ -199,6 +324,22 @@ def run_agent(
         step_num = step + 1
         print(f"\nStep {step_num}... ", end="", flush=True)
 
+        # Layer 2: Micro-compact old tool results
+        cleared_count, chars_saved = _apply_micro_compact(messages, context_config)
+        if cleared_count > 0:
+            log.debug("Micro-compact: cleared %d messages, ~%d chars saved", cleared_count, chars_saved)
+            print(f"  [micro-compact] cleared {cleared_count} old tool results (~{chars_saved} chars)")
+
+        # Layer 3: Auto-compact if threshold exceeded
+        tokens_est = estimate_tokens(messages)
+        if tokens_est > context_config.auto_compact_threshold:
+            print(f"  [auto-compact] {tokens_est} est. tokens exceeds threshold {context_config.auto_compact_threshold}, summarizing...")
+            messages[:] = _apply_auto_compact(
+                messages, context_config, executor_model, trace_metadata,
+                reason="threshold_exceeded",
+            )
+            print(f"  [auto-compact] conversation compressed to {len(messages)} messages")
+
         response = call_llm(executor_model, messages, tools=TOOL_SCHEMAS, metadata=trace_metadata)
 
         # Build assistant message
@@ -230,16 +371,17 @@ def run_agent(
                     args_preview = args_preview[:150] + "..."
                 print(f"  {CLI_BLUE}call{CLI_CLR}: {tc.name}({args_preview})")
         else:
-            # LLM responded with text only — no tool calls.
+            # LLM responded with text only -- no tool calls.
             # Auto-submit as report_completion so the harness receives an answer.
             if response.content and response.content.strip():
-                print(f"  (no tool calls — auto-submitting text as answer)")
+                print(f"  (no tool calls -- auto-submitting text as answer)")
                 from agent.dispatch import dispatch_tool
                 dispatch_tool(
                     vm, "report_completion",
                     {"answer": response.content.strip(), "grounding_refs": [],
                      "steps": [], "code": "completed"},
                     tracker, protected_files, skill_loader,
+                    context_config=context_config,
                 )
                 fallback_refs = tracker.merge([])
                 print(f"  Auto-submitted answer: {response.content.strip()[:120]}")
@@ -249,20 +391,40 @@ def run_agent(
         # Dispatch all tool calls in parallel
         results = dispatch_parallel(
             vm, response.tool_calls, tracker, protected_files, skill_loader,
+            context_config=context_config,
         )
 
-        # Append tool results and show them
+        # Append tool results, detect compact sentinel
         completion_called = False
+        compact_requested = False
         for tool_call_id, result_text in results:
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": result_text,
-            })
+            if result_text == COMPACT_SENTINEL:
+                compact_requested = True
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": "Compacting context...",
+                })
+            else:
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": result_text,
+                })
             preview = result_text[:200].replace("\n", "\\n")
             if len(result_text) > 200:
                 preview += "..."
             print(f"  {CLI_GREEN}result({tool_call_id}){CLI_CLR}: {preview}")
+
+        # Handle compact sentinel
+        if compact_requested:
+            log.info("Compact tool invoked by LLM")
+            print(f"  [compact tool] LLM requested context compaction, summarizing...")
+            messages[:] = _apply_auto_compact(
+                messages, context_config, executor_model, trace_metadata,
+                reason="compact_tool",
+            )
+            print(f"  [compact tool] conversation compressed to {len(messages)} messages")
 
         # Check if report_completion was called
         for tc in response.tool_calls:

@@ -115,7 +115,7 @@ class TestCircularImports:
         """dispatch.py should only import from tracker and llm (for ToolCall type)."""
         imports = self._get_agent_imports("dispatch")
         # dispatch imports tracker and llm (for ToolCall type)
-        allowed = {"tracker", "llm", "tools"}
+        allowed = {"tracker", "llm", "tools", "context"}
         assert imports.issubset(allowed), (
             f"dispatch.py imports beyond allowed set: {imports - allowed}"
         )
@@ -123,7 +123,7 @@ class TestCircularImports:
     def test_scout_imports_from_allowed_modules(self):
         """scout.py imports from llm, dispatch, tracker, tools, prompt (two-phase architecture)."""
         imports = self._get_agent_imports("scout")
-        allowed = {"llm", "dispatch", "tracker", "tools", "prompt"}
+        allowed = {"llm", "dispatch", "tracker", "tools", "prompt", "context"}
         assert imports.issubset(allowed), (
             f"scout.py imports beyond allowed set: {imports - allowed}"
         )

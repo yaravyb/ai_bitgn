@@ -3,7 +3,7 @@
 Phase 1 (Deterministic Bootstrap): tree("/") + read root meta-files.
 Phase 2 (LLM Explorer): tool-use loop using call_llm + dispatch_parallel.
 
-Imports from llm, dispatch, tracker, tools, and prompt.
+Imports from llm, dispatch, tracker, tools, prompt, and context.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from agent.llm import call_llm
 from agent.prompt import build_scout_prompt
 from agent.tools import SCOUT_TOOL_SCHEMAS
 from agent.tracker import GroundingTracker
+from agent.context import ContextConfig, micro_compact
 
 log = logging.getLogger(__name__)
 
@@ -105,6 +106,29 @@ def is_meta_file(filename: str) -> bool:
     return any(p.match(filename) for p in META_PATTERNS)
 
 
+def _build_scout_context_config(context_config: ContextConfig | None) -> ContextConfig:
+    """Build a scout-specific ContextConfig with independently tunable values.
+
+    Scout uses separate environment variables for micro-compact settings,
+    defaulting to keep_batches=2 (shorter conversations).
+    """
+    if context_config is None:
+        return ContextConfig()
+
+    return ContextConfig(
+        truncation_limit=context_config.truncation_limit,
+        micro_compact_keep_batches=int(
+            os.environ.get("CTX_SCOUT_MICRO_COMPACT_KEEP_BATCHES", "2")
+        ),
+        micro_compact_min_length=int(
+            os.environ.get("CTX_SCOUT_MICRO_COMPACT_MIN_LENGTH",
+                           str(context_config.micro_compact_min_length))
+        ),
+        auto_compact_threshold=context_config.auto_compact_threshold,
+        transcript_dir=context_config.transcript_dir,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Phase 1: Deterministic Bootstrap
 # ---------------------------------------------------------------------------
@@ -113,6 +137,7 @@ def _run_bootstrap(
     vm: Any,
     tracker: GroundingTracker,
     protected_files: set[str],
+    context_config: ContextConfig | None = None,
 ) -> BootstrapContext:
     """Phase 1: tree("/") + read root-level text files.
 
@@ -120,12 +145,16 @@ def _run_bootstrap(
         vm: MiniRuntimeClientSync instance.
         tracker: GroundingTracker to record files read.
         protected_files: Set of protected file paths.
+        context_config: Optional context config for tool result truncation.
 
     Returns:
         BootstrapContext with directory tree, root files, and folder list.
     """
     # Step 1: Get full directory tree
-    tree_result = dispatch_tool(vm, "tree", {"path": "/"}, tracker, protected_files)
+    tree_result = dispatch_tool(
+        vm, "tree", {"path": "/"}, tracker, protected_files,
+        context_config=context_config,
+    )
 
     directory_tree = tree_result
     folders_discovered: list[str] = []
@@ -154,7 +183,10 @@ def _run_bootstrap(
             continue
 
         file_path = f"/{filename}"
-        read_result = dispatch_tool(vm, "read_file", {"path": file_path}, tracker, protected_files)
+        read_result = dispatch_tool(
+            vm, "read_file", {"path": file_path}, tracker, protected_files,
+            context_config=context_config,
+        )
 
         try:
             read_data = json.loads(read_result)
@@ -220,13 +252,22 @@ def _run_llm_explorer(
     config: ScoutConfig,
     bootstrap: BootstrapContext,
     protected_files: set[str],
+    context_config: ContextConfig | None = None,
 ) -> tuple[str | None, int, bool, list[tuple[str, str, str]], list[str]]:
     """Phase 2: LLM-driven exploration loop.
+
+    Args:
+        context_config: Optional context config. When provided, micro-compact
+            is applied before each call_llm and truncation applies to tool results.
+            Auto-compact is NOT applied in the scout phase.
 
     Returns:
         (llm_summary, total_steps, completed_fully, accumulated_reads, phase2_folders)
         where accumulated_reads is a list of (tool_name, file_path, result_json) tuples.
     """
+    # Build scout-specific context config for micro-compact
+    scout_ctx_config = _build_scout_context_config(context_config) if context_config else None
+
     # Build scout prompt
     formatted_context = _format_bootstrap_for_prompt(bootstrap)
     scout_prompt = build_scout_prompt(config.task_instruction, formatted_context)
@@ -256,6 +297,10 @@ def _run_llm_explorer(
 
     for step in range(config.max_steps):
         total_steps += 1
+
+        # Micro-compact old tool results before each LLM call (no auto-compact)
+        if scout_ctx_config is not None:
+            micro_compact(messages, scout_ctx_config)
 
         response = call_llm(
             config.model,
@@ -293,10 +338,11 @@ def _run_llm_explorer(
                 path = tc.arguments.get("path", "/")
                 phase2_folders.append(path)
 
-        # Dispatch tool calls
+        # Dispatch tool calls (with truncation if context_config provided)
         results = dispatch_parallel(
             vm, response.tool_calls, tracker, protected_files,
             max_workers=config.max_workers,
+            context_config=context_config,
         )
 
         # Accumulate read_file results for later classification
@@ -383,6 +429,7 @@ def run_scout(
     vm: Any,
     tracker: GroundingTracker,
     config: ScoutConfig,
+    context_config: ContextConfig | None = None,
 ) -> ScoutSummary:
     """Run the two-phase scout: deterministic bootstrap + LLM-driven explorer.
 
@@ -390,6 +437,8 @@ def run_scout(
         vm: MiniRuntimeClientSync instance for VM operations.
         tracker: GroundingTracker to record all files read during both phases.
         config: ScoutConfig with model, task_instruction, max_steps, max_workers.
+        context_config: Optional ContextConfig for tool result truncation and
+            micro-compact. Auto-compact is NOT applied in the scout phase.
 
     Returns:
         ScoutSummary with directory tree, policy files, vault skills,
@@ -399,7 +448,7 @@ def run_scout(
 
     # Phase 1: Deterministic Bootstrap
     print("  Scout Phase 1: Bootstrap (tree + root files)...", flush=True)
-    bootstrap = _run_bootstrap(vm, tracker, protected_files)
+    bootstrap = _run_bootstrap(vm, tracker, protected_files, context_config=context_config)
     print(
         f"  Bootstrap: {len(bootstrap.folders_discovered)} folders, "
         f"{len(bootstrap.root_policy_files)} policy files, "
@@ -410,6 +459,7 @@ def run_scout(
     print(f"  Scout Phase 2: LLM Explorer (model={config.model}, max_steps={config.max_steps})...", flush=True)
     llm_summary, total_steps, completed_fully, reads, folders = _run_llm_explorer(
         vm, tracker, config, bootstrap, protected_files,
+        context_config=context_config,
     )
     print(
         f"  Explorer: {total_steps} steps, "
