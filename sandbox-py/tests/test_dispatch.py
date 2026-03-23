@@ -8,6 +8,7 @@ Task 5.4: delete_file with protected file checking
 Task 5.5: report_completion handler with tracker.merge
 Task 5.6: load_skill handler
 Task 5.7: dispatch_tool() and dispatch_parallel() functions
+Task 2 (refactor): Updated to use RuntimeAdapter interface (adapter methods instead of raw VM calls)
 """
 
 import json
@@ -16,44 +17,14 @@ from unittest.mock import MagicMock, patch, PropertyMock
 
 
 def _make_mock_vm():
-    """Create a mock VM client with all expected methods."""
+    """Create a mock RuntimeAdapter with all expected methods."""
     vm = MagicMock()
-
-    # outline returns a protobuf-like response
-    outline_resp = MagicMock()
-    outline_resp.DESCRIPTOR = MagicMock()
-    vm.outline.return_value = outline_resp
-
-    # list returns a protobuf-like response
-    list_resp = MagicMock()
-    list_resp.DESCRIPTOR = MagicMock()
-    vm.list.return_value = list_resp
-
-    # read returns a protobuf-like response
-    read_resp = MagicMock()
-    read_resp.DESCRIPTOR = MagicMock()
-    vm.read.return_value = read_resp
-
-    # write returns a protobuf-like response
-    write_resp = MagicMock()
-    write_resp.DESCRIPTOR = MagicMock()
-    vm.write.return_value = write_resp
-
-    # delete returns a protobuf-like response
-    delete_resp = MagicMock()
-    delete_resp.DESCRIPTOR = MagicMock()
-    vm.delete.return_value = delete_resp
-
-    # search returns a protobuf-like response
-    search_resp = MagicMock()
-    search_resp.DESCRIPTOR = MagicMock()
-    vm.search.return_value = search_resp
-
-    # answer returns a protobuf-like response
-    answer_resp = MagicMock()
-    answer_resp.DESCRIPTOR = MagicMock()
-    vm.answer.return_value = answer_resp
-
+    for method in ['tree', 'list_dir', 'read', 'write', 'delete', 'search', 'answer', 'find', 'mkdir', 'move']:
+        resp = MagicMock()
+        resp.DESCRIPTOR = MagicMock()
+        getattr(vm, method).return_value = resp
+    vm.runtime_type = "mini"
+    vm.extra_tools = frozenset()
     return vm
 
 
@@ -93,13 +64,13 @@ class TestDispatchMap:
 
 
 class TestTreeHandler:
-    """Task 5.2: tree handler calls vm.outline()."""
+    """Task 5.2: tree handler calls vm.tree()."""
 
     @patch("agent.dispatch.MessageToDict", return_value={"tree": "root contents"})
-    def test_tree_calls_vm_outline(self, mock_mtd, mock_vm, tracker, protected_files):
+    def test_tree_calls_vm_tree(self, mock_mtd, mock_vm, tracker, protected_files):
         from agent.dispatch import dispatch_tool
         result = dispatch_tool(mock_vm, "tree", {"path": "/"}, tracker, protected_files)
-        mock_vm.outline.assert_called_once()
+        mock_vm.tree.assert_called_once()
         assert isinstance(result, str)
         parsed = json.loads(result)
         assert "tree" in parsed
@@ -113,13 +84,13 @@ class TestTreeHandler:
 
 
 class TestListDirHandler:
-    """Task 5.2: list_dir handler calls vm.list()."""
+    """Task 5.2: list_dir handler calls vm.list_dir()."""
 
     @patch("agent.dispatch.MessageToDict", return_value={"entries": []})
-    def test_list_dir_calls_vm_list(self, mock_mtd, mock_vm, tracker, protected_files):
+    def test_list_dir_calls_vm_list_dir(self, mock_mtd, mock_vm, tracker, protected_files):
         from agent.dispatch import dispatch_tool
         result = dispatch_tool(mock_vm, "list_dir", {"path": "/workspace"}, tracker, protected_files)
-        mock_vm.list.assert_called_once()
+        mock_vm.list_dir.assert_called_once()
         assert isinstance(result, str)
 
 
@@ -302,17 +273,58 @@ class TestLoadSkillHandler:
         assert "body" in result
 
 
+class TestFindHandler:
+    """find handler calls vm.find()."""
+
+    @patch("agent.dispatch.MessageToDict", return_value={"items": []})
+    def test_find_calls_runtime(self, mock_mtd, mock_vm, tracker, protected_files):
+        from agent.dispatch import dispatch_tool
+        result = dispatch_tool(mock_vm, "find", {"root": "/", "name": "test", "kind": "all", "limit": 10}, tracker, protected_files)
+        mock_vm.find.assert_called_once()
+        assert isinstance(result, str)
+
+
+class TestMkDirHandler:
+    """mkdir handler calls vm.mkdir()."""
+
+    @patch("agent.dispatch.MessageToDict", return_value={})
+    def test_mkdir_calls_runtime(self, mock_mtd, mock_vm, tracker, protected_files):
+        from agent.dispatch import dispatch_tool
+        result = dispatch_tool(mock_vm, "mkdir", {"path": "/newdir"}, tracker, protected_files)
+        mock_vm.mkdir.assert_called_once()
+        assert isinstance(result, str)
+
+
+class TestMoveHandler:
+    """move handler calls vm.move() with protected file checking."""
+
+    @patch("agent.dispatch.MessageToDict", return_value={})
+    def test_move_calls_runtime(self, mock_mtd, mock_vm, tracker, protected_files):
+        from agent.dispatch import dispatch_tool
+        result = dispatch_tool(mock_vm, "move", {"from_name": "/a.txt", "to_name": "/b.txt"}, tracker, protected_files)
+        mock_vm.move.assert_called_once()
+        assert isinstance(result, str)
+
+    def test_move_protected_file_is_refused(self, mock_vm, tracker, protected_files):
+        from agent.dispatch import dispatch_tool
+        result = dispatch_tool(mock_vm, "move", {"from_name": "/AGENTS.MD", "to_name": "/renamed.md"}, tracker, protected_files)
+        mock_vm.move.assert_not_called()
+        parsed = json.loads(result)
+        assert "error" in parsed
+
+
 class TestDispatchToolFunction:
     """Task 5.7: dispatch_tool() function."""
 
-    def test_dispatch_tool_unknown_tool_raises_or_errors(self, mock_vm, tracker, protected_files):
-        """Unknown tool name should raise ValueError or return error."""
+    def test_dispatch_tool_unknown_tool_returns_error(self, mock_vm, tracker, protected_files):
+        """Unknown tool name should return error JSON."""
         from agent.dispatch import dispatch_tool
-        with pytest.raises((ValueError, KeyError)):
-            dispatch_tool(
-                mock_vm, "unknown_tool", {},
-                tracker, protected_files,
-            )
+        result = dispatch_tool(
+            mock_vm, "unknown_tool", {},
+            tracker, protected_files,
+        )
+        parsed = json.loads(result)
+        assert "error" in parsed
 
     @patch("agent.dispatch.MessageToDict", return_value={"content": "text"})
     def test_dispatch_tool_routes_correctly(self, mock_mtd, mock_vm, tracker, protected_files):

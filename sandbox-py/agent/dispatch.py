@@ -15,17 +15,6 @@ from typing import Any, Callable
 from google.protobuf.json_format import MessageToDict
 from connectrpc.errors import ConnectError
 
-from bitgn.vm.mini_connect import MiniRuntimeClientSync
-from bitgn.vm.mini_pb2 import (
-    AnswerRequest,
-    DeleteRequest,
-    ListRequest,
-    OutlineRequest,
-    ReadRequest,
-    SearchRequest,
-    WriteRequest,
-)
-
 from agent.tracker import GroundingTracker
 from agent.llm import ToolCall
 from agent.context import ContextConfig, truncate_tool_result, COMPACT_SENTINEL
@@ -51,45 +40,45 @@ def _normalize_path(path: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _handle_tree(
-    vm: MiniRuntimeClientSync,
+    vm,
     args: dict[str, Any],
     tracker: GroundingTracker,
     protected_files: set[str],
     skill_loader: Any | None,
 ) -> str:
     path = args.get("path", "/")
-    resp = vm.outline(OutlineRequest(path=path))
+    resp = vm.tree(path)
     # tree is a directory operation, not a file read — do not add to tracker
     return json.dumps(MessageToDict(resp), ensure_ascii=False)
 
 
 def _handle_list_dir(
-    vm: MiniRuntimeClientSync,
+    vm,
     args: dict[str, Any],
     tracker: GroundingTracker,
     protected_files: set[str],
     skill_loader: Any | None,
 ) -> str:
     path = args.get("path", "/")
-    resp = vm.list(ListRequest(path=path))
+    resp = vm.list_dir(path)
     return json.dumps(MessageToDict(resp), ensure_ascii=False)
 
 
 def _handle_read_file(
-    vm: MiniRuntimeClientSync,
+    vm,
     args: dict[str, Any],
     tracker: GroundingTracker,
     protected_files: set[str],
     skill_loader: Any | None,
 ) -> str:
     path = args.get("path", "")
-    resp = vm.read(ReadRequest(path=path))
+    resp = vm.read(path)
     tracker.add(path)
     return json.dumps(MessageToDict(resp), ensure_ascii=False)
 
 
 def _handle_write_file(
-    vm: MiniRuntimeClientSync,
+    vm,
     args: dict[str, Any],
     tracker: GroundingTracker,
     protected_files: set[str],
@@ -97,12 +86,12 @@ def _handle_write_file(
 ) -> str:
     path = args.get("path", "")
     content = args.get("content", "")
-    resp = vm.write(WriteRequest(path=path, content=content))
+    resp = vm.write(path, content)
     return json.dumps(MessageToDict(resp), ensure_ascii=False)
 
 
 def _handle_delete_file(
-    vm: MiniRuntimeClientSync,
+    vm,
     args: dict[str, Any],
     tracker: GroundingTracker,
     protected_files: set[str],
@@ -118,12 +107,12 @@ def _handle_delete_file(
             ensure_ascii=False,
         )
 
-    resp = vm.delete(DeleteRequest(path=path))
+    resp = vm.delete(path)
     return json.dumps(MessageToDict(resp), ensure_ascii=False)
 
 
 def _handle_search(
-    vm: MiniRuntimeClientSync,
+    vm,
     args: dict[str, Any],
     tracker: GroundingTracker,
     protected_files: set[str],
@@ -132,12 +121,12 @@ def _handle_search(
     pattern = args.get("pattern", "")
     path = args.get("path", "/")
     count = args.get("count", 5)
-    resp = vm.search(SearchRequest(path=path, pattern=pattern, count=count))
+    resp = vm.search(path, pattern, count)
     return json.dumps(MessageToDict(resp), ensure_ascii=False)
 
 
 def _handle_report_completion(
-    vm: MiniRuntimeClientSync,
+    vm,
     args: dict[str, Any],
     tracker: GroundingTracker,
     protected_files: set[str],
@@ -145,17 +134,65 @@ def _handle_report_completion(
 ) -> str:
     answer = args.get("answer", "")
     llm_refs = args.get("grounding_refs", [])
+    code = args.get("code", "completed")
     # Trust the LLM's refs when provided; fall back to tracker only when empty
     if llm_refs:
         refs = llm_refs
     else:
         refs = tracker.merge([])
-    resp = vm.answer(AnswerRequest(answer=answer, refs=refs))
+    resp = vm.answer(answer, refs, code)
+    return json.dumps(MessageToDict(resp), ensure_ascii=False)
+
+
+def _handle_find(
+    vm,
+    args: dict[str, Any],
+    tracker: GroundingTracker,
+    protected_files: set[str],
+    skill_loader: Any | None,
+) -> str:
+    root = args.get("root", "/")
+    name = args.get("name", "")
+    kind = args.get("kind", "all")
+    limit = args.get("limit", 10)
+    resp = vm.find(root, name, kind, limit)
+    return json.dumps(MessageToDict(resp), ensure_ascii=False)
+
+
+def _handle_mkdir(
+    vm,
+    args: dict[str, Any],
+    tracker: GroundingTracker,
+    protected_files: set[str],
+    skill_loader: Any | None,
+) -> str:
+    path = args.get("path", "")
+    resp = vm.mkdir(path)
+    return json.dumps(MessageToDict(resp), ensure_ascii=False)
+
+
+def _handle_move(
+    vm,
+    args: dict[str, Any],
+    tracker: GroundingTracker,
+    protected_files: set[str],
+    skill_loader: Any | None,
+) -> str:
+    from_name = args.get("from_name", "")
+    to_name = args.get("to_name", "")
+    normalized_from = _normalize_path(from_name)
+    if normalized_from in protected_files:
+        log.warning("REFUSED: move %s (protected policy file)", from_name)
+        return json.dumps(
+            {"error": f"Cannot move protected file: {from_name}"},
+            ensure_ascii=False,
+        )
+    resp = vm.move(from_name, to_name)
     return json.dumps(MessageToDict(resp), ensure_ascii=False)
 
 
 def _handle_load_skill(
-    vm: MiniRuntimeClientSync,
+    vm,
     args: dict[str, Any],
     tracker: GroundingTracker,
     protected_files: set[str],
@@ -172,7 +209,7 @@ def _handle_load_skill(
 
 
 def _handle_compact(
-    vm: MiniRuntimeClientSync,
+    vm,
     args: dict[str, Any],
     tracker: GroundingTracker,
     protected_files: set[str],
@@ -196,6 +233,9 @@ DISPATCH_MAP: dict[str, Callable] = {
     "report_completion": _handle_report_completion,
     "load_skill": _handle_load_skill,
     "compact": _handle_compact,
+    "find": _handle_find,
+    "mkdir": _handle_mkdir,
+    "move": _handle_move,
 }
 
 
@@ -204,7 +244,7 @@ DISPATCH_MAP: dict[str, Callable] = {
 # ---------------------------------------------------------------------------
 
 def dispatch_tool(
-    vm: MiniRuntimeClientSync,
+    vm,
     tool_name: str,
     args: dict[str, Any],
     tracker: GroundingTracker,
@@ -217,7 +257,7 @@ def dispatch_tool(
     When context_config is provided, tool results (except report_completion)
     are truncated if they exceed the configured limit.
 
-    Raises ValueError if the tool_name is not recognized.
+    Returns error JSON if the tool_name is not recognized.
     """
     handler = DISPATCH_MAP.get(tool_name)
     if handler is None:
@@ -251,7 +291,7 @@ def dispatch_tool(
 
 
 def dispatch_parallel(
-    vm: MiniRuntimeClientSync,
+    vm,
     tool_calls: list[ToolCall],
     tracker: GroundingTracker,
     protected_files: set[str],
