@@ -37,7 +37,7 @@ def _read_response(content: str) -> str:
 
 def _make_dispatch_side_effect(responses: dict[str, str]):
     """Create a side_effect function for dispatch_tool that returns canned responses."""
-    def side_effect(vm, tool_name, args, tracker, protected_files, skill_loader=None):
+    def side_effect(vm, tool_name, args, tracker, protected_files, skill_loader=None, context_config=None):
         path = args.get("path", "/")
         key = (tool_name, path)
         if key in responses:
@@ -887,14 +887,14 @@ class TestBuildScoutPromptFromScout:
 # ---------------------------------------------------------------------------
 
 class TestScoutModuleDependencies:
-    """scout.py imports from llm, tools, prompt, dispatch, tracker; NOT dag, skills, loop."""
+    """scout.py imports from llm, tools, prompt, dispatch, tracker, context; NOT dag, skills, loop."""
 
     def test_imports_required_modules(self):
         import agent.scout as mod
         with open(mod.__file__) as f:
             source = f.read()
         agent_imports = re.findall(r"from\s+agent\.(\w+)", source)
-        required = {"llm", "tools", "prompt", "dispatch", "tracker"}
+        required = {"llm", "tools", "prompt", "dispatch", "tracker", "context"}
         for req in required:
             assert req in agent_imports, (
                 f"scout.py must import from agent.{req}"
@@ -910,6 +910,191 @@ class TestScoutModuleDependencies:
             assert imp not in forbidden, (
                 f"scout.py must NOT import from agent.{imp}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Context management integration tests (Task 11)
+# ---------------------------------------------------------------------------
+
+class TestScoutMicroCompact:
+    """Micro-compact is applied in the scout LLM explorer loop."""
+
+    @patch("agent.scout.micro_compact")
+    @patch("agent.scout.dispatch_parallel")
+    @patch("agent.scout.call_llm")
+    @patch("agent.scout.build_scout_prompt")
+    def test_micro_compact_called_before_llm(
+        self, mock_prompt, mock_call_llm, mock_dispatch, mock_micro_compact,
+    ):
+        from agent.scout import _run_llm_explorer, ScoutConfig, BootstrapContext
+        from agent.context import ContextConfig
+        from agent.tracker import GroundingTracker
+
+        mock_prompt.return_value = "scout prompt"
+
+        tc = _make_tool_call("tc1", "read_file", {"path": "/test.md"})
+        mock_call_llm.side_effect = [
+            _make_llm_response(content=None, tool_calls=[tc]),
+            _make_llm_response(content="Done"),
+        ]
+        mock_dispatch.return_value = [("tc1", _read_response("content"))]
+
+        config = ScoutConfig(model="openai/gpt-4.1", task_instruction="test")
+        ctx_config = ContextConfig()
+        bootstrap = BootstrapContext(
+            directory_tree="tree", root_policy_files={},
+            root_vault_skills={}, files_read=set(),
+            folders_discovered=[],
+        )
+
+        vm = MagicMock()
+        tracker = GroundingTracker()
+        _run_llm_explorer(vm, tracker, config, bootstrap, set(), context_config=ctx_config)
+
+        # micro_compact should have been called at least twice (once per call_llm)
+        assert mock_micro_compact.call_count >= 2
+
+
+class TestScoutNoAutoCompact:
+    """Auto-compact is NOT applied in the scout phase."""
+
+    @patch("agent.scout.dispatch_parallel")
+    @patch("agent.scout.call_llm")
+    @patch("agent.scout.build_scout_prompt")
+    def test_no_auto_compact_in_scout(
+        self, mock_prompt, mock_call_llm, mock_dispatch,
+    ):
+        from agent.scout import _run_llm_explorer, ScoutConfig, BootstrapContext
+        from agent.context import ContextConfig
+        from agent.tracker import GroundingTracker
+
+        mock_prompt.return_value = "scout prompt"
+
+        # Return many tool calls to simulate a long conversation
+        tc = _make_tool_call("tc1", "read_file", {"path": "/test.md"})
+        mock_call_llm.side_effect = [
+            _make_llm_response(content=None, tool_calls=[tc]),
+            _make_llm_response(content="Done"),
+        ]
+        mock_dispatch.return_value = [("tc1", _read_response("x" * 100000))]
+
+        config = ScoutConfig(model="openai/gpt-4.1", task_instruction="test")
+        ctx_config = ContextConfig(auto_compact_threshold=1)  # Very low threshold
+        bootstrap = BootstrapContext(
+            directory_tree="tree", root_policy_files={},
+            root_vault_skills={}, files_read=set(),
+            folders_discovered=[],
+        )
+
+        vm = MagicMock()
+        tracker = GroundingTracker()
+        _run_llm_explorer(vm, tracker, config, bootstrap, set(), context_config=ctx_config)
+
+        # Only 2 call_llm calls (no summarization call for auto-compact)
+        assert mock_call_llm.call_count == 2
+
+
+class TestScoutTruncationApplied:
+    """Tool result truncation applies to scout tool calls."""
+
+    @patch("agent.scout.dispatch_parallel")
+    @patch("agent.scout.call_llm")
+    @patch("agent.scout.build_scout_prompt")
+    def test_context_config_passed_to_dispatch(
+        self, mock_prompt, mock_call_llm, mock_dispatch,
+    ):
+        from agent.scout import _run_llm_explorer, ScoutConfig, BootstrapContext
+        from agent.context import ContextConfig
+        from agent.tracker import GroundingTracker
+
+        mock_prompt.return_value = "scout prompt"
+
+        tc = _make_tool_call("tc1", "read_file", {"path": "/test.md"})
+        mock_call_llm.side_effect = [
+            _make_llm_response(content=None, tool_calls=[tc]),
+            _make_llm_response(content="Done"),
+        ]
+        mock_dispatch.return_value = [("tc1", _read_response("content"))]
+
+        config = ScoutConfig(model="openai/gpt-4.1", task_instruction="test")
+        ctx_config = ContextConfig(truncation_limit=5000)
+        bootstrap = BootstrapContext(
+            directory_tree="tree", root_policy_files={},
+            root_vault_skills={}, files_read=set(),
+            folders_discovered=[],
+        )
+
+        vm = MagicMock()
+        tracker = GroundingTracker()
+        _run_llm_explorer(vm, tracker, config, bootstrap, set(), context_config=ctx_config)
+
+        # dispatch_parallel should have received context_config
+        dp_call = mock_dispatch.call_args
+        ctx_arg = dp_call[1].get("context_config")
+        assert ctx_arg is not None
+
+    @patch("agent.scout.dispatch_tool")
+    @patch("agent.scout.dispatch_parallel")
+    @patch("agent.scout.call_llm")
+    @patch("agent.scout.build_scout_prompt")
+    def test_bootstrap_passes_context_config(
+        self, mock_prompt, mock_call_llm, mock_dispatch_parallel,
+        mock_dispatch_tool,
+    ):
+        """run_scout passes context_config to bootstrap dispatch_tool calls."""
+        from agent.scout import run_scout, ScoutConfig
+        from agent.context import ContextConfig
+        from agent.tracker import GroundingTracker
+
+        mock_dispatch_tool.side_effect = _make_dispatch_side_effect({
+            ("tree", "/"): _tree_response([], []),
+        })
+        mock_prompt.return_value = "scout prompt"
+        mock_call_llm.return_value = _make_llm_response(content="Done")
+
+        vm = MagicMock()
+        tracker = GroundingTracker()
+        config = ScoutConfig(model="openai/gpt-4.1", task_instruction="test")
+        ctx_config = ContextConfig(truncation_limit=5000)
+
+        run_scout(vm, tracker, config, context_config=ctx_config)
+
+        # dispatch_tool calls from bootstrap should have received context_config
+        dt_calls = mock_dispatch_tool.call_args_list
+        assert len(dt_calls) >= 1
+        # At least the tree call should have context_config
+        for dt_call in dt_calls:
+            ctx = dt_call[1].get("context_config")
+            assert ctx is not None
+
+
+class TestScoutRunScoutContextConfigParam:
+    """run_scout accepts context_config parameter."""
+
+    @patch("agent.scout.dispatch_parallel")
+    @patch("agent.scout.call_llm")
+    @patch("agent.scout.build_scout_prompt")
+    @patch("agent.scout.dispatch_tool")
+    def test_run_scout_accepts_context_config(
+        self, mock_dispatch_tool, mock_prompt, mock_call_llm, mock_dispatch_parallel,
+    ):
+        from agent.scout import run_scout, ScoutConfig, ScoutSummary
+        from agent.context import ContextConfig
+        from agent.tracker import GroundingTracker
+
+        mock_dispatch_tool.side_effect = _make_dispatch_side_effect({
+            ("tree", "/"): _tree_response([], []),
+        })
+        mock_prompt.return_value = "scout prompt"
+        mock_call_llm.return_value = _make_llm_response(content="Done")
+
+        vm = MagicMock()
+        tracker = GroundingTracker()
+        config = ScoutConfig(model="openai/gpt-4.1", task_instruction="test")
+        ctx_config = ContextConfig()
+
+        result = run_scout(vm, tracker, config, context_config=ctx_config)
+        assert isinstance(result, ScoutSummary)
 
 
 # ---------------------------------------------------------------------------

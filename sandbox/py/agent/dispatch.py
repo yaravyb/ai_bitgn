@@ -28,6 +28,7 @@ from bitgn.vm.mini_pb2 import (
 
 from agent.tracker import GroundingTracker
 from agent.llm import ToolCall
+from agent.context import ContextConfig, truncate_tool_result, COMPACT_SENTINEL
 
 log = logging.getLogger(__name__)
 
@@ -170,6 +171,17 @@ def _handle_load_skill(
     return content
 
 
+def _handle_compact(
+    vm: MiniRuntimeClientSync,
+    args: dict[str, Any],
+    tracker: GroundingTracker,
+    protected_files: set[str],
+    skill_loader: Any | None,
+) -> str:
+    """Return the compact sentinel. Actual compaction logic lives in loop.py."""
+    return COMPACT_SENTINEL
+
+
 # ---------------------------------------------------------------------------
 # Dispatch map: tool name -> handler (Req 12.2)
 # ---------------------------------------------------------------------------
@@ -183,6 +195,7 @@ DISPATCH_MAP: dict[str, Callable] = {
     "search": _handle_search,
     "report_completion": _handle_report_completion,
     "load_skill": _handle_load_skill,
+    "compact": _handle_compact,
 }
 
 
@@ -197,23 +210,44 @@ def dispatch_tool(
     tracker: GroundingTracker,
     protected_files: set[str],
     skill_loader: Any | None = None,
+    context_config: ContextConfig | None = None,
 ) -> str:
     """Dispatch a single tool call and return the result as a JSON string.
+
+    When context_config is provided, tool results (except report_completion)
+    are truncated if they exceed the configured limit.
 
     Raises ValueError if the tool_name is not recognized.
     """
     handler = DISPATCH_MAP.get(tool_name)
     if handler is None:
-        raise ValueError(f"Unknown tool: {tool_name}")
+        log.warning("Unknown tool: %s", tool_name)
+        return json.dumps(
+            {"error": f"Unknown tool: {tool_name}"},
+            ensure_ascii=False,
+        )
 
     try:
-        return handler(vm, args, tracker, protected_files, skill_loader)
+        result = handler(vm, args, tracker, protected_files, skill_loader)
     except ConnectError as exc:
         log.warning("Tool %s error: %s %s", tool_name, exc.code, exc.message)
         return json.dumps(
             {"error": f"{exc.code}: {exc.message}"},
             ensure_ascii=False,
         )
+
+    # Apply truncation when context_config is provided and tool is not exempt
+    if context_config is not None and tool_name != "report_completion":
+        original_len = len(result)
+        result = truncate_tool_result(result, context_config)
+        if len(result) < original_len:
+            log.debug(
+                "Tool %s result truncated: %d -> %d chars",
+                tool_name, original_len, len(result),
+            )
+            print(f"  [truncated] {tool_name}: {original_len} -> {len(result)} chars")
+
+    return result
 
 
 def dispatch_parallel(
@@ -223,6 +257,7 @@ def dispatch_parallel(
     protected_files: set[str],
     skill_loader: Any | None = None,
     max_workers: int = 4,
+    context_config: ContextConfig | None = None,
 ) -> list[tuple[str, str]]:
     """Execute multiple tool calls concurrently.
 
@@ -237,6 +272,7 @@ def dispatch_parallel(
         result = dispatch_tool(
             vm, tc.name, tc.arguments,
             tracker, protected_files, skill_loader,
+            context_config=context_config,
         )
         return (tc.id, result)
 

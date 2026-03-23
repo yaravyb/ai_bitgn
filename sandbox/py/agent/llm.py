@@ -15,6 +15,10 @@ from typing import Any
 import litellm
 from litellm import completion
 
+# Suppress noisy LiteLLM warnings (e.g. "consecutive user/tool blocks" on Bedrock)
+litellm.suppress_debug_info = True
+logging.getLogger("LiteLLM").setLevel(logging.ERROR)
+
 log = logging.getLogger(__name__)
 
 # Exceptions considered transient and worth retrying

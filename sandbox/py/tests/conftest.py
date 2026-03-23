@@ -6,9 +6,24 @@ bitgn SDK is compiled against a newer protobuf gencode version than the
 runtime in the lockfile, which causes an ImportError during test collection.
 """
 
+import os
 import sys
 import types
 from unittest.mock import MagicMock
+
+import pytest
+
+
+# ---------------------------------------------------------------------------
+# Isolate tests from verification env vars so that VERIFY_ENABLED=1 in the
+# user's shell does not alter default-config test expectations.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _clear_verification_env(monkeypatch):
+    """Ensure VERIFY_ENABLED / VERIFY_MAX_ATTEMPTS are unset for every test."""
+    monkeypatch.delenv("VERIFY_ENABLED", raising=False)
+    monkeypatch.delenv("VERIFY_MAX_ATTEMPTS", raising=False)
 
 # ---------------------------------------------------------------------------
 # Pre-populate sys.modules with mocks for bitgn / connectrpc before any test

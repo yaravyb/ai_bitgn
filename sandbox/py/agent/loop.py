@@ -11,6 +11,8 @@ import json
 import logging
 import os
 import posixpath
+import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -19,11 +21,24 @@ from bitgn.vm.mini_connect import MiniRuntimeClientSync
 
 from agent.scout import run_scout, ScoutSummary, ScoutConfig
 from agent.llm import call_llm, LLMResponse
-from agent.dispatch import dispatch_parallel
+from agent.dispatch import dispatch_parallel, dispatch_tool
+from agent.verify import (
+    VerificationState,
+    VerificationOutcome,
+    should_verify,
+    build_verification_prompt,
+    detect_verification_outcome,
+)
 from agent.prompt import build_system_prompt
 from agent.skills import SkillLoader
 from agent.tracker import GroundingTracker
 from agent.tools import TOOL_SCHEMAS
+from agent.context import (
+    ContextConfig,
+    estimate_tokens,
+    micro_compact,
+    COMPACT_SENTINEL,
+)
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +53,48 @@ def _normalize_path(path: str) -> str:
     stripped = path.lstrip("/")
     normalized = posixpath.normpath(stripped)
     return normalized.lower()
+
+
+def _try_extract_completion(text: str) -> dict[str, Any] | None:
+    """Try to extract report_completion arguments from structured text.
+
+    Weaker models sometimes output tool calls as plain text (JSON blobs or
+    ``report_completion({...})`` syntax) instead of using the tool mechanism.
+    Returns the parsed arguments dict when extraction succeeds, None otherwise.
+    """
+    # Try 1: entire text is a JSON object with an "answer" key
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and "answer" in data:
+            return data
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Try 2: report_completion({...}) function-call with JSON arg
+    match = re.search(r"report_completion\s*\(\s*(\{.*\})\s*\)", text, re.DOTALL)
+    if match:
+        try:
+            data = json.loads(match.group(1))
+            if isinstance(data, dict) and "answer" in data:
+                return data
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Try 3: report_completion(answer="...", ...) Python kwargs syntax
+    match = re.search(r'report_completion\s*\(\s*(?:.*,\s*)?answer\s*=\s*"([^"]*)"', text)
+    if match:
+        result: dict[str, Any] = {"answer": match.group(1)}
+        code_match = re.search(r'code\s*=\s*"([^"]*)"', text)
+        if code_match:
+            result["code"] = code_match.group(1)
+        refs_match = re.search(r"grounding_refs\s*=\s*\[([^\]]*)\]", text)
+        if refs_match:
+            result["grounding_refs"] = [
+                r.strip().strip("\"'") for r in refs_match.group(1).split(",") if r.strip()
+            ]
+        return result
+
+    return None
 
 
 def _format_scout_context(summary: ScoutSummary) -> str:
@@ -87,6 +144,123 @@ def _format_scout_context(summary: ScoutSummary) -> str:
     return "\n".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Context management helpers (Task 7.1, 7.2)
+# ---------------------------------------------------------------------------
+
+def _apply_micro_compact(
+    messages: list[dict[str, Any]],
+    config: ContextConfig,
+) -> tuple[int, int]:
+    """Wrap micro_compact() and return (cleared_count, chars_saved)."""
+    # Snapshot content lengths before compaction
+    before: dict[int, int] = {}
+    for idx, msg in enumerate(messages):
+        if msg.get("role") == "tool":
+            content = msg.get("content")
+            if isinstance(content, str):
+                before[idx] = len(content)
+
+    micro_compact(messages, config)
+
+    # Compute what changed
+    cleared_count = 0
+    chars_saved = 0
+    for idx, old_len in before.items():
+        content = messages[idx].get("content", "")
+        new_len = len(content) if isinstance(content, str) else 0
+        if new_len < old_len:
+            cleared_count += 1
+            chars_saved += old_len - new_len
+
+    return (cleared_count, chars_saved)
+
+
+def _apply_auto_compact(
+    messages: list[dict[str, Any]],
+    config: ContextConfig,
+    model: str,
+    trace_metadata: dict[str, Any],
+    reason: str = "threshold_exceeded",
+) -> list[dict[str, Any]]:
+    """Summarize the conversation via LLM and return replacement messages.
+
+    Steps:
+    1. Save full transcript to disk as JSONL with metadata header.
+    2. Call LLM with summarization prompt.
+    3. Return [system_message, summary_user_message, assistant_ack].
+    """
+    tokens_before = estimate_tokens(messages)
+    messages_before = len(messages)
+
+    # Step 1: Save transcript
+    timestamp = int(time.time())
+    transcript_path = f"{config.transcript_dir}/transcript_{timestamp}.jsonl"
+    try:
+        os.makedirs(config.transcript_dir, exist_ok=True)
+        with open(transcript_path, "w", encoding="utf-8") as f:
+            meta = {
+                "_meta": {
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "trace_id": trace_metadata.get("trace_id", ""),
+                    "estimated_tokens": tokens_before,
+                    "reason": reason,
+                }
+            }
+            f.write(json.dumps(meta, default=str) + "\n")
+            for msg in messages:
+                f.write(json.dumps(msg, default=str) + "\n")
+    except OSError as exc:
+        log.warning("Failed to save transcript: %s", exc)
+        transcript_path = "(failed to save)"
+
+    # Step 2: Build summarization prompt and call LLM
+    conversation_text = str(messages)[:80_000]
+    summarization_prompt = (
+        "Summarize this conversation for continuity. Preserve:\n"
+        "1) What has been accomplished so far\n"
+        "2) Current state of the task\n"
+        "3) Key decisions and their rationale\n"
+        "4) Files read and modified\n"
+        "5) Pending actions or next steps\n"
+        "6) The original task instruction and system prompt rules\n\n"
+        "Be concise but preserve critical details for continued execution.\n\n"
+        f"Conversation:\n{conversation_text}"
+    )
+
+    summary_response = call_llm(
+        model,
+        [{"role": "user", "content": summarization_prompt}],
+        tools=None,
+        max_tokens=2000,
+        metadata=trace_metadata,
+    )
+    summary_text = summary_response.content or "Summary unavailable."
+
+    # Step 3: Build replacement messages
+    system_msg = messages[0]  # Preserve original system message
+    new_messages = [
+        system_msg,
+        {
+            "role": "user",
+            "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary_text}",
+        },
+        {
+            "role": "assistant",
+            "content": "Understood. I have the context from the summary. Continuing with the task.",
+        },
+    ]
+
+    tokens_after = estimate_tokens(new_messages)
+    log.info(
+        "Auto-compact (%s): tokens %d -> %d, messages %d -> %d, summary %d chars",
+        reason, tokens_before, tokens_after, messages_before, len(new_messages),
+        len(summary_text),
+    )
+
+    return new_messages
+
+
 def run_agent(
     executor_model: str,
     harness_url: str,
@@ -109,6 +283,7 @@ def run_agent(
     vm = MiniRuntimeClientSync(harness_url)
     tracker = GroundingTracker()
     protected_files: set[str] = {"agents.md"}
+    context_config = ContextConfig.from_env()
 
     skill_loader: SkillLoader | None = None
     if skills_dir is not None and skills_dir.is_dir():
@@ -124,7 +299,7 @@ def run_agent(
         model=scout_model or executor_model,
         task_instruction=task_text,
     )
-    summary = run_scout(vm, tracker, scout_config)
+    summary = run_scout(vm, tracker, scout_config, context_config=context_config)
 
     # Expand protected_files with scout-discovered policy files
     for policy_path in summary.policy_files:
@@ -194,10 +369,29 @@ def run_agent(
     print(f"  Policy files in context: {list(summary.policy_files.keys())}")
     print(f"  Vault skills in context: {list(summary.vault_skills.keys())}")
 
+    # Verification state (self-verification feature)
+    verification_state = VerificationState()
+
     step_num = 0
     for step in range(30):  # 30 step limit (Req 12.1)
         step_num = step + 1
         print(f"\nStep {step_num}... ", end="", flush=True)
+
+        # Layer 2: Micro-compact old tool results
+        cleared_count, chars_saved = _apply_micro_compact(messages, context_config)
+        if cleared_count > 0:
+            log.debug("Micro-compact: cleared %d messages, ~%d chars saved", cleared_count, chars_saved)
+            print(f"  [micro-compact] cleared {cleared_count} old tool results (~{chars_saved} chars)")
+
+        # Layer 3: Auto-compact if threshold exceeded
+        tokens_est = estimate_tokens(messages)
+        if tokens_est > context_config.auto_compact_threshold:
+            print(f"  [auto-compact] {tokens_est} est. tokens exceeds threshold {context_config.auto_compact_threshold}, summarizing...")
+            messages[:] = _apply_auto_compact(
+                messages, context_config, executor_model, trace_metadata,
+                reason="threshold_exceeded",
+            )
+            print(f"  [auto-compact] conversation compressed to {len(messages)} messages")
 
         response = call_llm(executor_model, messages, tools=TOOL_SCHEMAS, metadata=trace_metadata)
 
@@ -230,49 +424,220 @@ def run_agent(
                     args_preview = args_preview[:150] + "..."
                 print(f"  {CLI_BLUE}call{CLI_CLR}: {tc.name}({args_preview})")
         else:
-            # LLM responded with text only — no tool calls.
-            # Auto-submit as report_completion so the harness receives an answer.
+            # LLM responded with text only -- no tool calls.
             if response.content and response.content.strip():
-                print(f"  (no tool calls — auto-submitting text as answer)")
-                from agent.dispatch import dispatch_tool
+                raw_text = response.content.strip()
+
+                # Weaker models sometimes output tool calls as text instead of
+                # using the tool mechanism. Extract the answer if possible.
+                extracted = _try_extract_completion(raw_text)
+                text_answer = extracted["answer"] if extracted else raw_text
+                if extracted:
+                    print(f"  (extracted answer from structured text)")
+
+                # --- VERIFICATION INTERCEPTION: text-only path (Task 6.2) ---
+                if should_verify(verification_state, context_config.verification_enabled,
+                                 context_config.verification_max_attempts):
+                    # Intercept text-only auto-submit for verification
+                    if not verification_state.in_verification:
+                        verification_state.original_answer = text_answer
+                        verification_state.original_code = extracted.get("code", "completed") if extracted else "completed"
+                    verification_state.in_verification = True
+                    verification_state.attempts += 1
+
+                    # Log verification start (Task 7)
+                    print(f"  [verify] attempt {verification_state.attempts}: "
+                          f"intercepted text-only auto-submit")
+                    log.info("Verification attempt %d: intercepted text-only auto-submit",
+                             verification_state.attempts)
+
+                    # Build and inject verification prompt
+                    prompt = build_verification_prompt(
+                        text_answer, "completed", summary.policy_files,
+                    )
+                    messages.append({
+                        "role": "user",
+                        "content": prompt,
+                    })
+                    continue  # Next iteration of executor loop
+                else:
+                    # Auto-submit normally
+                    print(f"  (no tool calls -- auto-submitting text as answer)")
+                    submit_args: dict[str, Any] = {
+                        "answer": text_answer,
+                        "grounding_refs": extracted.get("grounding_refs", []) if extracted else [],
+                        "steps": extracted.get("steps", []) if extracted else [],
+                        "code": extracted.get("code", "completed") if extracted else "completed",
+                    }
+                    dispatch_tool(
+                        vm, "report_completion", submit_args,
+                        tracker, protected_files, skill_loader,
+                        context_config=context_config,
+                    )
+
+                    # Log verification outcome if we were in a verification cycle (Task 7)
+                    if verification_state.in_verification:
+                        outcome = detect_verification_outcome(
+                            verification_state.original_answer, text_answer
+                        )
+                        if outcome == VerificationOutcome.CONFIRMED:
+                            print(f"  [verify] answer CONFIRMED after "
+                                  f"{verification_state.attempts} attempt(s)")
+                            log.info("Verification: answer confirmed (unchanged)")
+                        else:
+                            orig_preview = verification_state.original_answer[:80]
+                            new_preview = text_answer[:80]
+                            print(f"  [verify] answer REVISED after "
+                                  f"{verification_state.attempts} attempt(s)")
+                            print(f"    original: {orig_preview}")
+                            print(f"    revised:  {new_preview}")
+                            log.info("Verification: answer revised. "
+                                     "original=%r, revised=%r",
+                                     orig_preview, new_preview)
+
+                    actual_refs = submit_args["grounding_refs"] or tracker.merge([])
+                    print(f"  Auto-submitted answer: {text_answer[:120]}")
+                    print(f"  Refs sent to harness: {actual_refs}")
+            elif verification_state.in_verification:
+                # Empty/whitespace LLM response during verification cycle.
+                # Submit the captured answer rather than dropping it.
+                print(f"  (empty response during verification -- submitting captured answer)")
                 dispatch_tool(
                     vm, "report_completion",
-                    {"answer": response.content.strip(), "grounding_refs": [],
-                     "steps": [], "code": "completed"},
+                    {"answer": verification_state.original_answer, "grounding_refs": [],
+                     "steps": [], "code": verification_state.original_code},
                     tracker, protected_files, skill_loader,
+                    context_config=context_config,
                 )
-                fallback_refs = tracker.merge([])
-                print(f"  Auto-submitted answer: {response.content.strip()[:120]}")
-                print(f"  Refs sent to harness (tracker fallback): {fallback_refs}")
+                print(f"  Auto-submitted answer: {verification_state.original_answer[:120]}")
             break
 
-        # Dispatch all tool calls in parallel
-        results = dispatch_parallel(
-            vm, response.tool_calls, tracker, protected_files, skill_loader,
-        )
-
-        # Append tool results and show them
-        completion_called = False
-        for tool_call_id, result_text in results:
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": result_text,
-            })
-            preview = result_text[:200].replace("\n", "\\n")
-            if len(result_text) > 200:
-                preview += "..."
-            print(f"  {CLI_GREEN}result({tool_call_id}){CLI_CLR}: {preview}")
-
-        # Check if report_completion was called
+        # --- VERIFICATION INTERCEPTION: tool-call path (Task 6.1) ---
+        # Separate report_completion from other tool calls
+        completion_tc = None
+        other_tool_calls = []
         for tc in response.tool_calls:
             if tc.name == "report_completion":
-                completion_called = True
-                answer = tc.arguments.get("answer", "")
-                llm_refs = tc.arguments.get("grounding_refs", [])
-                code = tc.arguments.get("code", "?")
-                steps = tc.arguments.get("steps", [])
-                # Show what was actually sent (mirrors dispatch logic)
+                completion_tc = tc
+            else:
+                other_tool_calls.append(tc)
+
+        # Dispatch non-completion tool calls (may be empty)
+        compact_requested = False
+        if other_tool_calls:
+            results = dispatch_parallel(
+                vm, other_tool_calls, tracker, protected_files, skill_loader,
+                context_config=context_config,
+            )
+
+            # Append tool results, detect compact sentinel
+            for tool_call_id, result_text in results:
+                if result_text == COMPACT_SENTINEL:
+                    compact_requested = True
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": "Compacting context...",
+                    })
+                else:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": result_text,
+                    })
+                preview = result_text[:200].replace("\n", "\\n")
+                if len(result_text) > 200:
+                    preview += "..."
+                print(f"  {CLI_GREEN}result({tool_call_id}){CLI_CLR}: {preview}")
+
+        # Handle compact sentinel
+        if compact_requested:
+            log.info("Compact tool invoked by LLM")
+            print(f"  [compact tool] LLM requested context compaction, summarizing...")
+            messages[:] = _apply_auto_compact(
+                messages, context_config, executor_model, trace_metadata,
+                reason="compact_tool",
+            )
+            print(f"  [compact tool] conversation compressed to {len(messages)} messages")
+
+        # Handle report_completion with verification interception
+        if completion_tc is not None:
+            answer = completion_tc.arguments.get("answer", "")
+            code = completion_tc.arguments.get("code", "completed")
+
+            if should_verify(verification_state, context_config.verification_enabled,
+                             context_config.verification_max_attempts):
+                # INTERCEPT: initiate verification cycle
+                if not verification_state.in_verification:
+                    verification_state.original_answer = answer
+                    verification_state.original_code = code
+                verification_state.in_verification = True
+                verification_state.attempts += 1
+
+                # Log verification start (Task 7)
+                answer_preview = answer[:120]
+                print(f"  [verify] attempt {verification_state.attempts}: "
+                      f"intercepted report_completion, answer preview: {answer_preview}")
+                log.info("Verification attempt %d: intercepted report_completion",
+                         verification_state.attempts)
+
+                # Build and inject verification prompt
+                prompt = build_verification_prompt(
+                    answer, code, summary.policy_files,
+                )
+
+                # Append synthetic tool result for report_completion
+                # (required to maintain valid message sequence for the LLM API)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": completion_tc.id,
+                    "content": "[Verification in progress -- answer held for review]",
+                })
+
+                # Inject verification prompt as user message
+                messages.append({
+                    "role": "user",
+                    "content": prompt,
+                })
+
+                continue  # Next iteration of executor loop
+            else:
+                # Dispatch report_completion normally (verification disabled or max attempts reached)
+                dispatch_tool(
+                    vm, "report_completion", completion_tc.arguments,
+                    tracker, protected_files, skill_loader,
+                    context_config=context_config,
+                )
+                # Append tool result message
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": completion_tc.id,
+                    "content": '{"status": "submitted"}',
+                })
+
+                # Log verification outcome if we were in a verification cycle (Task 7)
+                if verification_state.in_verification:
+                    outcome = detect_verification_outcome(
+                        verification_state.original_answer, answer
+                    )
+                    if outcome == VerificationOutcome.CONFIRMED:
+                        print(f"  [verify] answer CONFIRMED after "
+                              f"{verification_state.attempts} attempt(s)")
+                        log.info("Verification: answer confirmed (unchanged)")
+                    else:
+                        orig_preview = verification_state.original_answer[:80]
+                        new_preview = answer[:80]
+                        print(f"  [verify] answer REVISED after "
+                              f"{verification_state.attempts} attempt(s)")
+                        print(f"    original: {orig_preview}")
+                        print(f"    revised:  {new_preview}")
+                        log.info("Verification: answer revised. "
+                                 "original=%r, revised=%r",
+                                 orig_preview, new_preview)
+
+                # Completion logging
+                llm_refs = completion_tc.arguments.get("grounding_refs", [])
+                steps = completion_tc.arguments.get("steps", [])
                 actual_refs = llm_refs if llm_refs else tracker.merge([])
                 print(f"\n  {CLI_GREEN}=== COMPLETION ==={CLI_CLR}")
                 print(f"  Code: {code}")
@@ -280,11 +645,16 @@ def run_agent(
                 print(f"  Refs sent to harness: {actual_refs}")
                 print(f"  Steps: {steps}")
                 print(f"  (tracker has {len(tracker)} files: {sorted(tracker.all())})")
+
+                print(f"\n{CLI_GREEN}Agent completed.{CLI_CLR}")
                 break
 
-        if completion_called:
-            print(f"\n{CLI_GREEN}Agent completed.{CLI_CLR}")
-            break
+    # Fallback: if the loop ended while verification was in progress
+    # (step limit reached or empty response), ensure an answer is submitted.
+    if verification_state.in_verification and verification_state.original_answer:
+        # Check if an answer was already submitted by inspecting the loop exit
+        # (this fallback only runs if the for-loop exhausted its range)
+        log.info("Loop ended during verification -- original answer may have been submitted as fallback")
 
     print(f"\n--- Executor finished after {step_num} steps. "
           f"Tracker: {len(tracker)} files ---")

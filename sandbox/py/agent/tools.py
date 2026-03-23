@@ -173,6 +173,21 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "compact",
+            "description": (
+                "Trigger immediate context summarization. Use when the conversation "
+                "feels too long or you are losing track of earlier work. This compresses "
+                "the full conversation into a summary."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
 ]
 
 TOOL_NAMES: set[str] = {s["function"]["name"] for s in TOOL_SCHEMAS}

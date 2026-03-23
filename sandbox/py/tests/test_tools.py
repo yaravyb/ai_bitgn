@@ -14,9 +14,9 @@ def test_tool_schemas_is_list():
     assert isinstance(TOOL_SCHEMAS, list)
 
 
-def test_tool_schemas_has_eight_entries():
+def test_tool_schemas_has_nine_entries():
     from agent.tools import TOOL_SCHEMAS
-    assert len(TOOL_SCHEMAS) == 8
+    assert len(TOOL_SCHEMAS) == 9
 
 
 def test_tool_names_is_set():
@@ -24,9 +24,9 @@ def test_tool_names_is_set():
     assert isinstance(TOOL_NAMES, set)
 
 
-def test_tool_names_has_eight_entries():
+def test_tool_names_has_nine_entries():
     from agent.tools import TOOL_NAMES
-    assert len(TOOL_NAMES) == 8
+    assert len(TOOL_NAMES) == 9
 
 
 EXPECTED_TOOL_NAMES = {
@@ -38,6 +38,7 @@ EXPECTED_TOOL_NAMES = {
     "search",
     "report_completion",
     "load_skill",
+    "compact",
 }
 
 
@@ -90,13 +91,15 @@ class TestSchemaStructure:
             assert params["type"] == "object"
             assert "properties" in params
 
-    def test_each_schema_has_required_field(self, schemas):
+    def test_each_schema_has_required_field_when_properties_exist(self, schemas):
         for schema in schemas:
             params = schema["function"]["parameters"]
-            assert "required" in params, (
-                f"Schema {schema['function']['name']} missing 'required' field"
-            )
-            assert isinstance(params["required"], list)
+            # Tools with no properties (e.g., compact) may omit 'required'
+            if params.get("properties"):
+                assert "required" in params, (
+                    f"Schema {schema['function']['name']} missing 'required' field"
+                )
+                assert isinstance(params["required"], list)
 
 
 class TestSpecificToolSchemas:
@@ -215,8 +218,8 @@ class TestScoutToolSchemas:
     def test_existing_exports_unchanged(self):
         """TOOL_SCHEMAS and TOOL_NAMES must still be present and correct."""
         from agent.tools import TOOL_SCHEMAS, TOOL_NAMES
-        assert len(TOOL_SCHEMAS) == 8
-        assert len(TOOL_NAMES) == 8
+        assert len(TOOL_SCHEMAS) == 9
+        assert len(TOOL_NAMES) == 9
 
 
 class TestToolsModuleIsLeaf:

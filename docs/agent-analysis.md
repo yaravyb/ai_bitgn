@@ -1,18 +1,20 @@
 # AI Agent Implementation Analysis
 
-> Living document — updated as the agent evolves. Last reviewed: 2026-03-20.
+> Living document — updated as the agent evolves. Last reviewed: 2026-03-23 (self-verification update).
 
 ---
 
 ## Architecture Overview
 
-The agent is a **modular multi-phase system** built for the BitGN benchmark platform. It decomposes into two execution phases — a two-phase **Scout** (deterministic bootstrap + LLM-driven explorer) and an LLM-driven **Executor** (tool-use loop) — connected by an orchestrator (`loop.py`), with 9 modules under strict one-way dependency flow.
+The agent is a **modular multi-phase system** built for the BitGN benchmark platform. It decomposes into two execution phases — a two-phase **Scout** (deterministic bootstrap + LLM-driven explorer) and an LLM-driven **Executor** (tool-use loop with optional self-verification) — connected by an orchestrator (`loop.py`), with 11 modules under strict one-way dependency flow.
 
 ```
 main.py → agent/loop.py (orchestrator)
-             ├── scout.py  → llm.py, dispatch.py, tracker.py, tools.py, prompt.py
+             ├── verify.py             (leaf — pure functions, zero agent/ imports)
+             ├── context.py            (leaf — pure functions, zero agent/ imports)
+             ├── scout.py  → llm.py, dispatch.py, tracker.py, tools.py, prompt.py, context.py
              ├── llm.py                (leaf)
-             ├── dispatch.py → tracker.py, tools.py, llm.py
+             ├── dispatch.py → tracker.py, tools.py, llm.py, context.py
              ├── prompt.py             (leaf)
              ├── skills.py             (leaf)
              ├── tracker.py            (leaf)
@@ -27,7 +29,7 @@ main.py → agent/loop.py (orchestrator)
 
 ### 1. Excellent Modular Architecture
 
-Clear separation into leaf modules (`tracker.py`, `tools.py`, `llm.py`, `prompt.py`, `skills.py`) vs. orchestrator modules (`loop.py`, `scout.py`, `dispatch.py`) with strict one-way dependency flow. No circular imports; each module has a single responsibility. `dag.py` remains as an orphaned leaf module (no longer imported).
+Clear separation into leaf modules (`tracker.py`, `tools.py`, `llm.py`, `prompt.py`, `skills.py`, `context.py`, `verify.py`) vs. orchestrator modules (`loop.py`, `scout.py`, `dispatch.py`) with strict one-way dependency flow. No circular imports; each module has a single responsibility. `verify.py` is the newest leaf — pure functions with zero `agent/` imports, following the same pattern as `context.py`. `dag.py` remains as an orphaned leaf module (no longer imported).
 
 **Status**: Maintained.
 
@@ -60,9 +62,9 @@ LiteLLM enables swapping between OpenAI, Anthropic, AWS Bedrock, Azure, and Vert
 
 ### 5. Graceful Degradation for Observability
 
-Langfuse integration is a model of optional features: optional dependency group, `ImportError` handled, missing env vars → silent no-op, fire-and-forget async callbacks.
+Langfuse integration is a model of optional features: optional dependency group, `ImportError` handled, missing env vars → silent no-op, fire-and-forget async callbacks. Additionally includes a TCP reachability check — if credentials are set but the host is unreachable, observability is silently disabled rather than causing errors.
 
-**Status**: Maintained.
+**Status**: Improved (added host reachability check).
 
 ### 6. Parallel Tool Dispatch
 
@@ -82,6 +84,36 @@ Every module has dedicated tests. `conftest.py` handles pre-mocking of `bitgn` a
 
 **Status**: Maintained.
 
+### 9. Three-Layer Context Compression Pipeline
+
+A defense-in-depth strategy against unbounded context growth, implemented as three independent layers in `context.py` (pure functions) with orchestration in `loop.py`:
+
+- **Layer 1 — Tool result truncation**: Applied at the `dispatch_tool()` boundary. JSON-aware truncation preserves the JSON envelope while cutting the largest string value within the character budget. Configurable limit (default 10K chars). `report_completion` is exempt.
+- **Layer 2 — Micro-compact**: A zero-cost pass before every `call_llm()` that replaces old tool result content with `"[Previous tool result cleared]"`. Batch-based detection preserves the N most recent tool-use turns (default 3). Never removes messages or `tool_call_id` linkage.
+- **Layer 3 — Auto-compact**: When estimated tokens exceed a configurable threshold (default 80K), an LLM summarization call compresses the entire conversation into [system, summary, ack]. Pre-compaction transcripts are saved as JSONL for audit/debugging.
+
+Additionally exposes a `compact` tool that lets the LLM trigger summarization on-demand (sentinel pattern, same as `report_completion`). Scout phase uses Layer 1 + Layer 2 only (no auto-compact), with independently tunable settings.
+
+All parameters configurable via environment variables (`CTX_TRUNCATION_LIMIT`, `CTX_AUTO_COMPACT_THRESHOLD`, etc.). Backward-compatible: `context_config=None` skips all layers.
+
+**Status**: New.
+
+### 10. Self-Verification Loop
+
+A pre-submission verification loop intercepts `report_completion` (both tool-call and text-only auto-submit paths) to let the LLM double-check its answer before final submission. Configurable via `VERIFY_ENABLED` and `VERIFY_MAX_ATTEMPTS` (default: 2) environment variables.
+
+Key design decisions:
+- **Pure leaf module** (`verify.py`): `VerificationState` dataclass, `should_verify()`, `build_verification_prompt()`, `detect_verification_outcome()` — all pure functions with zero `agent/` imports.
+- **Pre-filter pattern**: `report_completion` is separated from other tool calls before `dispatch_parallel()`, so the harness never receives a premature answer. Other tool calls in the same response are dispatched normally.
+- **Policy-aware prompt**: Verification prompt embeds all policy file contents from the scout summary inline (saves LLM steps vs. re-reading).
+- **Defense in depth**: `verification_max_attempts` caps re-verification cycles; the 30-step executor limit caps total execution.
+- **Structured text extraction**: `_try_extract_completion()` handles weaker models that output tool calls as text (JSON, `report_completion({...})`, or Python kwargs syntax) instead of using the tool mechanism.
+- **Empty response fallback**: If the LLM returns empty content during a verification cycle, the captured answer is submitted rather than dropping it silently.
+- **Graceful unknown tool handling**: `dispatch_tool()` returns an error JSON for unrecognized tool names instead of crashing with `ValueError`.
+- **Backward compatible**: Disabled by default (`verification_enabled=False`). When disabled, identical behavior to pre-verification code with no overhead beyond a single boolean check.
+
+**Status**: New.
+
 ---
 
 ## Weaknesses
@@ -94,13 +126,11 @@ The executor loop is a simple linear sequence. If the LLM goes down a wrong path
 **Mitigation ideas**: Reflection/self-critique loops, progress heuristics (e.g., if same tool called 3+ times in a row, inject a "step back" prompt).
 **Status**: Open.
 
-### 2. No Memory / Context Management
+### 2. ~~No Memory / Context Management~~
 
-The message list grows unboundedly across the 30 steps. Large tool results get appended in full and stay in context forever. No summarization, truncation, or sliding window.
+~~The message list grows unboundedly across the 30 steps. Large tool results get appended in full and stay in context forever. No summarization, truncation, or sliding window.~~
 
-**Impact**: May hit token limits; performance degrades with excessive context.
-**Mitigation ideas**: Summarize older steps, truncate large tool results, implement a context budget.
-**Status**: Open.
+**Status**: **Addressed** (see Strength #9). Three-layer compression pipeline: tool result truncation at dispatch, micro-compact per-turn pruning, auto-compact LLM summarization at token threshold. All configurable via environment variables.
 
 ### 3. Hardcoded Configuration
 
@@ -136,13 +166,11 @@ The scout now consumes LLM tokens (Phase 2). Estimated ~3K-15K tokens per scout 
 **Mitigation ideas**: Use `threading.Lock` or collect results via `queue.Queue`.
 **Status**: Open.
 
-### 7. No Tool Result Validation
+### 7. ~~No Tool Result Validation~~
 
-`dispatch_tool()` returns raw serialized results without schema validation or size limits. A large file in the sandbox could blow up context or increase costs.
+~~`dispatch_tool()` returns raw serialized results without schema validation or size limits. A large file in the sandbox could blow up context or increase costs.~~
 
-**Impact**: Context window exhaustion, LLM focus loss.
-**Mitigation ideas**: Truncate results beyond a configurable threshold, validate against expected schemas.
-**Status**: Open.
+**Status**: **Partially addressed** (see Strength #9). Tool results are now truncated at the dispatch boundary with configurable limits (Layer 1). JSON-aware truncation preserves structure. Schema validation of tool results is still not implemented — the truncation handles the size problem but not structural correctness.
 
 ### 8. Limited Observability for Non-LLM Operations
 
@@ -155,12 +183,11 @@ Langfuse traces LLM calls (both executor and scout Phase 2, with separate `trace
 **Impact**: Blind spots when diagnosing performance issues outside LLM calls.
 **Status**: Partially improved (scout LLM calls now traced via Langfuse); remaining gaps open.
 
-### 9. Single-Attempt Completion
+### 9. ~~Single-Attempt Completion~~
 
-No mechanism for self-verification before submitting. No multi-attempt strategies, confidence scoring, or refinement loops. Auto-submit (text-only response → `report_completion`) could fire prematurely.
+~~No mechanism for self-verification before submitting. No multi-attempt strategies, confidence scoring, or refinement loops. Auto-submit (text-only response → `report_completion`) could fire prematurely.~~
 
-**Impact**: Incomplete or incorrect answers submitted without review.
-**Status**: Open.
+**Status**: **Addressed** (see Strength #10). Self-verification loop intercepts `report_completion` and text-only auto-submit, injects a policy-aware verification prompt, and gives the LLM up to N attempts to confirm or correct its answer. Includes structured text extraction for weaker models and empty-response fallback. Configurable via `VERIFY_ENABLED` and `VERIFY_MAX_ATTEMPTS`.
 
 ### 10. No Caching Layer
 
@@ -173,23 +200,27 @@ Every `run_agent()` starts fresh. Scout re-explores the workspace even if unchan
 
 ## Summary Scorecard
 
-| Aspect | Rating | Notes |
-|--------|--------|-------|
-| Modularity | Strong | Clean boundaries, no circular deps |
-| Safety | Good | Protected files, injection defense, step limits, read-only scout tools |
-| Provider flexibility | Strong | LiteLLM-based, config-driven |
-| Scout intelligence | Strong | Task-aware LLM explorer with structured analysis |
-| Observability | Partial | LLM calls traced (executor + scout), but not tool dispatch ops |
-| Error handling | Basic | Retries on LLM, but no re-planning or recovery |
-| Scalability | Weak | No context management, no caching |
-| Testability | Strong | Comprehensive TDD suite (388 tests) |
-| Robustness | Moderate | Thread safety gaps, no result validation |
+| Aspect              | Rating   | Notes                                                                   |
+|---------------------|----------|-------------------------------------------------------------------------|
+| Modularity          | Strong   | Clean boundaries, no circular deps, 11 modules                         |
+| Safety              | Good     | Protected files, injection defense, step limits, read-only scout tools  |
+| Provider flexibility| Strong   | LiteLLM-based, config-driven                                           |
+| Scout intelligence  | Strong   | Task-aware LLM explorer with structured analysis                       |
+| Context management  | Strong   | Three-layer compression pipeline (truncation, micro-compact, auto-compact) |
+| Self-verification   | Strong   | Pre-submission verification loop with policy-aware prompt, text extraction, fallbacks |
+| Observability       | Partial  | LLM calls traced; Langfuse host reachability check; tool dispatch ops not traced |
+| Error handling      | Moderate | Retries on LLM, verification fallbacks, graceful unknown tool handling  |
+| Scalability         | Moderate | Context managed, but no caching layer                                  |
+| Testability         | Strong   | Comprehensive TDD suite (501 tests)                                    |
+| Robustness          | Moderate | Thread safety gaps; tool results size-limited but not schema-validated  |
 
 ---
 
 ## Changelog
 
-| Date | Change |
-|------|--------|
-| 2026-03-20 | Initial analysis created |
-| 2026-03-20 | Updated for two-phase LLM scout (replaced DAG-based scout) |
+| Date       | Change                                                                          |
+|------------|---------------------------------------------------------------------------------|
+| 2026-03-20 | Initial analysis created                                                        |
+| 2026-03-20 | Updated for two-phase LLM scout (replaced DAG-based scout)                      |
+| 2026-03-23 | Updated for three-layer context compression pipeline; weaknesses #2 and #7 addressed; added Langfuse host reachability check; test count 388→436 |
+| 2026-03-23 | Added self-verification loop (verify.py); weakness #9 addressed; structured text extraction for weaker models; graceful unknown tool handling; LiteLLM/Langfuse log suppression; per-task timing in benchmark runner; test count 436→501 |

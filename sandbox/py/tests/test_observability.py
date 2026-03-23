@@ -128,6 +128,34 @@ class TestConfigureObservabilityImportError:
             os.environ.pop("LANGFUSE_SECRET_KEY", None)
 
 
+class TestConfigureObservabilityHostUnreachable:
+    """When keys are set but the Langfuse host is down, callbacks must NOT be registered."""
+
+    def setup_method(self):
+        litellm.success_callback = []
+        litellm.failure_callback = []
+
+    def test_noop_when_host_unreachable(self):
+        """When both keys are set but Langfuse host is unreachable, callbacks stay empty."""
+        from agent.observability import configure_observability
+        os.environ["LANGFUSE_PUBLIC_KEY"] = "pk-lf-test"
+        os.environ["LANGFUSE_SECRET_KEY"] = "sk-lf-test"
+
+        try:
+            mock_langfuse = MagicMock()
+            with (
+                patch.dict(sys.modules, {"langfuse": mock_langfuse}),
+                patch("agent.observability._langfuse_host_reachable", return_value=False),
+            ):
+                configure_observability()
+
+            assert "langfuse" not in litellm.success_callback
+            assert "langfuse" not in litellm.failure_callback
+        finally:
+            os.environ.pop("LANGFUSE_PUBLIC_KEY", None)
+            os.environ.pop("LANGFUSE_SECRET_KEY", None)
+
+
 class TestConfigureObservabilitySuccess:
     """Task 3.1: When both env vars are set and langfuse is importable, callbacks are registered."""
 
@@ -136,15 +164,17 @@ class TestConfigureObservabilitySuccess:
         litellm.failure_callback = []
 
     def test_registers_callbacks_when_configured(self):
-        """When both keys are set and langfuse is importable, callbacks are registered."""
+        """When both keys are set, langfuse is importable, and host is reachable, callbacks are registered."""
         from agent.observability import configure_observability
         os.environ["LANGFUSE_PUBLIC_KEY"] = "pk-lf-test"
         os.environ["LANGFUSE_SECRET_KEY"] = "sk-lf-test"
 
         try:
-            # Mock langfuse as importable
             mock_langfuse = MagicMock()
-            with patch.dict(sys.modules, {"langfuse": mock_langfuse}):
+            with (
+                patch.dict(sys.modules, {"langfuse": mock_langfuse}),
+                patch("agent.observability._langfuse_host_reachable", return_value=True),
+            ):
                 configure_observability()
 
             assert "langfuse" in litellm.success_callback

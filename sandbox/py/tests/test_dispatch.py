@@ -390,7 +390,7 @@ class TestDispatchHandlesConnectError:
 
 
 class TestDispatchModuleDependencies:
-    """dispatch.py should import only from tracker and tools (and external libs)."""
+    """dispatch.py should import only from tracker, tools, llm, and context (and external libs)."""
 
     def test_dispatch_imports(self):
         import agent.dispatch as mod
@@ -398,9 +398,105 @@ class TestDispatchModuleDependencies:
             source = f.read()
         import re
         agent_imports = re.findall(r"from\s+agent\.(\w+)", source)
-        allowed = {"tracker", "tools", "llm"}  # llm for ToolCall type
+        allowed = {"tracker", "tools", "llm", "context"}  # context for ContextConfig, truncation
         for imp in agent_imports:
             assert imp in allowed, (
                 f"dispatch.py imports from agent.{imp}, "
                 f"only {allowed} are allowed"
             )
+
+
+# ---------------------------------------------------------------------------
+# Context management integration tests (Task 10.1)
+# ---------------------------------------------------------------------------
+
+class TestDispatchToolTruncation:
+    """Tool result truncation via context_config parameter."""
+
+    @patch("agent.dispatch.MessageToDict", return_value={"content": "x" * 20000})
+    def test_truncation_applied_when_config_provided(self, mock_mtd, mock_vm, tracker, protected_files):
+        """When context_config is provided and result exceeds limit, truncation is applied."""
+        from agent.dispatch import dispatch_tool
+        from agent.context import ContextConfig
+
+        cfg = ContextConfig(truncation_limit=100)
+        result = dispatch_tool(
+            mock_vm, "read_file", {"path": "/a.md"},
+            tracker, protected_files,
+            context_config=cfg,
+        )
+        assert "truncated" in result
+        assert len(result) < 20000
+
+    @patch("agent.dispatch.MessageToDict", return_value={"content": "x" * 20000})
+    def test_no_truncation_when_config_none(self, mock_mtd, mock_vm, tracker, protected_files):
+        """When context_config is None, result is returned unchanged (backward compat)."""
+        from agent.dispatch import dispatch_tool
+
+        result = dispatch_tool(
+            mock_vm, "read_file", {"path": "/a.md"},
+            tracker, protected_files,
+            context_config=None,
+        )
+        parsed = json.loads(result)
+        assert len(parsed["content"]) == 20000
+
+    @patch("agent.dispatch.MessageToDict", return_value={"status": "ok"})
+    def test_report_completion_exempt_from_truncation(self, mock_mtd, mock_vm, tracker, protected_files):
+        """report_completion results are never truncated, even with context_config."""
+        from agent.dispatch import dispatch_tool
+        from agent.context import ContextConfig
+
+        cfg = ContextConfig(truncation_limit=5)
+        result = dispatch_tool(
+            mock_vm, "report_completion",
+            {"answer": "done", "grounding_refs": [], "steps": [], "code": "completed"},
+            tracker, protected_files,
+            context_config=cfg,
+        )
+        # Result should not be truncated
+        assert "truncated" not in result
+
+
+class TestDispatchCompactSentinel:
+    """compact tool returns COMPACT_SENTINEL."""
+
+    def test_compact_returns_sentinel(self, mock_vm, tracker, protected_files):
+        """dispatch_tool('compact', ...) returns COMPACT_SENTINEL."""
+        from agent.dispatch import dispatch_tool
+        from agent.context import COMPACT_SENTINEL
+
+        result = dispatch_tool(
+            mock_vm, "compact", {},
+            tracker, protected_files,
+        )
+        assert result == COMPACT_SENTINEL
+
+    def test_compact_in_dispatch_map(self):
+        """compact handler is registered in DISPATCH_MAP."""
+        from agent.dispatch import DISPATCH_MAP
+        assert "compact" in DISPATCH_MAP
+        assert callable(DISPATCH_MAP["compact"])
+
+
+class TestDispatchParallelContextConfig:
+    """dispatch_parallel passes context_config through to dispatch_tool."""
+
+    @patch("agent.dispatch.MessageToDict", return_value={"content": "x" * 20000})
+    def test_parallel_applies_truncation(self, mock_mtd, mock_vm, tracker, protected_files):
+        """dispatch_parallel applies truncation when context_config is provided."""
+        from agent.dispatch import dispatch_parallel
+        from agent.llm import ToolCall
+        from agent.context import ContextConfig
+
+        cfg = ContextConfig(truncation_limit=100)
+        tool_calls = [
+            ToolCall(id="tc_1", name="read_file", arguments={"path": "/a.md"}),
+        ]
+        results = dispatch_parallel(
+            mock_vm, tool_calls, tracker, protected_files,
+            context_config=cfg,
+        )
+        assert len(results) == 1
+        _, result_text = results[0]
+        assert "truncated" in result_text
