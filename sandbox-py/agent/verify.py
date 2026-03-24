@@ -61,11 +61,15 @@ def build_verification_prompt(
     answer: str,
     code: str,
     policy_contents: dict[str, str],
+    checklist_body: str = "",
+    source_basename: str | None = None,
 ) -> str:
     """Construct the verification prompt injected as a user message.
 
-    The prompt includes the proposed answer/code verbatim, policy file
-    contents, a verification checklist, and submission instructions.
+    The prompt provides a structural frame (proposed answer, policy files,
+    submission instructions). The verification checklist content comes from
+    the ``checklist_body`` parameter (loaded from a skill file externally).
+    When ``source_basename`` is provided, a concrete filename check is added.
     """
     parts: list[str] = []
     parts.append("<verification>")
@@ -85,22 +89,20 @@ def build_verification_prompt(
             parts.append(f"### {path}")
             parts.append(content)
 
-    parts.append("")
-    parts.append("## Verification Checklist")
-    parts.append(
-        "1. Re-read the policy files above. Does the answer comply with "
-        "ALL format rules (exact casing, whitespace, punctuation, response codes)?"
-    )
-    parts.append(
-        "2. If you performed file operations (write_file, delete_file), "
-        "verify they succeeded by re-reading or listing the affected paths."
-    )
-    parts.append(
-        "3. Check that all grounding references point to files that actually exist."
-    )
-    parts.append(
-        "4. Verify the answer is complete and addresses the full task requirement."
-    )
+    if checklist_body and checklist_body.strip():
+        parts.append("")
+        parts.append(checklist_body)
+
+    if source_basename:
+        parts.append("")
+        parts.append(f"## Source Filename Check")
+        parts.append(
+            f"The task references source file `{source_basename}`. "
+            f"All derived files MUST use this exact basename. "
+            f"If any file you created has a different basename "
+            f"(e.g. extra segments added), delete it and recreate "
+            f"with the correct name before submitting."
+        )
 
     parts.append("")
     parts.append("## Instructions")

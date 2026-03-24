@@ -65,6 +65,11 @@ class GroundingTracker:
         """Return a copy of tracked file paths (original casing)."""
         return set(self._files.values())
 
+    def contains(self, path: str) -> bool:
+        """Check if a file path has been tracked (case-insensitive)."""
+        normalized = _normalize(path)
+        return normalized.lower() in self._files
+
     def __len__(self) -> int:
         return len(self._files)
 

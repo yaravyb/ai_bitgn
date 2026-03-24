@@ -144,14 +144,28 @@ class TestBuildVerificationPrompt:
         prompt = build_verification_prompt("ans", "code", {})
         assert "## Policy Files" not in prompt
 
-    def test_includes_checklist_items(self):
+    def test_includes_checklist_when_provided(self):
         from agent.verify import build_verification_prompt
-        prompt = build_verification_prompt("ans", "code", {"p.md": "content"})
-        # Checklist must mention format rules, file operations, grounding, completeness
+        checklist = (
+            "## Verification Checklist\n"
+            "1. Check format rules and casing.\n"
+            "2. Verify file operations (write_file, delete_file).\n"
+            "3. Check grounding references.\n"
+            "4. Verify completeness."
+        )
+        prompt = build_verification_prompt(
+            "ans", "code", {"p.md": "content"}, checklist_body=checklist,
+        )
         assert "format" in prompt.lower() or "casing" in prompt.lower()
         assert "file operation" in prompt.lower() or "write_file" in prompt.lower()
         assert "grounding" in prompt.lower()
         assert "complete" in prompt.lower()
+
+    def test_no_checklist_when_not_provided(self):
+        from agent.verify import build_verification_prompt
+        prompt = build_verification_prompt("ans", "code", {"p.md": "content"})
+        # Without checklist_body, no checklist content is injected
+        assert "grounding" not in prompt.lower()
 
     def test_includes_submission_instructions(self):
         from agent.verify import build_verification_prompt

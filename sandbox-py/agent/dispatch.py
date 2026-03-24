@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import posixpath
+import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
@@ -47,7 +48,8 @@ def _handle_tree(
     skill_loader: Any | None,
 ) -> str:
     path = args.get("path", "/")
-    resp = vm.tree(path)
+    level = args.get("level", 0)
+    resp = vm.tree(path, level=level)
     # tree is a directory operation, not a file read — do not add to tracker
     return json.dumps(MessageToDict(resp), ensure_ascii=False)
 
@@ -72,9 +74,50 @@ def _handle_read_file(
     skill_loader: Any | None,
 ) -> str:
     path = args.get("path", "")
-    resp = vm.read(path)
+    number = args.get("number", False)
+    start_line = args.get("start_line", 0)
+    end_line = args.get("end_line", 0)
+    resp = vm.read(path, number=number, start_line=start_line, end_line=end_line)
     tracker.add(path)
     return json.dumps(MessageToDict(resp), ensure_ascii=False)
+
+
+_SLUG_PREFIX_RE = re.compile(r"^(?:\d[\d\-]*__(?:\d+__)*)")
+
+
+def _extract_slug(stem: str) -> str:
+    """Extract the non-date, non-numeric slug from a filename stem.
+
+    ``2026-03-23__0000__hn-foo`` → ``hn-foo``
+    ``2026-03-23__hn-foo``       → ``hn-foo``
+    ``report``                   → ``report``
+    """
+    return _SLUG_PREFIX_RE.sub("", stem)
+
+
+def _is_basename_mismatch(source_basename: str, written_path: str) -> bool:
+    """Detect if written file is a renamed derivative of the source.
+
+    Returns True when the written file shares the source's slug but has
+    extra segments inserted (e.g. ``__0000__``).  Returns False for exact
+    matches or unrelated filenames.
+    """
+    written_bn = posixpath.basename(written_path)
+    if written_bn == source_basename:
+        return False
+    src_stem = source_basename.rsplit(".", 1)[0]
+    dst_stem = written_bn.rsplit(".", 1)[0]
+    src_slug = _extract_slug(src_stem)
+    dst_slug = _extract_slug(dst_stem)
+    # Same slug but different full stem → segment was inserted
+    if src_slug and src_slug == dst_slug and src_stem != dst_stem:
+        return True
+    return False
+
+
+# Module-level guards (set by dispatch_tool before handler invocation)
+_source_basename: str | None = None
+_scope_constrained: bool = False
 
 
 def _handle_write_file(
@@ -86,7 +129,32 @@ def _handle_write_file(
 ) -> str:
     path = args.get("path", "")
     content = args.get("content", "")
-    resp = vm.write(path, content)
+    start_line = args.get("start_line", 0)
+    end_line = args.get("end_line", 0)
+
+    # Guard: reject writes that look like renamed derivatives of the source file
+    if _source_basename and _is_basename_mismatch(_source_basename, path):
+        expected = _source_basename
+        actual = posixpath.basename(path)
+        log.warning("BLOCKED: write_file %s (basename mismatch: expected %s)", path, expected)
+        return json.dumps(
+            {"error": f"Filename mismatch: expected basename '{expected}', got '{actual}'. "
+             f"Use the exact source filename."},
+            ensure_ascii=False,
+        )
+
+    # Guard: when scope is constrained, block modifications to already-read files
+    # (read = context gathering, write = modification → unrequested change)
+    if _scope_constrained and tracker.contains(path):
+        log.warning("BLOCKED: write_file %s (scope constrained, file was already read)", path)
+        return json.dumps(
+            {"error": f"Scope constraint: '{path}' was read for context. "
+             f"Modifying existing files is not allowed when the task says "
+             f"'keep the diff focused'. Only create new files."},
+            ensure_ascii=False,
+        )
+
+    resp = vm.write(path, content, start_line=start_line, end_line=end_line)
     return json.dumps(MessageToDict(resp), ensure_ascii=False)
 
 
@@ -104,6 +172,16 @@ def _handle_delete_file(
         log.warning("REFUSED: delete %s (protected policy file)", path)
         return json.dumps(
             {"error": f"Cannot delete protected file: {path}"},
+            ensure_ascii=False,
+        )
+
+    # Guard: template files (prefixed with _) are structural, not content
+    basename = posixpath.basename(path)
+    if basename.startswith("_"):
+        log.warning("REFUSED: delete %s (template/structural file)", path)
+        return json.dumps(
+            {"error": f"Cannot delete template file: {path}. "
+             f"Files prefixed with '_' are structural, not captured content."},
             ensure_ascii=False,
         )
 
@@ -251,6 +329,8 @@ def dispatch_tool(
     protected_files: set[str],
     skill_loader: Any | None = None,
     context_config: ContextConfig | None = None,
+    source_basename: str | None = None,
+    scope_constrained: bool = False,
 ) -> str:
     """Dispatch a single tool call and return the result as a JSON string.
 
@@ -259,6 +339,11 @@ def dispatch_tool(
 
     Returns error JSON if the tool_name is not recognized.
     """
+    # Set module-level guards for write interception
+    global _source_basename, _scope_constrained
+    _source_basename = source_basename
+    _scope_constrained = scope_constrained
+
     handler = DISPATCH_MAP.get(tool_name)
     if handler is None:
         log.warning("Unknown tool: %s", tool_name)
@@ -298,6 +383,8 @@ def dispatch_parallel(
     skill_loader: Any | None = None,
     max_workers: int = 4,
     context_config: ContextConfig | None = None,
+    source_basename: str | None = None,
+    scope_constrained: bool = False,
 ) -> list[tuple[str, str]]:
     """Execute multiple tool calls concurrently.
 
@@ -313,6 +400,8 @@ def dispatch_parallel(
             vm, tc.name, tc.arguments,
             tracker, protected_files, skill_loader,
             context_config=context_config,
+            source_basename=source_basename,
+            scope_constrained=scope_constrained,
         )
         return (tc.id, result)
 

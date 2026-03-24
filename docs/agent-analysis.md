@@ -49,10 +49,13 @@ Replaced the previous reactive DAG-based scout which had no task awareness, no d
 ### 3. Strong Safety Mechanisms
 
 - **Protected files** — policy files can't be deleted by the LLM, with dynamic expansion from scout results.
-- **Prompt injection defense** — task text wrapped in `<task>` delimiters with explicit security instructions.
+- **Template file protection** — `_`-prefixed files (structural scaffolding) are protected from deletion at the dispatch layer.
+- **Prompt injection defense** — task text wrapped in `<task>` delimiters. Injection Response Protocol: refuse entire task with `OUTCOME_DENIED_SECURITY` when injection detected.
+- **Basename mismatch guard** — prevents writes with renamed derivatives of source files (slug extraction detects inserted segments like `__0000__`).
+- **Scope-constrained write guard** — when task says "keep the diff focused", blocks modifications to previously-read files (prevents over-scoping).
 - **Step limit** (30 steps) — prevents infinite loops and runaway costs.
 
-**Status**: Maintained.
+**Status**: Significantly enhanced (programmatic guards, injection protocol).
 
 ### 4. Provider-Agnostic LLM Access
 
@@ -111,6 +114,33 @@ Key design decisions:
 - **Empty response fallback**: If the LLM returns empty content during a verification cycle, the captured answer is submitted rather than dropping it silently.
 - **Graceful unknown tool handling**: `dispatch_tool()` returns an error JSON for unrecognized tool names instead of crashing with `ValueError`.
 - **Backward compatible**: Disabled by default (`verification_enabled=False`). When disabled, identical behavior to pre-verification code with no overhead beyond a single boolean check.
+
+**Status**: New.
+
+### 11. Embedded Skills System
+
+Behavioral rules live in skill markdown files, not hardcoded in Python:
+- **Always-on skills** (`security-posture`, `execution-discipline`): Embedded in the system prompt via `embedded_skill_bodies: list[str]` parameter in `build_system_prompt()`.
+- **On-demand skills** (`pattern-match-create`, `policy-gate`, `workspace-discovery`): Loaded by the LLM via `load_skill()` tool call.
+- **Verification checklist** (`self-verification`): Injected into the verification prompt via `checklist_body` parameter.
+- `prompt.py` is a pure structural assembler — zero behavioral content.
+
+**Status**: New.
+
+### 12. Full PCM Outcome Vocabulary
+
+All 5 PCM outcome codes exposed in the `report_completion` tool schema: `OUTCOME_OK`, `OUTCOME_ERR_INTERNAL`, `OUTCOME_NONE_UNSUPPORTED`, `OUTCOME_DENIED_SECURITY`, `OUTCOME_NONE_CLARIFICATION`. Self-documenting enum names (matching the reference agent pattern) eliminate the need for skill-level descriptions of when to use each code.
+
+**Status**: New.
+
+### 13. SDK v2 Tool Capabilities
+
+Updated to bitgn SDK v2 (20260324) with:
+- **Line-range reads**: `read_file(path, number, start_line, end_line)` — partial file reads for context efficiency.
+- **Line-range writes**: `write_file(path, content, start_line, end_line)` — surgical edits without full file rewrites.
+- **Depth-limited tree**: `tree(path, level)` — controlled directory outline for scout phase.
+
+All parameters wired through tool schemas → dispatch handlers → runtime adapters.
 
 **Status**: New.
 
@@ -196,6 +226,29 @@ Every `run_agent()` starts fresh. Scout re-explores the workspace even if unchan
 **Impact**: Redundant work across multiple tasks against the same sandbox.
 **Status**: Open.
 
+### 11. Module-Level Mutable Globals in Dispatch
+
+`dispatch.py` uses `_source_basename` and `_scope_constrained` module-level globals set by `dispatch_tool()` before handler invocation. These race under `dispatch_parallel()` with `ThreadPoolExecutor`.
+
+**Impact**: Thread-safety hazard; violates functional purity.
+**Mitigation**: Planned refactoring to frozen `DispatchContext` dataclass (spec: agent-guard-architecture, Req 1).
+**Status**: Open (spec generated).
+
+### 12. Regex-Based Task Parsing
+
+`loop.py` uses `_FILE_PATH_RE` regex and `_SCOPE_PHRASES` tuple to extract task constraints. Fragile, English-only, benchmark-coupled.
+
+**Impact**: Fails on paraphrased constraints, non-English tasks, unexpected file path formats.
+**Mitigation**: Planned hybrid approach — regex fast-path + LLM fallback (spec: agent-guard-architecture, Req 2).
+**Status**: Open (spec generated).
+
+### 13. No Tests for Dispatch Guards
+
+`_is_basename_mismatch()`, `_extract_slug()`, scope guard, template guard — all production code with zero unit tests.
+
+**Impact**: Regressions go undetected.
+**Status**: Open (spec: agent-guard-architecture, Req 5).
+
 ---
 
 ## Summary Scorecard
@@ -203,7 +256,7 @@ Every `run_agent()` starts fresh. Scout re-explores the workspace even if unchan
 | Aspect              | Rating   | Notes                                                                   |
 |---------------------|----------|-------------------------------------------------------------------------|
 | Modularity          | Strong   | Clean boundaries, no circular deps, 11 modules                         |
-| Safety              | Good     | Protected files, injection defense, step limits, read-only scout tools  |
+| Safety              | Strong   | Protected files, template guards, injection protocol, basename/scope guards |
 | Provider flexibility| Strong   | LiteLLM-based, config-driven                                           |
 | Scout intelligence  | Strong   | Task-aware LLM explorer with structured analysis                       |
 | Context management  | Strong   | Three-layer compression pipeline (truncation, micro-compact, auto-compact) |
@@ -211,8 +264,10 @@ Every `run_agent()` starts fresh. Scout re-explores the workspace even if unchan
 | Observability       | Partial  | LLM calls traced; Langfuse host reachability check; tool dispatch ops not traced |
 | Error handling      | Moderate | Retries on LLM, verification fallbacks, graceful unknown tool handling  |
 | Scalability         | Moderate | Context managed, but no caching layer                                  |
-| Testability         | Strong   | Comprehensive TDD suite (501 tests)                                    |
-| Robustness          | Moderate | Thread safety gaps; tool results size-limited but not schema-validated  |
+| Testability         | Strong   | Comprehensive TDD suite (534 tests); guard functions untested (known gap) |
+| Robustness          | Moderate | Thread safety gaps in dispatch/tracker; guard tests missing             |
+| SDK integration     | Strong   | SDK v2 line-range reads/writes, depth-limited tree, all PCM tools      |
+| Outcome vocabulary  | Strong   | All 5 PCM outcome codes, self-documenting enum names                   |
 
 ---
 
@@ -224,3 +279,4 @@ Every `run_agent()` starts fresh. Scout re-explores the workspace even if unchan
 | 2026-03-20 | Updated for two-phase LLM scout (replaced DAG-based scout)                      |
 | 2026-03-23 | Updated for three-layer context compression pipeline; weaknesses #2 and #7 addressed; added Langfuse host reachability check; test count 388→436 |
 | 2026-03-23 | Added self-verification loop (verify.py); weakness #9 addressed; structured text extraction for weaker models; graceful unknown tool handling; LiteLLM/Langfuse log suppression; per-task timing in benchmark runner; test count 436→501 |
+| 2026-03-24 | Full PCM outcome codes (5 codes, self-documenting names); embedded skills system (security-posture, execution-discipline, self-verification); programmatic dispatch guards (basename mismatch, scope constraint, template protection); SDK v2 upgrade (line-range read/write, depth-limited tree); prompt.py made pure structural assembler; injection response protocol; spec `agent-guard-architecture` generated for remaining gaps (globals→context, regex→LLM, tests); test count 501→534 |

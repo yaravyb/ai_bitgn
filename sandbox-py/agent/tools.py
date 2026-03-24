@@ -17,6 +17,11 @@ TOOL_SCHEMAS: list[dict] = [
                         "type": "string",
                         "description": "Root path to outline.",
                     },
+                    "level": {
+                        "type": "integer",
+                        "description": "Maximum depth level to display. 0 or omitted = unlimited.",
+                        "default": 0,
+                    },
                 },
                 "required": ["path"],
             },
@@ -43,13 +48,26 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the contents of a file.",
+            "description": "Read the contents of a file. Supports line-range reads and line numbering.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
                         "description": "File path to read.",
+                    },
+                    "number": {
+                        "type": "boolean",
+                        "description": "If true, prefix each line with its line number (like cat -n).",
+                        "default": False,
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "First line to read (1-based). Omit to start from beginning.",
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "Last line to read (1-based, inclusive). Omit to read to end.",
                     },
                 },
                 "required": ["path"],
@@ -60,7 +78,10 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Write content to a file, creating or overwriting it.",
+            "description": (
+                "Write content to a file. Without line range: creates or overwrites. "
+                "With start_line/end_line: replaces only the specified lines."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -71,6 +92,14 @@ TOOL_SCHEMAS: list[dict] = [
                     "content": {
                         "type": "string",
                         "description": "Content to write.",
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "First line to replace (1-based). Omit for full overwrite.",
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "Last line to replace (1-based, inclusive). Omit for full overwrite.",
                     },
                 },
                 "required": ["path", "content"],
@@ -148,8 +177,16 @@ TOOL_SCHEMAS: list[dict] = [
                     },
                     "code": {
                         "type": "string",
-                        "enum": ["completed", "failed"],
-                        "description": "Completion status code.",
+                        "enum": [
+                            "OUTCOME_OK",
+                            "OUTCOME_ERR_INTERNAL",
+                            "OUTCOME_NONE_UNSUPPORTED",
+                            "OUTCOME_DENIED_SECURITY",
+                            "OUTCOME_NONE_CLARIFICATION",
+                        ],
+                        "description": (
+                            "PCM outcome code that best matches the situation."
+                        ),
                     },
                 },
                 "required": ["answer", "grounding_refs", "steps", "code"],
