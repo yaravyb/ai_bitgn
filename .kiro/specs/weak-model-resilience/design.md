@@ -121,17 +121,30 @@ else:
 
 Two small helper functions added to `loop.py`:
 
-**`_looks_like_tool_call(text: str) -> bool`**: Attempts `json.loads(text.strip())`. If result is a dict containing any key that matches a known tool parameter name (`"path"`, `"pattern"`, `"content"`, `"answer"` is excluded since that goes through `_try_extract_completion`), returns True. Otherwise False.
+**`_looks_like_tool_call(text: str) -> bool`**:
+1. **Pre-check**: If `text.strip()` does not start with `{` and end with `}`, return False immediately (Req 7: zero overhead for non-JSON text).
+2. Attempt `json.loads(text.strip())`. If parse fails, return False.
+3. If result is not a dict, return False.
+4. If dict contains `"answer"` key, return False (handled by `_try_extract_completion`).
+5. Check for **distinguishing parameter combinations** (not just `"path"` alone — too many false positives):
+   - `{"path", "content"}` → likely `write_file`
+   - `{"path", "level"}` → likely `tree`
+   - `{"path", "number"}` or `{"path", "start_line"}` → likely `read_file`
+   - `{"pattern"}` → likely `search`
+   - `{"name"}` with `"root"` or `"kind"` → likely `find`
+   - `{"path"}` alone → **ambiguous** — return False (too many false positives)
+6. Return True only if a distinguishing combo is matched.
 
-**`_detect_tool_name(text: str) -> str | None`**: Parses the JSON dict keys and matches against the tool schemas' required parameters to identify the most likely tool. Returns tool name or None. Used only for the log message and the correction prompt.
+**`_detect_tool_name(text: str) -> str | None`**: Uses the same combo matching to identify the most likely tool. Returns tool name or None.
 
 **Known tool parameter signatures** (derived from `tools.py`):
 
-| Tool | Distinguishing required param |
-|------|-------------------------------|
-| tree | `path` + `level` |
-| read_file | `path` (alone or with `offset`) |
-| write_file | `path` + `content` |
+| Tool | Distinguishing param combo | `"path"` alone? |
+|------|---------------------------|-----------------|
+| tree | `path` + `level` | No (ambiguous) |
+| list_dir | `path` only | No (ambiguous) |
+| read_file | `path` + (`number` or `start_line` or `end_line`) | No (ambiguous) |
+| write_file | `path` + `content` | No — requires `content` |
 | search | `pattern` |
 | find | `name` |
 | report_completion | `answer` (handled by `_try_extract_completion`) |
@@ -194,7 +207,19 @@ if not state.completion_submitted:
 
 **Req 13**: `report_completion` guaranteed to be called before `run_agent` returns, regardless of exit reason.
 
-The `completion_submitted` flag is set to `True` at every existing `dispatch_tool(... "report_completion" ...)` call site (the tool-call path completion and the text-only auto-submit path). The post-loop guard only fires if none of those paths executed.
+The `completion_submitted` flag is set to `True` at every existing `dispatch_tool(... "report_completion" ...)` call site. To handle edge cases (exceptions during dispatch), the flag is set BEFORE the dispatch call — if the dispatch fails, the guard still won't double-submit because the harness already received the (failed) attempt.
+
+**Exit-point mapping** (every way the loop can end):
+
+| Exit Point | How | `completion_submitted`? | Guard fires? |
+|---|---|---|---|
+| Normal tool-call completion | `break` after `dispatch_tool("report_completion")` | True (set before dispatch) | No |
+| Text-only auto-submit | `break` after `dispatch_tool("report_completion")` | True (set before dispatch) | No |
+| Empty-during-verification | `break` after `dispatch_tool("report_completion")` | True | No |
+| Empty-retry exhaustion (Req 2) | `break` after fallback `dispatch_tool("report_completion")` | True | No |
+| Text-tool re-prompt exhaustion | Falls through to auto-submit → same as text-only | True | No |
+| 30-step limit reached | `for` loop ends naturally | **Maybe False** | **Yes — guard fires** |
+| Exception in dispatch | Loop continues (ConnectError caught) | **Maybe False** | **Yes — guard fires** |
 
 ## 4. Counter Reset Rules
 
@@ -282,10 +307,21 @@ class ResilienceConfig:
 1. **Repetition detection** (Req 15): If the last 3 entries in `recent_tool_calls` have the same `(name, args_hash)` → stuck on same action.
 2. **Progress stall** (Req 14): If `steps_since_completion_attempt >= config.replan_interval` → no progress toward completion.
 
-**When triggered**:
+**When triggered** (Req 14, 15, 16):
 ```
-# Pseudocode (inspired by s_full.py todo nag pattern)
+# Pseudocode (inspired by s_full.py todo nag + s06 compact-as-reset)
 if repetition_detected or steps_since_completion_attempt >= config.replan_interval:
+
+    # Step 1: Auto-compact context for fresh perspective (Req 16)
+    # Only compact if context is substantial (>20K tokens); skip if small
+    if estimate_tokens(messages) > 20_000:
+        messages[:] = _apply_auto_compact(
+            messages, context_config, executor_model, trace_metadata,
+            reason="replan_recovery",
+        )
+        log.info("Re-plan: auto-compacted context at step %d", step_num)
+
+    # Step 2: Inject checkpoint prompt (Req 14)
     checkpoint_msg = (
         "<checkpoint>\n"
         f"You have been working for {steps_since_completion_attempt} steps without completing.\n"
