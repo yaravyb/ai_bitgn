@@ -18,3 +18,8 @@ description: Verification checklist for pre-submission answer review — injecte
    a) What was the original source filename?
    b) What filename did you use when creating derived files?
    c) If they differ (e.g. you added or removed segments), delete the wrong-named files and recreate them with the EXACT source basename.
+7. **Process completeness audit** (MANDATORY):
+   a) Which process/policy files govern this task type?
+   b) List every procedure or action those files require (file naming, updates to counters/sequences, format rules, required fields).
+   c) For each required procedure, confirm you performed it. If you read a value from a supporting file (counter, sequence, index) and used it, did you also write the updated value back?
+   d) If any required procedure was missed, perform it before submitting.
