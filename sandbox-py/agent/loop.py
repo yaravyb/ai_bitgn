@@ -595,12 +595,19 @@ def run_agent(
         # --- Point E: Re-planning checkpoint (Req 14, 15, 16) ---
         _replan_triggered = False
         if resilience_state.recent_tool_calls:
-            # Repetition detection: last 3 entries identical
+            # Repetition detection: last 3 entries identical (strict)
             if len(resilience_state.recent_tool_calls) >= 3:
                 last3 = resilience_state.recent_tool_calls[-3:]
                 if len(set(last3)) == 1:
                     _replan_triggered = True
                     log.info("Re-plan: repetition detected at step %d (tool=%s)", step_num, last3[0][0])
+            # Cycling detection: duplicate tool+args in a full window
+            if not _replan_triggered and len(resilience_state.recent_tool_calls) >= 6:
+                unique_calls = set(resilience_state.recent_tool_calls)
+                if len(unique_calls) <= len(resilience_state.recent_tool_calls) // 2:
+                    _replan_triggered = True
+                    log.info("Re-plan: cycling detected at step %d (%d unique in %d calls)",
+                             step_num, len(unique_calls), len(resilience_state.recent_tool_calls))
         if not _replan_triggered and resilience_state.steps_since_completion_attempt >= resilience_config.replan_interval:
             _replan_triggered = True
             log.info("Re-plan: progress stall at step %d (%d steps since last completion attempt)",
@@ -616,15 +623,31 @@ def run_agent(
                 log.info("Re-plan: auto-compacted context at step %d", step_num)
                 print(f"  [replan] auto-compacted context")
 
-            # Step 2: Inject checkpoint prompt (Req 14) -- NO tool names (Req 17)
+            # Step 2: Inject checkpoint prompt (Req 14) -- NO tool names list (Req 17)
+            # Build a brief summary of recent tool calls for context (Req 14:
+            # "shall include a summary of what the model has done so far")
+            history_lines: list[str] = []
+            if resilience_state.recent_tool_calls:
+                seen: dict[str, int] = {}
+                for name, _h in resilience_state.recent_tool_calls:
+                    seen[name] = seen.get(name, 0) + 1
+                history_lines.append("Recent actions: " + ", ".join(
+                    f"{name} x{count}" if count > 1 else name
+                    for name, count in seen.items()
+                ))
+            history_section = "\n".join(history_lines) + "\n" if history_lines else ""
+
             checkpoint_msg = (
                 "<checkpoint>\n"
                 f"You have been working for {resilience_state.steps_since_completion_attempt} steps without completing.\n"
+                f"{history_section}"
                 "Step back and assess:\n"
                 "1. What have you accomplished so far?\n"
                 "2. What remains to be done?\n"
-                "3. Are you stuck? If so, try a different approach.\n"
-                "4. If the task is done, call report_completion.\n"
+                "3. Are you stuck repeating the same reads? If so, try a DIFFERENT approach.\n"
+                "4. If the task is done, call report_completion with OUTCOME_OK.\n"
+                "5. If you cannot complete the task or need more information, call "
+                "report_completion with OUTCOME_NONE_CLARIFICATION.\n"
                 "</checkpoint>"
             )
             messages.append({"role": "user", "content": checkpoint_msg})
@@ -872,7 +895,7 @@ def run_agent(
                     content_to_append = result_text
                     if '"error"' in result_text:
                         resilience_state.consecutive_errors += 1
-                        if "not_found" in result_text.lower() or "NOT_FOUND" in result_text:
+                        if "not_found" in result_text.lower():
                             # Extract path from error for hint
                             hint = (
                                 "\n\n[Hint: The file was not found. Try using list_dir or "
@@ -911,7 +934,7 @@ def run_agent(
             for tc in other_tool_calls:
                 args_hash = hash(json.dumps(tc.arguments, sort_keys=True))
                 resilience_state.recent_tool_calls.append((tc.name, args_hash))
-                if len(resilience_state.recent_tool_calls) > 5:
+                if len(resilience_state.recent_tool_calls) > 10:
                     resilience_state.recent_tool_calls.pop(0)
 
         # Handle compact sentinel

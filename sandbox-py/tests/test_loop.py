@@ -2883,3 +2883,63 @@ class TestRepetitionWithDifferentArgs:
             if m.get("role") == "user" and "<checkpoint>" in m.get("content", "")
         ]
         assert len(checkpoint_msgs) == 0
+
+
+class TestCyclingDetection:
+    """test_cycling_detection: model reads same files in rotation -- cycling checkpoint triggered."""
+
+    @patch("agent.loop.dispatch_tool")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    def test_cycling_detection(
+        self, mock_call_llm, mock_run_scout, mock_dp, mock_dispatch_tool,
+    ):
+        from agent.loop import run_agent
+
+        mock_runtime = _make_mock_runtime()
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        # 3 unique tool calls repeated in a cycle (A, B, C, A, B, C)
+        tc_a = ToolCall(id="tc_a", name="read_file", arguments={"path": "/file_a.md"})
+        tc_b = ToolCall(id="tc_b", name="read_file", arguments={"path": "/file_b.md"})
+        tc_c = ToolCall(id="tc_c", name="search", arguments={"pattern": "keyword"})
+        tc_complete = ToolCall(
+            id="tc_done", name="report_completion",
+            arguments={"answer": "done", "grounding_refs": [], "steps": [], "code": "OUTCOME_OK"},
+        )
+
+        mock_call_llm.side_effect = [
+            # Steps 1-6: A, B, C, A, B, C (3 unique tool calls, each appears 2x)
+            MagicMock(content=None, tool_calls=[tc_a], raw=None),
+            MagicMock(content=None, tool_calls=[tc_b], raw=None),
+            MagicMock(content=None, tool_calls=[tc_c], raw=None),
+            MagicMock(content=None, tool_calls=[tc_a], raw=None),
+            MagicMock(content=None, tool_calls=[tc_b], raw=None),
+            MagicMock(content=None, tool_calls=[tc_c], raw=None),
+            # Step 7: completion after cycling checkpoint
+            MagicMock(content=None, tool_calls=[tc_complete], raw=None),
+        ]
+        mock_dp.side_effect = [
+            [("tc_a", '{"content": "ok"}')],
+            [("tc_b", '{"content": "ok"}')],
+            [("tc_c", '{"matches": []}')],
+            [("tc_a", '{"content": "ok"}')],
+            [("tc_b", '{"content": "ok"}')],
+            [("tc_c", '{"matches": []}')],
+        ]
+        mock_dispatch_tool.return_value = '{"ok": true}'
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            runtime=mock_runtime,
+            task_text="do something",
+        )
+
+        # Cycling checkpoint should have been triggered before step 8 interval
+        last_messages = mock_call_llm.call_args_list[-1][0][1]
+        checkpoint_msgs = [
+            m for m in last_messages
+            if m.get("role") == "user" and "<checkpoint>" in m.get("content", "")
+        ]
+        assert len(checkpoint_msgs) >= 1
