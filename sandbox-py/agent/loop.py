@@ -1058,16 +1058,19 @@ def run_agent(
             )
             print(f"  [guard] submitted captured verification answer")
         else:
-            # Generic fallback
+            # Generic fallback -- use OUTCOME_NONE_CLARIFICATION because
+            # exhausting the step limit means the model couldn't figure out
+            # how to complete the task, not that an internal error occurred.
             dispatch_tool(
                 runtime, "report_completion",
-                {"answer": "Agent loop ended without producing an answer.",
+                {"answer": "Agent was unable to complete the task within the step limit. "
+                 "The task may require clarification or a different approach.",
                  "grounding_refs": [], "steps": [],
-                 "code": "OUTCOME_ERR_INTERNAL"},
+                 "code": "OUTCOME_NONE_CLARIFICATION"},
                 tracker, protected_files, skill_loader,
                 context_config=context_config,
             )
-            print(f"  [guard] submitted fallback answer (OUTCOME_ERR_INTERNAL)")
+            print(f"  [guard] submitted fallback answer (OUTCOME_NONE_CLARIFICATION)")
         resilience_state.completion_submitted = True
 
     print(f"\n--- Executor finished after {step_num} steps. "

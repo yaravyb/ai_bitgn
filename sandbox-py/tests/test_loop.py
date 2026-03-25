@@ -2566,12 +2566,12 @@ class TestGuaranteedSubmissionStepLimit:
             task_text="do something",
         )
 
-        # Post-loop guard should call report_completion with OUTCOME_ERR_INTERNAL
-        # Find the last dispatch_tool call
+        # Post-loop guard should call report_completion with OUTCOME_NONE_CLARIFICATION
+        # (exhausting steps = model couldn't figure it out, not an internal error)
         assert mock_dispatch_tool.call_count >= 1
         last_dt = mock_dispatch_tool.call_args_list[-1][0]
         assert last_dt[1] == "report_completion"
-        assert last_dt[2]["code"] == "OUTCOME_ERR_INTERNAL"
+        assert last_dt[2]["code"] == "OUTCOME_NONE_CLARIFICATION"
 
 
 class TestGuaranteedSubmissionVerification:
