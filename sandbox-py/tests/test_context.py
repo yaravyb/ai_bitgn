@@ -21,7 +21,7 @@ class TestContextConfigDefaults:
         from agent.context import ContextConfig
         cfg = ContextConfig()
         assert cfg.truncation_limit == 10_000
-        assert cfg.micro_compact_keep_batches == 3
+        assert cfg.micro_compact_keep_batches == 5
         assert cfg.micro_compact_min_length == 100
         assert cfg.auto_compact_threshold == 80_000
         assert cfg.transcript_dir == ".transcripts/"
@@ -60,7 +60,7 @@ class TestContextConfigFromEnv:
 
         cfg = ContextConfig.from_env()
         assert cfg.truncation_limit == 10_000
-        assert cfg.micro_compact_keep_batches == 3
+        assert cfg.micro_compact_keep_batches == 5
         assert cfg.micro_compact_min_length == 100
         assert cfg.auto_compact_threshold == 80_000
         assert cfg.transcript_dir == ".transcripts/"

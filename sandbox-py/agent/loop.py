@@ -657,10 +657,12 @@ def run_agent(
             print(f"  [replan] checkpoint injected")
 
         # Layer 2: Micro-compact old tool results
-        cleared_count, chars_saved = _apply_micro_compact(messages, context_config)
-        if cleared_count > 0:
-            log.debug("Micro-compact: cleared %d messages, ~%d chars saved", cleared_count, chars_saved)
-            print(f"  [micro-compact] cleared {cleared_count} old tool results (~{chars_saved} chars)")
+        # Skip when replan just fired -- preserve context for reflection
+        if not _replan_triggered:
+            cleared_count, chars_saved = _apply_micro_compact(messages, context_config)
+            if cleared_count > 0:
+                log.debug("Micro-compact: cleared %d messages, ~%d chars saved", cleared_count, chars_saved)
+                print(f"  [micro-compact] cleared {cleared_count} old tool results (~{chars_saved} chars)")
 
         # Layer 3: Auto-compact if threshold exceeded
         tokens_est = estimate_tokens(messages)

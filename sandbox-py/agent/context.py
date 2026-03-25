@@ -58,7 +58,7 @@ class ContextConfig:
     """
 
     truncation_limit: int = 10_000
-    micro_compact_keep_batches: int = 3
+    micro_compact_keep_batches: int = 5
     micro_compact_min_length: int = 100
     auto_compact_threshold: int = 80_000
     transcript_dir: str = ".transcripts/"
@@ -72,7 +72,7 @@ class ContextConfig:
         """Create a ContextConfig reading from environment variables with fallback to defaults."""
         return cls(
             truncation_limit=int(os.environ.get("CTX_TRUNCATION_LIMIT", "10000")),
-            micro_compact_keep_batches=int(os.environ.get("CTX_MICRO_COMPACT_KEEP_BATCHES", "3")),
+            micro_compact_keep_batches=int(os.environ.get("CTX_MICRO_COMPACT_KEEP_BATCHES", "5")),
             micro_compact_min_length=int(os.environ.get("CTX_MICRO_COMPACT_MIN_LENGTH", "100")),
             auto_compact_threshold=int(os.environ.get("CTX_AUTO_COMPACT_THRESHOLD", "80000")),
             transcript_dir=os.environ.get("CTX_TRANSCRIPT_DIR", ".transcripts/"),
