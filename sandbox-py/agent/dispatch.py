@@ -11,6 +11,7 @@ import logging
 import posixpath
 import re
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from google.protobuf.json_format import MessageToDict
@@ -21,6 +22,46 @@ from agent.llm import ToolCall
 from agent.context import ContextConfig, truncate_tool_result, COMPACT_SENTINEL
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Guard configuration dataclasses (frozen, thread-safe by immutability)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TemplateGuardConfig:
+    """Configuration for the template deletion guard.
+
+    When protected_directories is empty, the guard defaults to blocking
+    all _-prefixed file deletions (backward compatibility).
+    """
+    protected_directories: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class TaskConstraints:
+    """Structured task constraints extracted by LLM or regex fast-path.
+
+    Immutable value object. Default values disable all constraint-based
+    guards (fail-open).
+    """
+    source_file: str | None = None
+    scope_level: str = "normal"            # "focused" | "normal"
+    target_directories: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class DispatchContext:
+    """Immutable per-task guard configuration passed through dispatch calls.
+
+    Constructed once per task by loop.py. Passed by reference to
+    dispatch_tool() and dispatch_parallel(). Each concurrent thread
+    reads from this frozen snapshot without mutation.
+    """
+    source_basename: str | None = None
+    scope_constrained: bool = False
+    target_directories: tuple[str, ...] = ()
+    template_guard_config: TemplateGuardConfig = field(default_factory=TemplateGuardConfig)
 
 
 def _normalize_path(path: str) -> str:
@@ -115,11 +156,6 @@ def _is_basename_mismatch(source_basename: str, written_path: str) -> bool:
     return False
 
 
-# Module-level guards (set by dispatch_tool before handler invocation)
-_source_basename: str | None = None
-_scope_constrained: bool = False
-
-
 def _handle_write_file(
     vm,
     args: dict[str, Any],
@@ -131,28 +167,6 @@ def _handle_write_file(
     content = args.get("content", "")
     start_line = args.get("start_line", 0)
     end_line = args.get("end_line", 0)
-
-    # Guard: reject writes that look like renamed derivatives of the source file
-    if _source_basename and _is_basename_mismatch(_source_basename, path):
-        expected = _source_basename
-        actual = posixpath.basename(path)
-        log.warning("BLOCKED: write_file %s (basename mismatch: expected %s)", path, expected)
-        return json.dumps(
-            {"error": f"Filename mismatch: expected basename '{expected}', got '{actual}'. "
-             f"Use the exact source filename."},
-            ensure_ascii=False,
-        )
-
-    # Guard: when scope is constrained, block modifications to already-read files
-    # (read = context gathering, write = modification → unrequested change)
-    if _scope_constrained and tracker.contains(path):
-        log.warning("BLOCKED: write_file %s (scope constrained, file was already read)", path)
-        return json.dumps(
-            {"error": f"Scope constraint: '{path}' was read for context. "
-             f"Modifying existing files is not allowed when the task says "
-             f"'keep the diff focused'. Only create new files."},
-            ensure_ascii=False,
-        )
 
     resp = vm.write(path, content, start_line=start_line, end_line=end_line)
     return json.dumps(MessageToDict(resp), ensure_ascii=False)
@@ -172,16 +186,6 @@ def _handle_delete_file(
         log.warning("REFUSED: delete %s (protected policy file)", path)
         return json.dumps(
             {"error": f"Cannot delete protected file: {path}"},
-            ensure_ascii=False,
-        )
-
-    # Guard: template files (prefixed with _) are structural, not content
-    basename = posixpath.basename(path)
-    if basename.startswith("_"):
-        log.warning("REFUSED: delete %s (template/structural file)", path)
-        return json.dumps(
-            {"error": f"Cannot delete template file: {path}. "
-             f"Files prefixed with '_' are structural, not captured content."},
             ensure_ascii=False,
         )
 
@@ -298,6 +302,149 @@ def _handle_compact(
 
 
 # ---------------------------------------------------------------------------
+# Guard functions (standalone, pure, testable -- called by dispatch_tool)
+# ---------------------------------------------------------------------------
+
+def _check_basename_guard(
+    dispatch_ctx: DispatchContext,
+    path: str,
+) -> str | None:
+    """Return error message if basename mismatch detected, else None.
+
+    Reads source_basename from dispatch_ctx. When no source_basename is
+    configured, the guard is inactive (returns None).
+    """
+    source_basename = dispatch_ctx.source_basename
+    if not source_basename:
+        log.debug("basename guard: ALLOW %s (no source_basename set)", path)
+        return None
+    if _is_basename_mismatch(source_basename, path):
+        expected = source_basename
+        actual = posixpath.basename(path)
+        log.warning(
+            "basename guard: BLOCK %s (mismatch: expected %s, got %s)",
+            path, expected, actual,
+        )
+        return (
+            f"Filename mismatch: expected basename '{expected}', got '{actual}'. "
+            f"Use the exact source filename."
+        )
+    log.debug("basename guard: ALLOW %s (matches source %s)", path, source_basename)
+    return None
+
+
+def _check_scope_guard(
+    dispatch_ctx: DispatchContext,
+    path: str,
+    tracker: GroundingTracker,
+) -> str | None:
+    """Return error message if scope-constrained write is blocked, else None.
+
+    Implements intent-aware five-step decision logic:
+    1. Not constrained -> allow
+    2. File not previously read -> allow (new file creation)
+    3. Target in allowed directories -> allow
+    4. Basename matches source_basename -> allow
+    5. Block
+    """
+    # Step 1: Not constrained -> allow
+    if not dispatch_ctx.scope_constrained:
+        log.debug("scope guard: ALLOW %s (scope not constrained)", path)
+        return None
+
+    # Step 2: File not previously read -> allow
+    if not tracker.contains(path):
+        log.debug("scope guard: ALLOW %s (file not previously read)", path)
+        return None
+
+    # Step 3: Target in allowed directories -> allow
+    normalized = _normalize_path(path)
+    for target_dir in dispatch_ctx.target_directories:
+        normalized_target = _normalize_path(target_dir)
+        if normalized.startswith(normalized_target):
+            log.debug(
+                "scope guard: ALLOW %s (target in allowed directory %s)",
+                path, target_dir,
+            )
+            return None
+
+    # Step 4: Basename matches source_basename -> allow
+    if dispatch_ctx.source_basename:
+        if posixpath.basename(path) == dispatch_ctx.source_basename:
+            log.debug(
+                "scope guard: ALLOW %s (basename matches source %s)",
+                path, dispatch_ctx.source_basename,
+            )
+            return None
+
+    # Step 5: Block
+    log.warning(
+        "scope guard: BLOCK %s (scope constrained, file was already read, "
+        "no target match, source_basename=%s, target_dirs=%s)",
+        path, dispatch_ctx.source_basename, dispatch_ctx.target_directories,
+    )
+    return (
+        f"Scope constraint: modifying '{path}' blocked. "
+        f"The file was read for context and is not in the task's allowed targets. "
+        f"Only create new files or modify files in target directories."
+    )
+
+
+def _check_template_guard(
+    dispatch_ctx: DispatchContext,
+    path: str,
+) -> str | None:
+    """Return error message if template deletion is blocked, else None.
+
+    Configurable directory-scoped behavior:
+    1. If basename does not start with '_': ALLOW
+    2. If protected_directories is empty: BLOCK (backward compat default)
+    3. If file path is inside any protected_directory: BLOCK
+    4. Otherwise: ALLOW (not in protected scope)
+    """
+    basename = posixpath.basename(path)
+
+    # Step 1: Non-prefixed file -> always allowed
+    if not basename.startswith("_"):
+        log.debug("template guard: ALLOW %s (no underscore prefix)", path)
+        return None
+
+    protected_dirs = dispatch_ctx.template_guard_config.protected_directories
+
+    # Step 2: Empty protected_directories -> block all _-prefixed (backward compat)
+    if not protected_dirs:
+        log.warning(
+            "template guard: BLOCK %s (underscore-prefixed, no protected_dirs configured)",
+            path,
+        )
+        return (
+            f"Cannot delete template file: {path}. "
+            f"Files prefixed with '_' are structural, not captured content."
+        )
+
+    # Step 3: Check if file is inside any protected directory
+    normalized = _normalize_path(path)
+    for pdir in protected_dirs:
+        normalized_pdir = _normalize_path(pdir)
+        if normalized.startswith(normalized_pdir):
+            log.warning(
+                "template guard: BLOCK %s (underscore-prefixed, inside protected dir %s)",
+                path, pdir,
+            )
+            return (
+                f"Cannot delete template file: {path}. "
+                f"Files prefixed with '_' inside '{pdir}' are structural."
+            )
+
+    # Step 4: Not in any protected directory -> allow
+    log.debug(
+        "template guard: ALLOW %s (underscore-prefixed but outside protected dirs %s)",
+        path, protected_dirs,
+    )
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Dispatch map: tool name -> handler (Req 12.2)
 # ---------------------------------------------------------------------------
 
@@ -329,20 +476,34 @@ def dispatch_tool(
     protected_files: set[str],
     skill_loader: Any | None = None,
     context_config: ContextConfig | None = None,
-    source_basename: str | None = None,
-    scope_constrained: bool = False,
+    dispatch_ctx: DispatchContext | None = None,
 ) -> str:
     """Dispatch a single tool call and return the result as a JSON string.
 
     When context_config is provided, tool results (except report_completion)
     are truncated if they exceed the configured limit.
 
+    When dispatch_ctx is provided, guard functions are executed as pre-dispatch
+    checks for write_file and delete_file operations. When None, guards that
+    depend on context data are disabled (backward-compatible default).
+
     Returns error JSON if the tool_name is not recognized.
     """
-    # Set module-level guards for write interception
-    global _source_basename, _scope_constrained
-    _source_basename = source_basename
-    _scope_constrained = scope_constrained
+    # Pre-dispatch guard checks (only when dispatch_ctx is provided)
+    if dispatch_ctx is not None:
+        if tool_name == "write_file":
+            path = args.get("path", "")
+            error = _check_basename_guard(dispatch_ctx, path)
+            if error:
+                return json.dumps({"error": error}, ensure_ascii=False)
+            error = _check_scope_guard(dispatch_ctx, path, tracker)
+            if error:
+                return json.dumps({"error": error}, ensure_ascii=False)
+        elif tool_name == "delete_file":
+            path = args.get("path", "")
+            error = _check_template_guard(dispatch_ctx, path)
+            if error:
+                return json.dumps({"error": error}, ensure_ascii=False)
 
     handler = DISPATCH_MAP.get(tool_name)
     if handler is None:
@@ -383,10 +544,12 @@ def dispatch_parallel(
     skill_loader: Any | None = None,
     max_workers: int = 4,
     context_config: ContextConfig | None = None,
-    source_basename: str | None = None,
-    scope_constrained: bool = False,
+    dispatch_ctx: DispatchContext | None = None,
 ) -> list[tuple[str, str]]:
     """Execute multiple tool calls concurrently.
+
+    The frozen dispatch_ctx instance is shared across all concurrent
+    dispatch_tool invocations without mutation, ensuring thread safety.
 
     Returns a list of (tool_call_id, result_json) tuples.
     """
@@ -400,8 +563,7 @@ def dispatch_parallel(
             vm, tc.name, tc.arguments,
             tracker, protected_files, skill_loader,
             context_config=context_config,
-            source_basename=source_basename,
-            scope_constrained=scope_constrained,
+            dispatch_ctx=dispatch_ctx,
         )
         return (tc.id, result)
 

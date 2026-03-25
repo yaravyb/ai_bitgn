@@ -193,6 +193,268 @@ class TestBuildVerificationPrompt:
 
 
 # ---------------------------------------------------------------------------
+# build_verification_prompt -- template-driven path tests (Task 4)
+# ---------------------------------------------------------------------------
+
+# Reusable template fixture matching the design specification
+_FRAME_TEMPLATE = """\
+<verification>
+You are about to submit the following answer. Before submitting, verify it is correct.
+
+## Proposed Answer
+Code: {{CODE}}
+Answer: {{ANSWER}}
+
+{{POLICY_SECTION}}
+
+{{CHECKLIST_SECTION}}
+
+{{SOURCE_BASENAME_SECTION}}
+
+## Instructions
+- If the answer is correct, use the report_completion tool with the SAME answer and code.
+- If the answer needs correction, use the report_completion tool with the CORRECTED answer.
+- You may use other tools (read_file, list_dir, etc.) to verify file operations before submitting.
+- IMPORTANT: Submit ONLY by calling the report_completion tool. Do NOT write the answer as plain text or JSON.
+</verification>"""
+
+
+class TestBuildVerificationPromptWithTemplate:
+    """build_verification_prompt with frame_template: template-driven path."""
+
+    def test_template_substitutes_answer(self):
+        from agent.verify import build_verification_prompt
+        prompt = build_verification_prompt(
+            answer="The answer is 42",
+            code="OUTCOME_OK",
+            policy_contents={},
+            frame_template=_FRAME_TEMPLATE,
+        )
+        assert "The answer is 42" in prompt
+        assert "{{ANSWER}}" not in prompt
+
+    def test_template_substitutes_code(self):
+        from agent.verify import build_verification_prompt
+        prompt = build_verification_prompt(
+            answer="ans",
+            code="OUTCOME_OK",
+            policy_contents={},
+            frame_template=_FRAME_TEMPLATE,
+        )
+        assert "OUTCOME_OK" in prompt
+        assert "{{CODE}}" not in prompt
+
+    def test_template_substitutes_policy_section(self):
+        from agent.verify import build_verification_prompt
+        policies = {
+            "workspace/RULES.md": "Rule 1: Always respond in lowercase.",
+        }
+        prompt = build_verification_prompt(
+            answer="ans",
+            code="code",
+            policy_contents=policies,
+            frame_template=_FRAME_TEMPLATE,
+        )
+        assert "workspace/RULES.md" in prompt
+        assert "Rule 1: Always respond in lowercase." in prompt
+        assert "{{POLICY_SECTION}}" not in prompt
+
+    def test_template_empty_policies_no_header(self):
+        from agent.verify import build_verification_prompt
+        prompt = build_verification_prompt(
+            answer="ans",
+            code="code",
+            policy_contents={},
+            frame_template=_FRAME_TEMPLATE,
+        )
+        assert "## Policy Files" not in prompt
+        assert "{{POLICY_SECTION}}" not in prompt
+
+    def test_template_substitutes_checklist_section(self):
+        from agent.verify import build_verification_prompt
+        checklist = "## Verification Checklist\n1. Check format."
+        prompt = build_verification_prompt(
+            answer="ans",
+            code="code",
+            policy_contents={},
+            checklist_body=checklist,
+            frame_template=_FRAME_TEMPLATE,
+        )
+        assert "Check format." in prompt
+        assert "{{CHECKLIST_SECTION}}" not in prompt
+
+    def test_template_empty_checklist(self):
+        from agent.verify import build_verification_prompt
+        prompt = build_verification_prompt(
+            answer="ans",
+            code="code",
+            policy_contents={},
+            checklist_body="",
+            frame_template=_FRAME_TEMPLATE,
+        )
+        assert "{{CHECKLIST_SECTION}}" not in prompt
+
+    def test_template_substitutes_source_basename_section(self):
+        from agent.verify import build_verification_prompt
+        prompt = build_verification_prompt(
+            answer="ans",
+            code="code",
+            policy_contents={},
+            source_basename="report.csv",
+            frame_template=_FRAME_TEMPLATE,
+        )
+        assert "report.csv" in prompt
+        assert "{{SOURCE_BASENAME_SECTION}}" not in prompt
+
+    def test_template_no_source_basename(self):
+        from agent.verify import build_verification_prompt
+        prompt = build_verification_prompt(
+            answer="ans",
+            code="code",
+            policy_contents={},
+            source_basename=None,
+            frame_template=_FRAME_TEMPLATE,
+        )
+        assert "{{SOURCE_BASENAME_SECTION}}" not in prompt
+        assert "Source Filename Check" not in prompt
+
+    def test_template_includes_verification_tags(self):
+        from agent.verify import build_verification_prompt
+        prompt = build_verification_prompt(
+            answer="ans",
+            code="code",
+            policy_contents={},
+            frame_template=_FRAME_TEMPLATE,
+        )
+        assert "<verification>" in prompt
+        assert "</verification>" in prompt
+
+    def test_template_includes_instructions(self):
+        from agent.verify import build_verification_prompt
+        prompt = build_verification_prompt(
+            answer="ans",
+            code="code",
+            policy_contents={},
+            frame_template=_FRAME_TEMPLATE,
+        )
+        assert "report_completion" in prompt
+        assert "Do NOT" in prompt
+
+    def test_template_returns_string(self):
+        from agent.verify import build_verification_prompt
+        result = build_verification_prompt(
+            "a", "b", {},
+            frame_template=_FRAME_TEMPLATE,
+        )
+        assert isinstance(result, str)
+
+    def test_template_all_placeholders_substituted(self):
+        """No {{...}} placeholders remain after substitution."""
+        from agent.verify import build_verification_prompt
+        prompt = build_verification_prompt(
+            answer="my answer",
+            code="OUTCOME_OK",
+            policy_contents={"p.md": "policy content"},
+            checklist_body="## Checklist\n1. Check it.",
+            source_basename="data.json",
+            frame_template=_FRAME_TEMPLATE,
+        )
+        assert "{{" not in prompt
+        assert "}}" not in prompt
+
+
+class TestBuildVerificationPromptFallback:
+    """build_verification_prompt with frame_template=None: fallback inline path."""
+
+    def test_fallback_when_none(self):
+        """When frame_template is None, the inline frame is used."""
+        from agent.verify import build_verification_prompt
+        prompt = build_verification_prompt(
+            answer="ans",
+            code="code",
+            policy_contents={},
+            frame_template=None,
+        )
+        assert "<verification>" in prompt
+        assert "</verification>" in prompt
+        assert "## Proposed Answer" in prompt
+        assert "## Instructions" in prompt
+        assert "report_completion" in prompt
+
+    def test_fallback_not_provided(self):
+        """When frame_template is not passed at all, default is None -> fallback."""
+        from agent.verify import build_verification_prompt
+        prompt = build_verification_prompt("ans", "code", {})
+        assert "<verification>" in prompt
+        assert "## Proposed Answer" in prompt
+
+    def test_fallback_includes_answer_and_code(self):
+        from agent.verify import build_verification_prompt
+        prompt = build_verification_prompt(
+            answer="The answer is 42",
+            code="OUTCOME_OK",
+            policy_contents={},
+            frame_template=None,
+        )
+        assert "The answer is 42" in prompt
+        assert "OUTCOME_OK" in prompt
+
+    def test_fallback_includes_policies(self):
+        from agent.verify import build_verification_prompt
+        policies = {"rules.md": "Rule content"}
+        prompt = build_verification_prompt(
+            answer="ans",
+            code="code",
+            policy_contents=policies,
+            frame_template=None,
+        )
+        assert "rules.md" in prompt
+        assert "Rule content" in prompt
+
+    def test_fallback_includes_checklist(self):
+        from agent.verify import build_verification_prompt
+        prompt = build_verification_prompt(
+            answer="ans",
+            code="code",
+            policy_contents={},
+            checklist_body="## Checklist\n1. Verify.",
+            frame_template=None,
+        )
+        assert "Verify." in prompt
+
+    def test_fallback_includes_source_basename(self):
+        from agent.verify import build_verification_prompt
+        prompt = build_verification_prompt(
+            answer="ans",
+            code="code",
+            policy_contents={},
+            source_basename="report.csv",
+            frame_template=None,
+        )
+        assert "report.csv" in prompt
+
+    def test_fallback_and_template_produce_equivalent_content(self):
+        """Both paths should contain the same key content elements."""
+        from agent.verify import build_verification_prompt
+        common_kwargs = dict(
+            answer="test answer",
+            code="OUTCOME_OK",
+            policy_contents={"p.md": "policy"},
+            checklist_body="## Checklist\n1. Check.",
+            source_basename="file.txt",
+        )
+        fallback = build_verification_prompt(**common_kwargs, frame_template=None)
+        templated = build_verification_prompt(**common_kwargs, frame_template=_FRAME_TEMPLATE)
+
+        # Both should contain the same dynamic content
+        for expected in ["test answer", "OUTCOME_OK", "p.md", "policy",
+                         "Check.", "file.txt", "report_completion",
+                         "<verification>", "</verification>"]:
+            assert expected in fallback, f"Fallback missing: {expected}"
+            assert expected in templated, f"Template missing: {expected}"
+
+
+# ---------------------------------------------------------------------------
 # detect_verification_outcome tests
 # ---------------------------------------------------------------------------
 

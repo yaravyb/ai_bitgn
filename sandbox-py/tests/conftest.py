@@ -25,6 +25,28 @@ def _clear_verification_env(monkeypatch):
     monkeypatch.delenv("VERIFY_ENABLED", raising=False)
     monkeypatch.delenv("VERIFY_MAX_ATTEMPTS", raising=False)
 
+
+@pytest.fixture(autouse=True)
+def _default_constraint_extraction(monkeypatch, request):
+    """Bypass LLM constraint extraction in tests that don't test it.
+
+    Patches _extract_task_constraints_regex to return default TaskConstraints
+    so that the LLM fallback is never triggered and existing tests don't need
+    extra mock responses. Tests that explicitly test the extraction functions
+    (marked with @pytest.mark.no_default_constraints) opt out.
+    """
+    if "no_default_constraints" in (m.name for m in request.node.iter_markers()):
+        return
+    # Only patch if agent.loop is importable (test files that don't import it are unaffected)
+    try:
+        from agent.dispatch import TaskConstraints
+        monkeypatch.setattr(
+            "agent.loop._extract_task_constraints_regex",
+            lambda task_text: TaskConstraints(),
+        )
+    except (ImportError, AttributeError):
+        pass
+
 # ---------------------------------------------------------------------------
 # Pre-populate sys.modules with mocks for bitgn / connectrpc before any test
 # file imports from the ``agent`` package (which triggers agent/__init__.py

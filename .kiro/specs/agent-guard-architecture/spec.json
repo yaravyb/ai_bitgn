@@ -1,16 +1,16 @@
 {
   "featureName": "agent-guard-architecture",
-  "description": "Refactor programmatic dispatch guards from regex/globals to LLM-driven, thread-safe, testable architecture. Address all gaps from branch review: mutable globals → context object, task-text parsing → LLM-driven constraint extraction, scope heuristics → configurable, missing tests, stale docs, scout SDK v2 integration.",
+  "description": "Refactor programmatic dispatch guards from regex/globals to LLM-driven, thread-safe, testable architecture. Address all gaps from branch review: mutable globals -> context object, task-text parsing -> LLM-driven constraint extraction, scope heuristics -> configurable, missing tests, stale docs, scout SDK v2 integration.",
   "codeName": "agent-guard-architecture",
   "language": "en",
   "createdAt": "2026-03-24T12:00:00Z",
-  "updatedAt": "2026-03-24T18:45:00Z",
-  "status": "design-generated",
+  "updatedAt": "2026-03-24T20:00:00Z",
+  "status": "tasks-generated",
   "phases": {
     "requirements": "generated",
     "design": "generated",
-    "tasks": "pending",
-    "implementation": "pending"
+    "tasks": "generated",
+    "implementation": "completed"
   },
   "approvals": {
     "requirements": {
@@ -19,10 +19,10 @@
     },
     "design": {
       "generated": true,
-      "approved": false
+      "approved": true
     },
     "tasks": {
-      "generated": false,
+      "generated": true,
       "approved": false
     }
   }

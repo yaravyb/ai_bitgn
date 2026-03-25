@@ -68,6 +68,8 @@ class MiniRuntime:
         self._vm = vm
 
     def tree(self, path: str, level: int = 0) -> Any:
+        # SDK v2 note: MiniRuntime uses OutlineRequest which does not support
+        # a 'level' parameter. The level arg is accepted but gracefully ignored.
         return self._vm.outline(OutlineRequest(path=path))
 
     def list_dir(self, path: str) -> Any:
@@ -124,6 +126,7 @@ class PcmRuntime:
         self._vm = vm
 
     def tree(self, path: str, level: int = 0) -> Any:
+        # SDK v2: passes level to TreeRequest for depth-limited directory trees.
         return self._vm.tree(TreeRequest(root=path, level=level))
 
     def list_dir(self, path: str) -> Any:

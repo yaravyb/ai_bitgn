@@ -1,6 +1,6 @@
 # AI Agent Implementation Analysis
 
-> Living document — updated as the agent evolves. Last reviewed: 2026-03-23 (self-verification update).
+> Living document — updated as the agent evolves. Last reviewed: 2026-03-25 (agent-guard-architecture update).
 
 ---
 
@@ -8,19 +8,39 @@
 
 The agent is a **modular multi-phase system** built for the BitGN benchmark platform. It decomposes into two execution phases — a two-phase **Scout** (deterministic bootstrap + LLM-driven explorer) and an LLM-driven **Executor** (tool-use loop with optional self-verification) — connected by an orchestrator (`loop.py`), with 11 modules under strict one-way dependency flow.
 
+### Module Structure
+
+The codebase follows a strict **leaf/orchestrator pattern**: leaf modules have zero imports from other `agent/` modules, while orchestrator modules import from leaves but never from each other. No circular imports exist.
+
+| Module | Type | Role | Imports from agent/ |
+|---|---|---|---|
+| `loop.py` | Orchestrator | Top-level lifecycle: scout -> constraint extraction -> executor loop. Only module permitted to import from all other agent/ modules. Constructs `DispatchContext`, manages verification state, applies context compression. | scout, llm, dispatch, verify, prompt, skills, tracker, tools, context |
+| `scout.py` | Orchestrator | Two-phase workspace discovery: deterministic bootstrap (tree + meta-file reads) followed by LLM-driven explorer (tool-use loop with read-only tool subset). | llm, dispatch, tracker, tools, prompt, context |
+| `dispatch.py` | Leaf | Tool dispatch: maps tool names to VM operations. Defines `DispatchContext`, `TaskConstraints`, `TemplateGuardConfig` dataclasses. Contains standalone guard functions (`_check_basename_guard`, `_check_scope_guard`, `_check_template_guard`). Supports concurrent execution via `dispatch_parallel()`. | tracker, llm (ToolCall type only), context |
+| `verify.py` | Leaf | Self-verification: pure functions and dataclasses (`VerificationState`, `VerificationOutcome`, `should_verify`, `build_verification_prompt`, `detect_verification_outcome`). Supports externalized frame template via `frame_template` parameter. | None (zero agent/ imports) |
+| `prompt.py` | Leaf | System prompt builder: pure structural assembler. Accepts `embedded_skill_bodies` and `scout_summary` parameters. All behavioral rules come from skill files, not hardcoded here. | None (zero agent/ imports) |
+| `context.py` | Leaf | Context management: `ContextConfig` dataclass, `estimate_tokens()`, `micro_compact()`, `truncate_tool_result()`. Pure functions implementing the three-layer compression pipeline. | None (zero agent/ imports) |
+| `tracker.py` | Leaf | Grounding reference tracker: `GroundingTracker` class with thread-safe `add`/`contains`/`merge`/`all` operations. Uses `threading.Lock` for concurrent access safety. | None (zero agent/ imports) |
+| `tools.py` | Leaf | Tool schema definitions: OpenAI-compatible function calling schemas (`TOOL_SCHEMAS`, `SCOUT_TOOL_SCHEMAS`). `get_tool_schemas(runtime_type)` returns PCM-extended schemas when needed. | None (zero agent/ imports) |
+| `skills.py` | Leaf | Skill loader: reads `SKILL.md` files with YAML frontmatter. Provides Layer 1 metadata (descriptions) and Layer 2 body content. | None (zero agent/ imports) |
+| `runtime.py` | Leaf | Runtime adapters: `RuntimeAdapter` Protocol, `MiniRuntime`, `PcmRuntime`. Unified interface over Mini and PCM VMs with SDK v2 parameter support. | None (imports only from bitgn SDK) |
+| `llm.py` | Leaf | LLM client: wraps LiteLLM's completion API. Provider-agnostic access with retry logic (3 retries, exponential backoff). `ToolCall` and `LLMResponse` dataclasses. | None (zero agent/ imports) |
+
+Additional modules (not part of the core 11): `dag.py` (leaf, orphaned -- no longer imported), `observability.py` (leaf, optional Langfuse integration).
+
 ```
-main.py → agent/loop.py (orchestrator)
-             ├── verify.py             (leaf — pure functions, zero agent/ imports)
-             ├── context.py            (leaf — pure functions, zero agent/ imports)
-             ├── scout.py  → llm.py, dispatch.py, tracker.py, tools.py, prompt.py, context.py
-             ├── llm.py                (leaf)
-             ├── dispatch.py → tracker.py, tools.py, llm.py, context.py
-             ├── prompt.py             (leaf)
-             ├── skills.py             (leaf)
-             ├── tracker.py            (leaf)
-             ├── tools.py              (leaf)
-             ├── dag.py                (leaf, orphaned — no longer imported)
-             └── observability.py      (leaf)
+main.py -> agent/loop.py (orchestrator)
+             |-- verify.py             (leaf -- pure functions, zero agent/ imports)
+             |-- context.py            (leaf -- pure functions, zero agent/ imports)
+             |-- scout.py  -> llm.py, dispatch.py, tracker.py, tools.py, prompt.py, context.py
+             |-- llm.py                (leaf)
+             |-- dispatch.py -> tracker.py, llm.py (ToolCall type), context.py
+             |-- prompt.py             (leaf)
+             |-- skills.py             (leaf)
+             |-- tracker.py            (leaf -- thread-safe via threading.Lock)
+             |-- tools.py              (leaf)
+             |-- runtime.py            (leaf -- imports only bitgn SDK)
+             +-- observability.py      (leaf, optional)
 ```
 
 ---
@@ -29,7 +49,12 @@ main.py → agent/loop.py (orchestrator)
 
 ### 1. Excellent Modular Architecture
 
-Clear separation into leaf modules (`tracker.py`, `tools.py`, `llm.py`, `prompt.py`, `skills.py`, `context.py`, `verify.py`) vs. orchestrator modules (`loop.py`, `scout.py`, `dispatch.py`) with strict one-way dependency flow. No circular imports; each module has a single responsibility. `verify.py` is the newest leaf — pure functions with zero `agent/` imports, following the same pattern as `context.py`. `dag.py` remains as an orphaned leaf module (no longer imported).
+Clear separation into 8 leaf modules (`tracker.py`, `tools.py`, `llm.py`, `prompt.py`, `skills.py`, `context.py`, `verify.py`, `runtime.py`) vs. 3 orchestrator modules (`loop.py`, `scout.py`, `dispatch.py`) with strict one-way dependency flow. No circular imports; each module has a single responsibility. See the Module Structure table above for the full breakdown of roles and import constraints.
+
+Key constraints enforced:
+- **Leaf modules**: zero `agent/` imports (only stdlib, external SDKs, or built-in types).
+- **Orchestrator modules**: may import from leaves but never from each other (`scout.py` does not import `loop.py` and vice versa).
+- **`dispatch.py`**: imports only `tracker.py`, `llm.py` (ToolCall type), and `context.py`. Hosts the `DispatchContext` / `TaskConstraints` / `TemplateGuardConfig` dataclasses and standalone guard functions.
 
 **Status**: Maintained.
 
@@ -48,14 +73,13 @@ Replaced the previous reactive DAG-based scout which had no task awareness, no d
 
 ### 3. Strong Safety Mechanisms
 
-- **Protected files** — policy files can't be deleted by the LLM, with dynamic expansion from scout results.
-- **Template file protection** — `_`-prefixed files (structural scaffolding) are protected from deletion at the dispatch layer.
+- **Protected files** — policy files can't be deleted or moved by the LLM, with dynamic expansion from scout results.
+- **Programmatic guard system** — four standalone guard functions executed as pre-dispatch checks (see Strength 14 for full details).
 - **Prompt injection defense** — task text wrapped in `<task>` delimiters. Injection Response Protocol: refuse entire task with `OUTCOME_DENIED_SECURITY` when injection detected.
-- **Basename mismatch guard** — prevents writes with renamed derivatives of source files (slug extraction detects inserted segments like `__0000__`).
-- **Scope-constrained write guard** — when task says "keep the diff focused", blocks modifications to previously-read files (prevents over-scoping).
 - **Step limit** (30 steps) — prevents infinite loops and runaway costs.
+- **Immutable dispatch context** — guard parameters are frozen (`DispatchContext` dataclass), eliminating thread-safety hazards under concurrent dispatch (see Strength 15 for full details).
 
-**Status**: Significantly enhanced (programmatic guards, injection protocol).
+**Status**: Significantly enhanced (programmatic guards, injection protocol, DispatchContext pattern).
 
 ### 4. Provider-Agnostic LLM Access
 
@@ -119,28 +143,157 @@ Key design decisions:
 
 ### 11. Embedded Skills System
 
-Behavioral rules live in skill markdown files, not hardcoded in Python:
-- **Always-on skills** (`security-posture`, `execution-discipline`): Embedded in the system prompt via `embedded_skill_bodies: list[str]` parameter in `build_system_prompt()`.
-- **On-demand skills** (`pattern-match-create`, `policy-gate`, `workspace-discovery`): Loaded by the LLM via `load_skill()` tool call.
-- **Verification checklist** (`self-verification`): Injected into the verification prompt via `checklist_body` parameter.
-- `prompt.py` is a pure structural assembler — zero behavioral content.
+Behavioral rules live in skill markdown files (`SKILL.md` with YAML frontmatter), not hardcoded in Python. The `SkillLoader` class scans a skills directory, parses frontmatter for Layer 1 metadata (descriptions), and provides Layer 2 body content on demand.
 
-**Status**: New.
+**Three skill categories**:
+
+| Category | Skills | Injection Point | Loading Mechanism |
+|---|---|---|---|
+| Always-on | `security-posture`, `execution-discipline` | System prompt (`embedded_skill_bodies` parameter in `build_system_prompt()`) | Loaded at startup, embedded in every LLM call |
+| On-demand | `pattern-match-create`, `policy-gate`, `workspace-discovery` | Tool result (returned to LLM when it calls `load_skill()`) | LLM triggers via `load_skill` tool call; Layer 1 descriptions in system prompt let the LLM know what's available |
+| Verification | `self-verification`, `verification-frame` | Verification prompt (`checklist_body` and `frame_template` parameters in `build_verification_prompt()`) | Loaded at startup, injected only during self-verification cycles |
+
+**Key design decisions**:
+- `prompt.py` is a pure structural assembler -- zero behavioral content. All rules come from skill files.
+- `verification-frame` externalizes the verification prompt structure (`<verification>` tags, section headings, instruction text) into a skill template with `{{ANSWER}}`, `{{CODE}}`, `{{POLICY_SECTION}}`, `{{CHECKLIST_SECTION}}`, `{{SOURCE_BASENAME_SECTION}}` placeholders. When the skill file is missing, `build_verification_prompt()` falls back to the inline frame (backward compatible).
+- Always-on skills are loaded unconditionally; on-demand skills are catalog-only until the LLM explicitly requests them.
+
+**Status**: Enhanced (added `verification-frame` skill with placeholder substitution).
 
 ### 12. Full PCM Outcome Vocabulary
 
-All 5 PCM outcome codes exposed in the `report_completion` tool schema: `OUTCOME_OK`, `OUTCOME_ERR_INTERNAL`, `OUTCOME_NONE_UNSUPPORTED`, `OUTCOME_DENIED_SECURITY`, `OUTCOME_NONE_CLARIFICATION`. Self-documenting enum names (matching the reference agent pattern) eliminate the need for skill-level descriptions of when to use each code.
+All 5 PCM outcome codes are exposed in the `report_completion` tool schema with self-documenting enum names matching the reference agent pattern.
 
-**Status**: New.
+| Code | Usage Context |
+|---|---|
+| `OUTCOME_OK` | Task completed successfully. The agent produced a valid answer with grounding references. |
+| `OUTCOME_ERR_INTERNAL` | Agent encountered an internal error (LLM failure, runtime exception, unexpected state) that prevented task completion. |
+| `OUTCOME_NONE_UNSUPPORTED` | Task type is not supported by the agent's capabilities (e.g., requires a tool that doesn't exist, asks for something outside the agent's scope). |
+| `OUTCOME_DENIED_SECURITY` | Task was refused for security reasons: prompt injection detected, policy violation, or unsafe operation requested. Used by the Injection Response Protocol. |
+| `OUTCOME_NONE_CLARIFICATION` | Task is ambiguous or incomplete; the agent cannot proceed without additional information or clarification from the user. |
+
+The codes are defined as a string enum in the `report_completion` tool schema (`tools.py`). The `_handle_report_completion` handler in `dispatch.py` passes the code directly to `vm.answer()`. During self-verification, `build_verification_prompt()` injects the captured code so the verifier can confirm or correct it.
+
+**Status**: Enhanced (usage context documented).
 
 ### 13. SDK v2 Tool Capabilities
 
-Updated to bitgn SDK v2 (20260324) with:
-- **Line-range reads**: `read_file(path, number, start_line, end_line)` — partial file reads for context efficiency.
-- **Line-range writes**: `write_file(path, content, start_line, end_line)` — surgical edits without full file rewrites.
-- **Depth-limited tree**: `tree(path, level)` — controlled directory outline for scout phase.
+Updated to bitgn SDK v2 (20260324) with enhanced tool parameters and PCM-specific tools.
 
-All parameters wired through tool schemas → dispatch handlers → runtime adapters.
+**Enhanced parameters** (available on both Mini and PCM runtimes):
+- **Line-range reads**: `read_file(path, number, start_line, end_line)` -- partial file reads for context efficiency. The scout prompt instructs the LLM to use `start_line`/`end_line` for files exceeding ~200 lines.
+- **Line-range writes**: `write_file(path, content, start_line, end_line)` -- surgical edits without full file rewrites.
+- **Depth-limited tree**: `tree(path, level)` -- controlled directory outline. Configurable via `ScoutConfig.tree_level` (default 3, overridable with `SCOUT_TREE_LEVEL` env var). `MiniRuntime` accepts but gracefully ignores the `level` parameter; `PcmRuntime` passes it to `TreeRequest`.
+
+**PCM-specific tools** (available only when `runtime_type == "pcm"`, via `get_tool_schemas("pcm")`):
+- **`find`**: Find files or directories by name pattern. Parameters: `name` (pattern), `root` (search root, default `/`), `kind` (`all`/`files`/`dirs`), `limit` (max results, default 10).
+- **`mkdir`**: Create a directory. Protected file guard applies (cannot create over protected paths).
+- **`move`**: Move or rename a file or directory. Protected file guard prevents moving protected policy files.
+
+Tool schema flow: `tools.py` (schema definitions) -> `dispatch.py` (handler routing + guard checks) -> `runtime.py` (VM adapter calls). `_PCM_EXTRA_SCHEMAS` are appended to `TOOL_SCHEMAS` by `get_tool_schemas("pcm")`.
+
+**Status**: Enhanced (PCM-specific tools documented, scout tree_level configurable).
+
+### 14. Programmatic Guard System
+
+Four standalone guard functions in `dispatch.py` implement pre-dispatch safety checks. Each guard is a pure function that reads from `DispatchContext` (Strength 15), returns an error message string to block or `None` to allow, and logs every decision for observability.
+
+#### Basename Mismatch Guard (`_check_basename_guard`)
+
+- **Trigger**: `write_file` operations when `dispatch_ctx.source_basename` is set.
+- **Purpose**: Prevents the LLM from creating renamed derivatives of the source file (e.g., writing `2026-03-23__0000__hn-foo.md` when the source is `hn-foo.md`).
+- **Decision logic**:
+  1. No `source_basename` configured -> ALLOW (guard inactive).
+  2. Written basename matches source exactly -> ALLOW.
+  3. Extract slug from both filenames (stripping date/numeric prefixes via `_extract_slug()`). Same slug but different full stem -> BLOCK (segment was inserted).
+  4. Different slug -> ALLOW (unrelated file, not a derivative).
+- **Configuration source**: `DispatchContext.source_basename`, derived from `TaskConstraints.source_file` (extracted by LLM or regex fast-path).
+
+#### Scope-Constrained Write Guard (`_check_scope_guard`)
+
+- **Trigger**: `write_file` operations when `dispatch_ctx.scope_constrained` is `True`.
+- **Purpose**: Prevents the LLM from modifying files that were read for context only, when the task explicitly requests a focused diff.
+- **Decision logic** (intent-aware five-step):
+  1. Not scope-constrained -> ALLOW (no constraint active).
+  2. File not previously read (not in `GroundingTracker`) -> ALLOW (new file creation).
+  3. File path starts with any entry in `target_directories` -> ALLOW (task-approved target).
+  4. File basename matches `source_basename` -> ALLOW (source file itself).
+  5. Otherwise -> BLOCK with descriptive error message.
+- **Configuration source**: `DispatchContext.scope_constrained` (from `TaskConstraints.scope_level == "focused"`), `DispatchContext.target_directories` (from `TaskConstraints.target_directories`), `GroundingTracker` instance (tracks all files read during execution).
+
+#### Template Deletion Guard (`_check_template_guard`)
+
+- **Trigger**: `delete_file` operations targeting files whose basename starts with `_`.
+- **Purpose**: Protects structural scaffolding files (templates, config files prefixed with `_`) from accidental deletion.
+- **Decision logic** (configurable directory-scoped):
+  1. Basename does not start with `_` -> ALLOW (not a template file).
+  2. `protected_directories` is empty -> BLOCK all `_`-prefixed deletions (backward compatibility default).
+  3. File path is inside any `protected_directory` -> BLOCK.
+  4. File path is outside all protected directories -> ALLOW (not in protected scope).
+- **Configuration source**: `DispatchContext.template_guard_config.protected_directories`, read from the `TEMPLATE_PROTECTED_DIRS` environment variable (comma-separated directory paths). Empty value triggers backward-compatible block-all behavior.
+
+#### Protected File Guard (inline in handlers)
+
+- **Trigger**: `delete_file` and `move` operations targeting policy files.
+- **Purpose**: Prevents deletion or relocation of policy files discovered during the scout phase.
+- **Decision logic**: Path is normalized and checked against the `protected_files` set. This set starts with `{"agents.md"}` and is expanded dynamically with all policy file paths discovered by the scout phase.
+- **Configuration source**: `protected_files: set[str]` parameter passed to `dispatch_tool()` and handlers. Built by `loop.py` from the scout summary.
+
+**Guard invocation order in `dispatch_tool()`**:
+1. If `dispatch_ctx` is not `None` and tool is `write_file`: run basename guard, then scope guard.
+2. If `dispatch_ctx` is not `None` and tool is `delete_file`: run template guard.
+3. Protected file guard runs inside the `_handle_delete_file` and `_handle_move` handlers (always active, independent of `dispatch_ctx`).
+
+If any guard returns a non-None error, `dispatch_tool()` short-circuits and returns `{"error": "..."}` JSON without calling the VM handler.
+
+**Status**: New.
+
+### 15. DispatchContext Pattern
+
+The `DispatchContext` pattern eliminates module-level mutable globals and provides thread-safe guard parameter flow through the dispatch chain.
+
+**Data flow**:
+
+```
+Task text
+    |
+    v
+_extract_task_constraints_regex(task_text)     -- regex fast-path
+    |  returns None if ambiguous
+    v
+_extract_task_constraints_llm(model, text)     -- LLM fallback (fail-open)
+    |
+    v
+TaskConstraints (frozen dataclass)
+    |   source_file: str | None
+    |   scope_level: "focused" | "normal"
+    |   target_directories: tuple[str, ...]
+    |
+    v
+DispatchContext (frozen dataclass)             -- constructed once per task in loop.py
+    |   source_basename = constraints.source_file
+    |   scope_constrained = (scope_level == "focused")
+    |   target_directories = constraints.target_directories
+    |   template_guard_config = TemplateGuardConfig(protected_directories=...)
+    |
+    +---> dispatch_tool(vm, name, args, tracker, protected, ..., dispatch_ctx)
+    |         |
+    |         +---> _check_basename_guard(dispatch_ctx, path)
+    |         +---> _check_scope_guard(dispatch_ctx, path, tracker)
+    |         +---> _check_template_guard(dispatch_ctx, path)
+    |
+    +---> dispatch_parallel(vm, tool_calls, tracker, protected, ..., dispatch_ctx)
+              |
+              +---> Each concurrent thread receives the same frozen dispatch_ctx
+                    (immutable, no locking needed)
+```
+
+**Key design decisions**:
+- **Frozen dataclasses**: `DispatchContext`, `TaskConstraints`, and `TemplateGuardConfig` are all `@dataclass(frozen=True)`. Immutability guarantees that concurrent threads in `dispatch_parallel()` cannot modify shared state.
+- **Constructed once per task**: `loop.py` builds the `DispatchContext` after constraint extraction. The same instance is passed to every `dispatch_tool()` and `dispatch_parallel()` call throughout the executor loop.
+- **Backward compatible**: When `dispatch_ctx` is `None`, all context-dependent guards are disabled. This allows legacy callers and the scout phase (which uses read-only tools) to work without providing a context.
+- **No module-level mutable state**: The former `_source_basename` and `_scope_constrained` globals in `dispatch.py` were removed entirely. Guard functions read all inputs from their parameters.
+- **Hybrid constraint extraction**: The regex fast-path (`_extract_task_constraints_regex`) handles trivial cases (file path and scope phrases detected with high confidence) without an LLM call. The LLM fallback (`_extract_task_constraints_llm`) handles ambiguous tasks. On any extraction failure, the system defaults to `TaskConstraints()` which disables all constraint-based guards (fail-open).
 
 **Status**: New.
 
@@ -188,13 +341,11 @@ The scout now consumes LLM tokens (Phase 2). Estimated ~3K-15K tokens per scout 
 **Impact**: Agent appears frozen during long LLM calls; can't abort early.
 **Status**: Open.
 
-### 6. Thread Safety Concerns
+### 6. ~~Thread Safety Concerns~~
 
-`GroundingTracker` uses a plain `set[str]` without synchronization. `dispatch_parallel()` passes the tracker to all concurrent handlers that call `tracker.add()` from different threads.
+~~`GroundingTracker` uses a plain `set[str]` without synchronization. `dispatch_parallel()` passes the tracker to all concurrent handlers that call `tracker.add()` from different threads.~~
 
-**Impact**: Potential race conditions. CPython's GIL mostly protects `set.add()` for strings, but this is an implementation detail.
-**Mitigation ideas**: Use `threading.Lock` or collect results via `queue.Queue`.
-**Status**: Open.
+**Status**: **Addressed** (spec: agent-guard-architecture, Tasks 1 & 2). `GroundingTracker` now uses `threading.Lock` for all operations (see Strength #1, tracker.py). Module-level mutable globals replaced with frozen `DispatchContext` dataclass (see Strength #15). Concurrent test suite validates thread safety.
 
 ### 7. ~~No Tool Result Validation~~
 
@@ -226,28 +377,23 @@ Every `run_agent()` starts fresh. Scout re-explores the workspace even if unchan
 **Impact**: Redundant work across multiple tasks against the same sandbox.
 **Status**: Open.
 
-### 11. Module-Level Mutable Globals in Dispatch
+### 11. ~~Module-Level Mutable Globals in Dispatch~~
 
-`dispatch.py` uses `_source_basename` and `_scope_constrained` module-level globals set by `dispatch_tool()` before handler invocation. These race under `dispatch_parallel()` with `ThreadPoolExecutor`.
+~~`dispatch.py` uses `_source_basename` and `_scope_constrained` module-level globals set by `dispatch_tool()` before handler invocation. These race under `dispatch_parallel()` with `ThreadPoolExecutor`.~~
 
-**Impact**: Thread-safety hazard; violates functional purity.
-**Mitigation**: Planned refactoring to frozen `DispatchContext` dataclass (spec: agent-guard-architecture, Req 1).
-**Status**: Open (spec generated).
+**Status**: **Addressed** (spec: agent-guard-architecture, Task 2). Globals removed, replaced with frozen `DispatchContext` dataclass. See Strength #15.
 
-### 12. Regex-Based Task Parsing
+### 12. ~~Regex-Based Task Parsing~~
 
-`loop.py` uses `_FILE_PATH_RE` regex and `_SCOPE_PHRASES` tuple to extract task constraints. Fragile, English-only, benchmark-coupled.
+~~`loop.py` uses `_FILE_PATH_RE` regex and `_SCOPE_PHRASES` tuple to extract task constraints. Fragile, English-only, benchmark-coupled.~~
 
-**Impact**: Fails on paraphrased constraints, non-English tasks, unexpected file path formats.
-**Mitigation**: Planned hybrid approach — regex fast-path + LLM fallback (spec: agent-guard-architecture, Req 2).
-**Status**: Open (spec generated).
+**Status**: **Addressed** (spec: agent-guard-architecture, Task 5). Hybrid approach implemented: regex fast-path for trivial cases, LLM fallback for ambiguous tasks. Fail-open on extraction errors.
 
-### 13. No Tests for Dispatch Guards
+### 13. ~~No Tests for Dispatch Guards~~
 
-`_is_basename_mismatch()`, `_extract_slug()`, scope guard, template guard — all production code with zero unit tests.
+~~`_is_basename_mismatch()`, `_extract_slug()`, scope guard, template guard — all production code with zero unit tests.~~
 
-**Impact**: Regressions go undetected.
-**Status**: Open (spec: agent-guard-architecture, Req 5).
+**Status**: **Addressed** (spec: agent-guard-architecture, Task 7). 67 guard tests added covering all functions, end-to-end dispatch paths, and guard interactions.
 
 ---
 
@@ -264,8 +410,8 @@ Every `run_agent()` starts fresh. Scout re-explores the workspace even if unchan
 | Observability       | Partial  | LLM calls traced; Langfuse host reachability check; tool dispatch ops not traced |
 | Error handling      | Moderate | Retries on LLM, verification fallbacks, graceful unknown tool handling  |
 | Scalability         | Moderate | Context managed, but no caching layer                                  |
-| Testability         | Strong   | Comprehensive TDD suite (534 tests); guard functions untested (known gap) |
-| Robustness          | Moderate | Thread safety gaps in dispatch/tracker; guard tests missing             |
+| Testability         | Strong   | Comprehensive TDD suite (715+ tests); full guard coverage               |
+| Robustness          | Strong   | Thread-safe tracker, frozen DispatchContext, 67 guard tests             |
 | SDK integration     | Strong   | SDK v2 line-range reads/writes, depth-limited tree, all PCM tools      |
 | Outcome vocabulary  | Strong   | All 5 PCM outcome codes, self-documenting enum names                   |
 
@@ -280,3 +426,4 @@ Every `run_agent()` starts fresh. Scout re-explores the workspace even if unchan
 | 2026-03-23 | Updated for three-layer context compression pipeline; weaknesses #2 and #7 addressed; added Langfuse host reachability check; test count 388→436 |
 | 2026-03-23 | Added self-verification loop (verify.py); weakness #9 addressed; structured text extraction for weaker models; graceful unknown tool handling; LiteLLM/Langfuse log suppression; per-task timing in benchmark runner; test count 436→501 |
 | 2026-03-24 | Full PCM outcome codes (5 codes, self-documenting names); embedded skills system (security-posture, execution-discipline, self-verification); programmatic dispatch guards (basename mismatch, scope constraint, template protection); SDK v2 upgrade (line-range read/write, depth-limited tree); prompt.py made pure structural assembler; injection response protocol; spec `agent-guard-architecture` generated for remaining gaps (globals→context, regex→LLM, tests); test count 501→534 |
+| 2026-03-25 | Spec `agent-guard-architecture` fully implemented (Tasks 1-8): thread-safe tracker (Lock), frozen DispatchContext (eliminates globals), scout SDK v2 depth-limited tree, externalized verification frame, hybrid LLM constraint extraction (regex fast-path + LLM fallback), configurable template guard, 67 guard tests, weaknesses #6/#11/#12/#13 addressed; test count 534→715+ |

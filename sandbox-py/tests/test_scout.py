@@ -87,7 +87,7 @@ class TestScoutConfig:
     def test_scout_config_fields(self):
         from agent.scout import ScoutConfig
         field_names = {f.name for f in dc_fields(ScoutConfig)}
-        assert field_names == {"model", "task_instruction", "max_steps", "max_workers"}
+        assert field_names == {"model", "task_instruction", "max_steps", "max_workers", "tree_level"}
 
     def test_scout_config_required_params(self):
         from agent.scout import ScoutConfig
@@ -1095,6 +1095,184 @@ class TestScoutRunScoutContextConfigParam:
 
         result = run_scout(vm, tracker, config, context_config=ctx_config)
         assert isinstance(result, ScoutSummary)
+
+
+# ---------------------------------------------------------------------------
+# Task 3: Scout SDK v2 Features
+# ---------------------------------------------------------------------------
+
+class TestScoutConfigTreeLevel:
+    """Task 3.1: ScoutConfig has tree_level field with default 3, configurable via env."""
+
+    def test_tree_level_field_exists(self):
+        from agent.scout import ScoutConfig
+        from dataclasses import fields as dc_fields
+        field_names = {f.name for f in dc_fields(ScoutConfig)}
+        assert "tree_level" in field_names
+
+    def test_tree_level_default_is_3(self):
+        from agent.scout import ScoutConfig
+        config = ScoutConfig(model="openai/gpt-4.1", task_instruction="test")
+        assert config.tree_level == 3
+
+    def test_tree_level_custom_value(self):
+        from agent.scout import ScoutConfig
+        config = ScoutConfig(model="openai/gpt-4.1", task_instruction="test", tree_level=5)
+        assert config.tree_level == 5
+
+    def test_tree_level_from_env(self):
+        import os
+        from agent.scout import ScoutConfig
+        old = os.environ.get("SCOUT_TREE_LEVEL")
+        try:
+            os.environ["SCOUT_TREE_LEVEL"] = "7"
+            # Re-evaluate the default by constructing without explicit tree_level
+            config = ScoutConfig(model="openai/gpt-4.1", task_instruction="test")
+            assert config.tree_level == 7
+        finally:
+            if old is None:
+                os.environ.pop("SCOUT_TREE_LEVEL", None)
+            else:
+                os.environ["SCOUT_TREE_LEVEL"] = old
+
+    def test_scout_config_fields_includes_tree_level(self):
+        """Updated field set includes tree_level."""
+        from agent.scout import ScoutConfig
+        from dataclasses import fields as dc_fields
+        field_names = {f.name for f in dc_fields(ScoutConfig)}
+        assert field_names == {"model", "task_instruction", "max_steps", "max_workers", "tree_level"}
+
+
+class TestBootstrapTreeLevel:
+    """Task 3.2: _run_bootstrap passes level from config.tree_level to tree call."""
+
+    @patch("agent.scout.dispatch_tool")
+    def test_bootstrap_tree_uses_level_from_config(self, mock_dispatch):
+        from agent.scout import _run_bootstrap, ScoutConfig
+        from agent.tracker import GroundingTracker
+
+        mock_dispatch.side_effect = _make_dispatch_side_effect({
+            ("tree", "/"): _tree_response(["workspace"], []),
+        })
+
+        vm = MagicMock()
+        tracker = GroundingTracker()
+        config = ScoutConfig(model="openai/gpt-4.1", task_instruction="test", tree_level=5)
+        _run_bootstrap(vm, tracker, set(), config=config)
+
+        # The tree call should pass level in args
+        tree_calls = [
+            c for c in mock_dispatch.call_args_list
+            if c[0][1] == "tree"
+        ]
+        assert len(tree_calls) >= 1
+        tree_args = tree_calls[0][0][2]  # args dict
+        assert tree_args.get("level") == 5
+
+    @patch("agent.scout.dispatch_tool")
+    def test_bootstrap_tree_default_level_is_3(self, mock_dispatch):
+        from agent.scout import _run_bootstrap, ScoutConfig
+        from agent.tracker import GroundingTracker
+
+        mock_dispatch.side_effect = _make_dispatch_side_effect({
+            ("tree", "/"): _tree_response([], []),
+        })
+
+        vm = MagicMock()
+        tracker = GroundingTracker()
+        config = ScoutConfig(model="openai/gpt-4.1", task_instruction="test")
+        _run_bootstrap(vm, tracker, set(), config=config)
+
+        tree_calls = [
+            c for c in mock_dispatch.call_args_list
+            if c[0][1] == "tree"
+        ]
+        assert len(tree_calls) >= 1
+        tree_args = tree_calls[0][0][2]
+        assert tree_args.get("level") == 3
+
+
+class TestScoutPromptLineRange:
+    """Task 3.3: Scout prompt instructs LLM to use start_line/end_line for large files."""
+
+    def test_scout_prompt_mentions_start_line_end_line(self):
+        from agent.prompt import build_scout_prompt
+        result = build_scout_prompt(
+            task_instruction="test task",
+            bootstrap_context="tree output",
+        )
+        assert "start_line" in result
+        assert "end_line" in result
+
+    def test_scout_prompt_mentions_200_line_threshold(self):
+        from agent.prompt import build_scout_prompt
+        result = build_scout_prompt(
+            task_instruction="test task",
+            bootstrap_context="tree output",
+        )
+        assert "200" in result
+
+    def test_line_range_instruction_in_exploration_section(self):
+        from agent.prompt import build_scout_prompt
+        result = build_scout_prompt(
+            task_instruction="test task",
+            bootstrap_context="tree output",
+        )
+        # The instruction should be in the exploration section
+        exploration_idx = result.find("## Exploration Instructions")
+        assert exploration_idx >= 0
+        completion_idx = result.find("## Completion Instructions")
+        exploration_section = result[exploration_idx:completion_idx]
+        assert "start_line" in exploration_section
+        assert "end_line" in exploration_section
+
+
+class TestRuntimeTreeLevelParam:
+    """Task 3.4: Verify PcmRuntime passes level and MiniRuntime ignores it."""
+
+    def test_pcm_runtime_tree_passes_level_to_tree_request(self):
+        """PcmRuntime.tree() passes level to TreeRequest."""
+        from agent.runtime import PcmRuntime
+        import inspect
+        source = inspect.getsource(PcmRuntime.tree)
+        # Should contain 'level' in the TreeRequest construction
+        assert "level" in source
+
+    def test_pcm_runtime_tree_signature_has_level(self):
+        """PcmRuntime.tree() accepts level parameter."""
+        from agent.runtime import PcmRuntime
+        import inspect
+        sig = inspect.signature(PcmRuntime.tree)
+        assert "level" in sig.parameters
+
+    def test_mini_runtime_tree_signature_has_level(self):
+        """MiniRuntime.tree() accepts level parameter (ignores it gracefully)."""
+        from agent.runtime import MiniRuntime
+        import inspect
+        sig = inspect.signature(MiniRuntime.tree)
+        assert "level" in sig.parameters
+
+    def test_mini_runtime_tree_ignores_level(self):
+        """MiniRuntime.tree() does not pass level to OutlineRequest."""
+        from agent.runtime import MiniRuntime
+        import inspect
+        source = inspect.getsource(MiniRuntime.tree)
+        # Find the actual OutlineRequest(...) call, not comments
+        # Extract the arguments passed inside OutlineRequest(...)
+        import re as _re
+        match = _re.search(r"OutlineRequest\(([^)]*)\)", source)
+        assert match is not None, "OutlineRequest call not found"
+        outline_args = match.group(1)
+        assert "level" not in outline_args, (
+            f"MiniRuntime should NOT pass level to OutlineRequest, got: {outline_args}"
+        )
+
+    def test_runtime_adapter_protocol_has_level(self):
+        """RuntimeAdapter protocol specifies level parameter."""
+        from agent.runtime import RuntimeAdapter
+        import inspect
+        sig = inspect.signature(RuntimeAdapter.tree)
+        assert "level" in sig.parameters
 
 
 # ---------------------------------------------------------------------------

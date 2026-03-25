@@ -145,7 +145,10 @@ def build_scout_prompt(
         "5. Use parallel tool calls to batch multiple reads or listings.\n"
         "6. Skip clearly irrelevant directories (e.g., `node_modules`, `.git`).\n"
         "7. You have the full directory tree already -- jump directly to any "
-        "path at any depth. No level-by-level traversal needed."
+        "path at any depth. No level-by-level traversal needed.\n"
+        "8. For files exceeding ~200 lines (visible from tree/list output), "
+        "use start_line/end_line parameters to read only relevant sections "
+        "rather than loading the entire file."
     )
 
     # 5. Completion instructions

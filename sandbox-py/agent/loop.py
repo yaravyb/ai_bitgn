@@ -19,7 +19,7 @@ from typing import Any
 
 from agent.scout import run_scout, ScoutSummary, ScoutConfig
 from agent.llm import call_llm, LLMResponse
-from agent.dispatch import dispatch_parallel, dispatch_tool
+from agent.dispatch import dispatch_parallel, dispatch_tool, DispatchContext, TemplateGuardConfig, TaskConstraints
 from agent.verify import (
     VerificationState,
     VerificationOutcome,
@@ -53,21 +53,123 @@ def _normalize_path(path: str) -> str:
     return normalized.lower()
 
 
-_FILE_PATH_RE = re.compile(
+# Regex patterns used internally by _extract_task_constraints_regex.
+# Not exported as module-level names; kept private to the function scope
+# for clarity but defined here for compilation efficiency.
+_CONSTRAINT_FILE_PATH_RE = re.compile(
     r"(?:^|\s|/)(\S+/[\w\-]+(?:\.\w+)+)",
 )
 
+_CONSTRAINT_SCOPE_PHRASES = (
+    "keep the diff focused",
+    "don't touch anything else",
+    "do not touch anything else",
+    "focused diff",
+)
 
-def _extract_source_basename(task_text: str) -> str | None:
-    """Extract the source file basename from task text.
 
-    Looks for file paths in the task and returns the basename of the first
-    match. Returns None if no file path is found.
+def _extract_task_constraints_regex(task_text: str) -> TaskConstraints | None:
+    """Fast-path: attempt regex-based constraint extraction.
+
+    Returns TaskConstraints if BOTH source_file and scope_level are
+    determined with high confidence. Returns None if either is ambiguous,
+    triggering the LLM fallback path.
     """
-    match = _FILE_PATH_RE.search(task_text)
-    if match:
-        return posixpath.basename(match.group(1))
+    # Extract source file basename
+    match = _CONSTRAINT_FILE_PATH_RE.search(task_text)
+    source_file = posixpath.basename(match.group(1)) if match else None
+
+    # Detect scope level
+    task_lower = task_text.lower()
+    scope_constrained = any(p in task_lower for p in _CONSTRAINT_SCOPE_PHRASES)
+    scope_level = "focused" if scope_constrained else None
+
+    # Both must be resolved for high-confidence result
+    if source_file is not None and scope_level is not None:
+        return TaskConstraints(
+            source_file=source_file,
+            scope_level=scope_level,
+            target_directories=(),
+        )
+
+    # Either or both are ambiguous -> fall back to LLM
     return None
+
+
+def _extract_task_constraints_llm(
+    model: str,
+    task_text: str,
+    trace_metadata: dict[str, Any],
+) -> TaskConstraints:
+    """LLM-path: prompt the model to extract structured constraints.
+
+    Returns TaskConstraints parsed from LLM JSON response. Falls back to
+    default TaskConstraints(source_file=None, scope_level="normal",
+    target_directories=()) on any error (fail-open).
+    """
+    _DEFAULT = TaskConstraints()
+
+    extraction_prompt = (
+        "Extract task constraints from the following task instruction.\n"
+        "Return a JSON object with these fields:\n"
+        '- "source_file": basename of the primary source file (string or null)\n'
+        '- "scope_level": "focused" if the task restricts modifications, "normal" otherwise\n'
+        '- "target_directories": list of directory paths or file paths that the task\n'
+        "  explicitly allows modifications to\n\n"
+        "Task:\n"
+        f"<task>\n{task_text}\n</task>\n\n"
+        "Respond with ONLY the JSON object, no additional text."
+    )
+
+    try:
+        response = call_llm(
+            model,
+            [{"role": "user", "content": extraction_prompt}],
+            tools=None,
+            max_tokens=500,
+            metadata=trace_metadata,
+        )
+    except Exception:
+        log.warning("LLM constraint extraction failed (exception); using defaults")
+        return _DEFAULT
+
+    content = response.content
+    if not content:
+        log.warning("LLM constraint extraction returned empty content; using defaults")
+        return _DEFAULT
+
+    # Try to parse JSON from the response, handling markdown code fences
+    text = content.strip()
+    if text.startswith("```"):
+        # Strip markdown code fence
+        lines = text.split("\n")
+        # Remove first and last lines (``` markers)
+        lines = [ln for ln in lines if not ln.strip().startswith("```")]
+        text = "\n".join(lines).strip()
+
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        log.warning("LLM constraint extraction returned unparseable JSON; using defaults")
+        return _DEFAULT
+
+    if not isinstance(data, dict):
+        log.warning("LLM constraint extraction returned non-dict JSON; using defaults")
+        return _DEFAULT
+
+    # Build TaskConstraints from parsed data
+    source_file = data.get("source_file")
+    scope_level = data.get("scope_level", "normal")
+    target_dirs = data.get("target_directories", [])
+
+    if scope_level not in ("focused", "normal"):
+        scope_level = "normal"
+
+    return TaskConstraints(
+        source_file=source_file if isinstance(source_file, str) else None,
+        scope_level=scope_level,
+        target_directories=tuple(target_dirs) if isinstance(target_dirs, list) else (),
+    )
 
 
 def _try_extract_completion(text: str) -> dict[str, Any] | None:
@@ -335,6 +437,7 @@ def run_agent(
     # Skills that are always embedded in the system prompt (not on-demand)
     _EMBEDDED_SKILLS = ("security-posture", "execution-discipline")
     verification_checklist = ""
+    verification_frame: str | None = None
     if skill_loader is not None:
         skills_metadata = skill_loader.get_descriptions()
         for skill_name in _EMBEDDED_SKILLS:
@@ -345,6 +448,15 @@ def run_agent(
         vb = skill_loader.get_content("self-verification")
         if vb and not vb.startswith("{"):
             verification_checklist = vb
+        # Load verification frame template (Task 4: externalized frame)
+        vf = skill_loader.get_content("verification-frame")
+        if vf and not vf.startswith("{"):
+            verification_frame = vf
+        else:
+            log.warning(
+                "verification-frame skill not found or unreadable; "
+                "using inline fallback frame"
+            )
         print(f"Skills loaded: {skill_loader.list_names()}")
 
     scout_context_str = _format_scout_context(summary)
@@ -380,8 +492,15 @@ def run_agent(
         "content": scout_context_str,
     })
 
+    # --- Task constraint extraction: hybrid regex fast-path + LLM fallback (Req 2) ---
+    constraints = _extract_task_constraints_regex(task_text)
+    if constraints is None:
+        constraints = _extract_task_constraints_llm(
+            executor_model, task_text, trace_metadata
+        )
+    source_basename = constraints.source_file
+
     # Add task as user message with <task> wrapping (Req 4.4)
-    source_basename = _extract_source_basename(task_text)
     task_msg = (
         "Execute the following task.\n\n"
         f"<task>\n{task_text}\n</task>"
@@ -393,10 +512,20 @@ def run_agent(
         )
     messages.append({"role": "user", "content": task_msg})
 
-    # Detect scope constraints in task text for programmatic write-guards
-    _SCOPE_PHRASES = ("keep the diff focused", "don't touch anything else",
-                      "do not touch anything else", "focused diff")
-    scope_constrained = any(p in task_text.lower() for p in _SCOPE_PHRASES)
+    # Read template guard config from environment (Task 6)
+    template_dirs_env = os.environ.get("TEMPLATE_PROTECTED_DIRS", "")
+    template_protected_dirs = tuple(
+        d.strip() for d in template_dirs_env.split(",") if d.strip()
+    )
+    template_guard_config = TemplateGuardConfig(protected_directories=template_protected_dirs)
+
+    # Construct immutable DispatchContext from extracted constraints (Req 1, 2)
+    dispatch_ctx = DispatchContext(
+        source_basename=source_basename,
+        scope_constrained=(constraints.scope_level == "focused"),
+        target_directories=constraints.target_directories,
+        template_guard_config=template_guard_config,
+    )
 
     print(f"--- Executor start (model={executor_model}) ---")
     print(f"  Scout context: {len(scout_context_str)} chars")
@@ -491,6 +620,7 @@ def run_agent(
                         text_answer, "OUTCOME_OK", summary.policy_files,
                         checklist_body=verification_checklist,
                         source_basename=source_basename,
+                        frame_template=verification_frame,
                     )
                     messages.append({
                         "role": "user",
@@ -565,8 +695,7 @@ def run_agent(
             results = dispatch_parallel(
                 runtime, other_tool_calls, tracker, protected_files, skill_loader,
                 context_config=context_config,
-                source_basename=source_basename,
-                scope_constrained=scope_constrained,
+                dispatch_ctx=dispatch_ctx,
             )
 
             # Append tool results, detect compact sentinel
@@ -625,6 +754,7 @@ def run_agent(
                     answer, code, summary.policy_files,
                     checklist_body=verification_checklist,
                     source_basename=source_basename,
+                    frame_template=verification_frame,
                 )
 
                 # Append synthetic tool result for report_completion

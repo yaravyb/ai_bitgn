@@ -26,6 +26,11 @@ observability = [
     "langfuse>=2.0.0",
 ]
 
+[tool.pytest.ini_options]
+markers = [
+    "no_default_constraints: opt out of the autouse _default_constraint_extraction fixture",
+]
+
 [tool.uv]
 # AICODE-NOTE: `harness_core/sdk-tests/sdk-python.sh` rewrites the Buf SDK pins
 # in this file after `buf push`; keep this project flat so the sample stays
