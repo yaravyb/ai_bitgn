@@ -1,0 +1,29 @@
+{
+  "featureName": "weak-model-resilience",
+  "description": "Make the agent framework resilient to weak model behaviors: empty LLM responses that cause silent loop exits (5/9 failures), tool calls output as plain text instead of function calling (3/9 failures), and no error recovery after file-not-found errors (1/9 failures). Tested against openai.gpt-oss-120b model at 47% score.",
+  "codeName": "weak-model-resilience",
+  "language": "en",
+  "createdAt": "2026-03-25T14:00:00Z",
+  "updatedAt": "2026-03-25T15:00:00Z",
+  "status": "design-generated",
+  "phases": {
+    "requirements": "generated",
+    "design": "generated",
+    "tasks": "pending",
+    "implementation": "pending"
+  },
+  "approvals": {
+    "requirements": {
+      "generated": true,
+      "approved": true
+    },
+    "design": {
+      "generated": true,
+      "approved": true
+    },
+    "tasks": {
+      "generated": false,
+      "approved": false
+    }
+  }
+}
