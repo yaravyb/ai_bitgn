@@ -30,8 +30,8 @@ def _clear_verification_env(monkeypatch):
 def _default_constraint_extraction(monkeypatch, request):
     """Bypass LLM constraint extraction in tests that don't test it.
 
-    Patches _extract_task_constraints_regex to return default TaskConstraints
-    so that the LLM fallback is never triggered and existing tests don't need
+    Patches _extract_task_constraints_llm to return default TaskConstraints
+    so that the LLM call is never triggered and existing tests don't need
     extra mock responses. Tests that explicitly test the extraction functions
     (marked with @pytest.mark.no_default_constraints) opt out.
     """
@@ -41,8 +41,8 @@ def _default_constraint_extraction(monkeypatch, request):
     try:
         from agent.dispatch import TaskConstraints
         monkeypatch.setattr(
-            "agent.loop._extract_task_constraints_regex",
-            lambda task_text: TaskConstraints(),
+            "agent.loop._extract_task_constraints_llm",
+            lambda model, task_text, trace_metadata: TaskConstraints(),
         )
     except (ImportError, AttributeError):
         pass

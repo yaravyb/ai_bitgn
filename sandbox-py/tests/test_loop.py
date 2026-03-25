@@ -1715,12 +1715,12 @@ class TestTemplateGuardEnvWiring:
     the tests stay focused on the env var -> TemplateGuardConfig wiring.
     """
 
-    @patch("agent.loop._extract_task_constraints_regex")
+    @patch("agent.loop._extract_task_constraints_llm")
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
     def test_dispatch_parallel_receives_template_guard_config(
-        self, mock_call_llm, mock_run_scout, mock_dp, mock_regex_extract,
+        self, mock_call_llm, mock_run_scout, mock_dp, mock_llm_extract,
     ):
         """When TEMPLATE_PROTECTED_DIRS is set and dispatch_parallel is called,
         the dispatch_ctx should contain the correct TemplateGuardConfig."""
@@ -1730,7 +1730,7 @@ class TestTemplateGuardEnvWiring:
         mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock()
         # Return default constraints to skip LLM fallback
-        mock_regex_extract.return_value = TaskConstraints()
+        mock_llm_extract.return_value = TaskConstraints()
 
         # Call 1: LLM returns tool calls -> triggers dispatch_parallel
         # Call 2: LLM returns text only -> completes
@@ -1763,12 +1763,12 @@ class TestTemplateGuardEnvWiring:
             "/templates/", "/structural/",
         )
 
-    @patch("agent.loop._extract_task_constraints_regex")
+    @patch("agent.loop._extract_task_constraints_llm")
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
     def test_dispatch_ctx_empty_env_gives_empty_protected_dirs(
-        self, mock_call_llm, mock_run_scout, mock_dp, mock_regex_extract,
+        self, mock_call_llm, mock_run_scout, mock_dp, mock_llm_extract,
     ):
         """When TEMPLATE_PROTECTED_DIRS is empty or unset, DispatchContext should
         have TemplateGuardConfig with empty protected_directories tuple."""
@@ -1777,7 +1777,7 @@ class TestTemplateGuardEnvWiring:
 
         mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock()
-        mock_regex_extract.return_value = TaskConstraints()
+        mock_llm_extract.return_value = TaskConstraints()
 
         tool_call_response = MagicMock(
             content="",
@@ -1808,12 +1808,12 @@ class TestTemplateGuardEnvWiring:
         assert dispatch_ctx is not None
         assert dispatch_ctx.template_guard_config.protected_directories == ()
 
-    @patch("agent.loop._extract_task_constraints_regex")
+    @patch("agent.loop._extract_task_constraints_llm")
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
     def test_dispatch_ctx_env_with_trailing_commas_and_spaces(
-        self, mock_call_llm, mock_run_scout, mock_dp, mock_regex_extract,
+        self, mock_call_llm, mock_run_scout, mock_dp, mock_llm_extract,
     ):
         """Trailing commas and whitespace in TEMPLATE_PROTECTED_DIRS are ignored."""
         from agent.loop import run_agent
@@ -1821,7 +1821,7 @@ class TestTemplateGuardEnvWiring:
 
         mock_runtime = _make_mock_runtime()
         mock_run_scout.return_value = _make_scout_summary_mock()
-        mock_regex_extract.return_value = TaskConstraints()
+        mock_llm_extract.return_value = TaskConstraints()
 
         tool_call_response = MagicMock(
             content="",
@@ -1882,94 +1882,6 @@ class TestExistingTestsPassWithVerificationDisabled:
 # ---------------------------------------------------------------------------
 # Task 5: LLM-Driven Task Constraint Extraction
 # ---------------------------------------------------------------------------
-
-@pytest.mark.no_default_constraints
-class TestExtractTaskConstraintsRegex:
-    """Test _extract_task_constraints_regex: regex fast-path for constraint extraction."""
-
-    def test_extracts_source_file_and_focused_scope(self):
-        """When task text has a file path AND a scope phrase, returns TaskConstraints."""
-        from agent.loop import _extract_task_constraints_regex
-        from agent.dispatch import TaskConstraints
-
-        task = "Edit src/main.py and keep the diff focused"
-        result = _extract_task_constraints_regex(task)
-        assert result is not None
-        assert isinstance(result, TaskConstraints)
-        assert result.source_file == "main.py"
-        assert result.scope_level == "focused"
-
-    def test_returns_none_when_only_scope_phrase(self):
-        """When only scope phrase matched but no file path, returns None (ambiguous)."""
-        from agent.loop import _extract_task_constraints_regex
-
-        task = "Keep the diff focused on the task"
-        result = _extract_task_constraints_regex(task)
-        assert result is None
-
-    def test_returns_none_when_only_file_path(self):
-        """When only file path matched but no scope phrase, returns None (ambiguous)."""
-        from agent.loop import _extract_task_constraints_regex
-
-        task = "Edit the file src/main.py"
-        result = _extract_task_constraints_regex(task)
-        assert result is None
-
-    def test_returns_none_when_no_patterns_match(self):
-        """When no patterns match at all, returns None."""
-        from agent.loop import _extract_task_constraints_regex
-
-        task = "Do something vague"
-        result = _extract_task_constraints_regex(task)
-        assert result is None
-
-    def test_focused_diff_scope_phrase(self):
-        """The 'focused diff' scope phrase is recognized."""
-        from agent.loop import _extract_task_constraints_regex
-
-        task = "Make a focused diff on data/config.yaml"
-        result = _extract_task_constraints_regex(task)
-        assert result is not None
-        assert result.scope_level == "focused"
-        assert result.source_file == "config.yaml"
-
-    def test_dont_touch_anything_else_scope_phrase(self):
-        """'don't touch anything else' scope phrase is recognized."""
-        from agent.loop import _extract_task_constraints_regex
-
-        task = "Update lib/utils.js, don't touch anything else"
-        result = _extract_task_constraints_regex(task)
-        assert result is not None
-        assert result.scope_level == "focused"
-        assert result.source_file == "utils.js"
-
-    def test_do_not_touch_scope_phrase(self):
-        """'do not touch anything else' scope phrase is recognized."""
-        from agent.loop import _extract_task_constraints_regex
-
-        task = "Fix agent/loop.py. Do not touch anything else"
-        result = _extract_task_constraints_regex(task)
-        assert result is not None
-        assert result.scope_level == "focused"
-
-    def test_target_directories_always_empty(self):
-        """Regex path cannot extract target_directories; always empty tuple."""
-        from agent.loop import _extract_task_constraints_regex
-
-        task = "Edit src/main.py and keep the diff focused"
-        result = _extract_task_constraints_regex(task)
-        assert result is not None
-        assert result.target_directories == ()
-
-    def test_file_path_with_multiple_extensions(self):
-        """File path with complex extension like .spec.ts is extracted."""
-        from agent.loop import _extract_task_constraints_regex
-
-        task = "Update tests/app.spec.ts, keep the diff focused"
-        result = _extract_task_constraints_regex(task)
-        assert result is not None
-        assert result.source_file == "app.spec.ts"
-
 
 @pytest.mark.no_default_constraints
 class TestExtractTaskConstraintsLLM:
@@ -2138,19 +2050,18 @@ class TestOldFunctionsRemoved:
 
 
 @pytest.mark.no_default_constraints
-class TestHybridConstraintExtractionInRunAgent:
-    """Verify the hybrid flow is wired into run_agent()."""
+@pytest.mark.no_default_constraints
+class TestLLMConstraintExtractionInRunAgent:
+    """Verify LLM constraint extraction is wired into run_agent()."""
 
     @patch("agent.loop._extract_task_constraints_llm")
-    @patch("agent.loop._extract_task_constraints_regex")
     @patch("agent.loop.dispatch_parallel")
     @patch("agent.loop.run_scout")
     @patch("agent.loop.call_llm")
-    def test_regex_path_used_when_returns_constraints(
-        self, mock_call_llm, mock_run_scout, mock_dp,
-        mock_regex, mock_llm_extract,
+    def test_llm_extraction_called_in_run_agent(
+        self, mock_call_llm, mock_run_scout, mock_dp, mock_llm_extract,
     ):
-        """When regex returns TaskConstraints, LLM fallback is NOT called."""
+        """LLM constraint extraction is called during run_agent."""
         from agent.loop import run_agent
         from agent.dispatch import TaskConstraints
 
@@ -2159,125 +2070,12 @@ class TestHybridConstraintExtractionInRunAgent:
         mock_call_llm.return_value = MagicMock(
             content="done", tool_calls=[], raw=None,
         )
-        mock_regex.return_value = TaskConstraints(
-            source_file="main.py", scope_level="focused",
-        )
+        mock_llm_extract.return_value = TaskConstraints()
 
         run_agent(
             executor_model="openai/gpt-4.1",
             runtime=mock_runtime,
-            task_text="Edit src/main.py, keep the diff focused",
+            task_text="Do something",
         )
 
-        mock_regex.assert_called_once()
-        mock_llm_extract.assert_not_called()
-
-    @patch("agent.loop._extract_task_constraints_llm")
-    @patch("agent.loop._extract_task_constraints_regex")
-    @patch("agent.loop.dispatch_parallel")
-    @patch("agent.loop.run_scout")
-    @patch("agent.loop.call_llm")
-    def test_llm_fallback_when_regex_returns_none(
-        self, mock_call_llm, mock_run_scout, mock_dp,
-        mock_regex, mock_llm_extract,
-    ):
-        """When regex returns None, LLM fallback IS called."""
-        from agent.loop import run_agent
-        from agent.dispatch import TaskConstraints
-
-        mock_runtime = _make_mock_runtime()
-        mock_run_scout.return_value = _make_scout_summary_mock()
-        mock_call_llm.return_value = MagicMock(
-            content="done", tool_calls=[], raw=None,
-        )
-        mock_regex.return_value = None
-        mock_llm_extract.return_value = TaskConstraints(
-            source_file="main.py", scope_level="normal",
-        )
-
-        run_agent(
-            executor_model="openai/gpt-4.1",
-            runtime=mock_runtime,
-            task_text="Edit main.py",
-        )
-
-        mock_regex.assert_called_once()
         mock_llm_extract.assert_called_once()
-
-    @patch("agent.loop._extract_task_constraints_llm")
-    @patch("agent.loop._extract_task_constraints_regex")
-    @patch("agent.loop.dispatch_parallel")
-    @patch("agent.loop.run_scout")
-    @patch("agent.loop.call_llm")
-    def test_dispatch_ctx_built_from_constraints(
-        self, mock_call_llm, mock_run_scout, mock_dp,
-        mock_regex, mock_llm_extract,
-    ):
-        """DispatchContext is built from the extracted TaskConstraints."""
-        from agent.loop import run_agent
-        from agent.dispatch import TaskConstraints, DispatchContext
-
-        mock_runtime = _make_mock_runtime()
-        mock_run_scout.return_value = _make_scout_summary_mock()
-
-        tc = ToolCall(id="tc1", name="read_file", arguments={"path": "x.md"})
-        mock_call_llm.side_effect = [
-            MagicMock(content=None, tool_calls=[tc], raw=None),
-            MagicMock(content="done", tool_calls=[], raw=None),
-        ]
-        mock_dp.return_value = [("tc1", '{"content": "ok"}')]
-
-        mock_regex.return_value = TaskConstraints(
-            source_file="main.py",
-            scope_level="focused",
-            target_directories=("src/",),
-        )
-
-        run_agent(
-            executor_model="openai/gpt-4.1",
-            runtime=mock_runtime,
-            task_text="Edit src/main.py, keep the diff focused",
-        )
-
-        # Check that dispatch_parallel received a DispatchContext
-        dp_call = mock_dp.call_args
-        dispatch_ctx = dp_call[1].get("dispatch_ctx")
-        assert dispatch_ctx is not None
-        assert isinstance(dispatch_ctx, DispatchContext)
-        assert dispatch_ctx.source_basename == "main.py"
-        assert dispatch_ctx.scope_constrained is True
-        assert dispatch_ctx.target_directories == ("src/",)
-
-    @patch("agent.loop._extract_task_constraints_llm")
-    @patch("agent.loop._extract_task_constraints_regex")
-    @patch("agent.loop.dispatch_parallel")
-    @patch("agent.loop.run_scout")
-    @patch("agent.loop.call_llm")
-    def test_source_basename_in_task_message(
-        self, mock_call_llm, mock_run_scout, mock_dp,
-        mock_regex, mock_llm_extract,
-    ):
-        """Source filename hint is still included in the task user message."""
-        from agent.loop import run_agent
-        from agent.dispatch import TaskConstraints
-
-        mock_runtime = _make_mock_runtime()
-        mock_run_scout.return_value = _make_scout_summary_mock()
-        mock_call_llm.return_value = MagicMock(
-            content="done", tool_calls=[], raw=None,
-        )
-        mock_regex.return_value = TaskConstraints(
-            source_file="main.py", scope_level="focused",
-        )
-
-        run_agent(
-            executor_model="openai/gpt-4.1",
-            runtime=mock_runtime,
-            task_text="Edit src/main.py, keep the diff focused",
-        )
-
-        llm_call = mock_call_llm.call_args
-        messages = llm_call[0][1]
-        task_msgs = [m for m in messages if m.get("role") == "user" and "<task>" in m.get("content", "")]
-        assert len(task_msgs) >= 1
-        assert "main.py" in task_msgs[-1]["content"]

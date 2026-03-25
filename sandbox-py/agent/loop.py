@@ -53,49 +53,6 @@ def _normalize_path(path: str) -> str:
     return normalized.lower()
 
 
-# Regex patterns used internally by _extract_task_constraints_regex.
-# Not exported as module-level names; kept private to the function scope
-# for clarity but defined here for compilation efficiency.
-_CONSTRAINT_FILE_PATH_RE = re.compile(
-    r"(?:^|\s|/)(\S+/[\w\-]+(?:\.\w+)+)",
-)
-
-_CONSTRAINT_SCOPE_PHRASES = (
-    "keep the diff focused",
-    "don't touch anything else",
-    "do not touch anything else",
-    "focused diff",
-)
-
-
-def _extract_task_constraints_regex(task_text: str) -> TaskConstraints | None:
-    """Fast-path: attempt regex-based constraint extraction.
-
-    Returns TaskConstraints if BOTH source_file and scope_level are
-    determined with high confidence. Returns None if either is ambiguous,
-    triggering the LLM fallback path.
-    """
-    # Extract source file basename
-    match = _CONSTRAINT_FILE_PATH_RE.search(task_text)
-    source_file = posixpath.basename(match.group(1)) if match else None
-
-    # Detect scope level
-    task_lower = task_text.lower()
-    scope_constrained = any(p in task_lower for p in _CONSTRAINT_SCOPE_PHRASES)
-    scope_level = "focused" if scope_constrained else None
-
-    # Both must be resolved for high-confidence result
-    if source_file is not None and scope_level is not None:
-        return TaskConstraints(
-            source_file=source_file,
-            scope_level=scope_level,
-            target_directories=(),
-        )
-
-    # Either or both are ambiguous -> fall back to LLM
-    return None
-
-
 def _extract_task_constraints_llm(
     model: str,
     task_text: str,
@@ -492,24 +449,16 @@ def run_agent(
         "content": scout_context_str,
     })
 
-    # --- Task constraint extraction: hybrid regex fast-path + LLM fallback (Req 2) ---
-    constraints = _extract_task_constraints_regex(task_text)
-    if constraints is None:
-        constraints = _extract_task_constraints_llm(
-            executor_model, task_text, trace_metadata
-        )
-    source_basename = constraints.source_file
+    # --- LLM-driven task constraint extraction ---
+    constraints = _extract_task_constraints_llm(
+        executor_model, task_text, trace_metadata
+    )
 
     # Add task as user message with <task> wrapping (Req 4.4)
     task_msg = (
         "Execute the following task.\n\n"
         f"<task>\n{task_text}\n</task>"
     )
-    if source_basename:
-        task_msg += (
-            f"\n\nSource filename: `{source_basename}` — "
-            "when creating derived files, use this exact basename."
-        )
     messages.append({"role": "user", "content": task_msg})
 
     # Read template guard config from environment (Task 6)
@@ -519,11 +468,11 @@ def run_agent(
     )
     template_guard_config = TemplateGuardConfig(protected_directories=template_protected_dirs)
 
-    # Construct immutable DispatchContext from extracted constraints (Req 1, 2)
+    # Construct DispatchContext with safety-only guards (template deletion).
+    # Behavioral decisions (scope, filenames) are left to the LLM + skills.
+    # TaskConstraints are extracted by LLM but NOT used for programmatic guards —
+    # they flow into DispatchContext for observability/logging purposes only.
     dispatch_ctx = DispatchContext(
-        source_basename=source_basename,
-        scope_constrained=(constraints.scope_level == "focused"),
-        target_directories=constraints.target_directories,
         template_guard_config=template_guard_config,
     )
 
@@ -619,7 +568,7 @@ def run_agent(
                     prompt = build_verification_prompt(
                         text_answer, "OUTCOME_OK", summary.policy_files,
                         checklist_body=verification_checklist,
-                        source_basename=source_basename,
+                        source_basename=None,
                         frame_template=verification_frame,
                     )
                     messages.append({
@@ -753,7 +702,7 @@ def run_agent(
                 prompt = build_verification_prompt(
                     answer, code, summary.policy_files,
                     checklist_body=verification_checklist,
-                    source_basename=source_basename,
+                    source_basename=None,
                     frame_template=verification_frame,
                 )
 

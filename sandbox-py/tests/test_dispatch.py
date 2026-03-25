@@ -786,35 +786,31 @@ class TestGuardWiringInDispatchTool:
     """Task 2.8: Guards are called as pre-dispatch checks in dispatch_tool."""
 
     @patch("agent.dispatch.MessageToDict", return_value={"status": "ok"})
-    def test_write_blocked_by_basename_guard(self, mock_mtd, mock_vm, tracker, protected_files):
-        """write_file with basename mismatch -> error, vm.write not called."""
+    def test_write_allowed_with_basename_mismatch(self, mock_mtd, mock_vm, tracker, protected_files):
+        """write_file with basename mismatch -> allowed (behavioral guards removed from dispatch)."""
         from agent.dispatch import dispatch_tool, DispatchContext
         ctx = DispatchContext(source_basename="2026-03-23__hn-foo.md")
-        result = dispatch_tool(
+        dispatch_tool(
             mock_vm, "write_file",
             {"path": "/out/2026-03-23__0000__hn-foo.md", "content": "x"},
             tracker, protected_files,
             dispatch_ctx=ctx,
         )
-        mock_vm.write.assert_not_called()
-        parsed = json.loads(result)
-        assert "error" in parsed
+        mock_vm.write.assert_called_once()
 
     @patch("agent.dispatch.MessageToDict", return_value={"status": "ok"})
-    def test_write_blocked_by_scope_guard(self, mock_mtd, mock_vm, tracker, protected_files):
-        """write_file to tracked file while scope constrained -> error."""
+    def test_write_allowed_when_scope_constrained(self, mock_mtd, mock_vm, tracker, protected_files):
+        """write_file to tracked file while scope constrained -> allowed (behavioral guard removed)."""
         from agent.dispatch import dispatch_tool, DispatchContext
         ctx = DispatchContext(scope_constrained=True)
         tracker.add("/existing.md")
-        result = dispatch_tool(
+        dispatch_tool(
             mock_vm, "write_file",
             {"path": "/existing.md", "content": "x"},
             tracker, protected_files,
             dispatch_ctx=ctx,
         )
-        mock_vm.write.assert_not_called()
-        parsed = json.loads(result)
-        assert "error" in parsed
+        mock_vm.write.assert_called_once()
 
     @patch("agent.dispatch.MessageToDict", return_value={"status": "ok"})
     def test_write_allowed_when_guards_pass(self, mock_mtd, mock_vm, tracker, protected_files):
@@ -1443,98 +1439,32 @@ class TestGuardEndToEnd:
     Verifies correct error JSON when guards block and VM is called when guards allow.
     """
 
-    # --- Basename guard e2e ---
+    # --- Write guards: basename and scope guards are NOT applied at dispatch level ---
+    # Behavioral decisions (filenames, scope) are left to the LLM + skills.
+    # Only template deletion guard is applied programmatically.
 
     @patch("agent.dispatch.MessageToDict", return_value={"status": "ok"})
-    def test_e2e_write_blocked_by_basename_guard(self, mock_mtd, mock_vm, tracker, protected_files):
-        """dispatch_tool returns error JSON when basename guard blocks write."""
+    def test_e2e_write_allowed_despite_basename_mismatch(self, mock_mtd, mock_vm, tracker, protected_files):
+        """dispatch_tool allows write even with basename mismatch (behavioral guard removed)."""
         from agent.dispatch import dispatch_tool, DispatchContext
         ctx = DispatchContext(source_basename="2026-03-23__hn-foo.md")
-        result = dispatch_tool(
+        dispatch_tool(
             mock_vm, "write_file",
             {"path": "/out/2026-03-23__0000__hn-foo.md", "content": "x"},
             tracker, protected_files,
             dispatch_ctx=ctx,
         )
-        mock_vm.write.assert_not_called()
-        parsed = json.loads(result)
-        assert "error" in parsed
-        assert "mismatch" in parsed["error"].lower() or "Mismatch" in parsed["error"]
-
-    @patch("agent.dispatch.MessageToDict", return_value={"status": "ok"})
-    def test_e2e_write_allowed_by_basename_guard(self, mock_mtd, mock_vm, tracker, protected_files):
-        """dispatch_tool calls VM when basename guard allows write."""
-        from agent.dispatch import dispatch_tool, DispatchContext
-        ctx = DispatchContext(source_basename="report.md")
-        result = dispatch_tool(
-            mock_vm, "write_file",
-            {"path": "/output/report.md", "content": "content"},
-            tracker, protected_files,
-            dispatch_ctx=ctx,
-        )
         mock_vm.write.assert_called_once()
-        parsed = json.loads(result)
-        assert "error" not in parsed
-
-    # --- Scope guard e2e ---
 
     @patch("agent.dispatch.MessageToDict", return_value={"status": "ok"})
-    def test_e2e_write_blocked_by_scope_guard(self, mock_mtd, mock_vm, tracker, protected_files):
-        """dispatch_tool returns error JSON when scope guard blocks write."""
+    def test_e2e_write_allowed_despite_scope_constraint(self, mock_mtd, mock_vm, tracker, protected_files):
+        """dispatch_tool allows write to tracked file even when scope constrained (behavioral guard removed)."""
         from agent.dispatch import dispatch_tool, DispatchContext
         ctx = DispatchContext(scope_constrained=True)
         tracker.add("/readonly.md")
-        result = dispatch_tool(
+        dispatch_tool(
             mock_vm, "write_file",
             {"path": "/readonly.md", "content": "x"},
-            tracker, protected_files,
-            dispatch_ctx=ctx,
-        )
-        mock_vm.write.assert_not_called()
-        parsed = json.loads(result)
-        assert "error" in parsed
-        assert "scope" in parsed["error"].lower()
-
-    @patch("agent.dispatch.MessageToDict", return_value={"status": "ok"})
-    def test_e2e_write_allowed_by_scope_guard_not_constrained(self, mock_mtd, mock_vm, tracker, protected_files):
-        """dispatch_tool calls VM when scope is not constrained."""
-        from agent.dispatch import dispatch_tool, DispatchContext
-        ctx = DispatchContext(scope_constrained=False)
-        tracker.add("/file.md")
-        result = dispatch_tool(
-            mock_vm, "write_file",
-            {"path": "/file.md", "content": "content"},
-            tracker, protected_files,
-            dispatch_ctx=ctx,
-        )
-        mock_vm.write.assert_called_once()
-
-    @patch("agent.dispatch.MessageToDict", return_value={"status": "ok"})
-    def test_e2e_write_allowed_by_scope_guard_target_dir(self, mock_mtd, mock_vm, tracker, protected_files):
-        """dispatch_tool calls VM when write target is in allowed directories."""
-        from agent.dispatch import dispatch_tool, DispatchContext
-        ctx = DispatchContext(
-            scope_constrained=True,
-            target_directories=("/output/",),
-        )
-        tracker.add("/output/result.md")
-        result = dispatch_tool(
-            mock_vm, "write_file",
-            {"path": "/output/result.md", "content": "content"},
-            tracker, protected_files,
-            dispatch_ctx=ctx,
-        )
-        mock_vm.write.assert_called_once()
-
-    @patch("agent.dispatch.MessageToDict", return_value={"status": "ok"})
-    def test_e2e_write_allowed_by_scope_guard_new_file(self, mock_mtd, mock_vm, tracker, protected_files):
-        """dispatch_tool calls VM when writing new file (not previously read)."""
-        from agent.dispatch import dispatch_tool, DispatchContext
-        ctx = DispatchContext(scope_constrained=True)
-        # Do NOT add the file to tracker -> file not read
-        result = dispatch_tool(
-            mock_vm, "write_file",
-            {"path": "/new-file.md", "content": "content"},
             tracker, protected_files,
             dispatch_ctx=ctx,
         )
@@ -1638,59 +1568,17 @@ class TestGuardInteractions:
     """
 
     @patch("agent.dispatch.MessageToDict", return_value={"status": "ok"})
-    def test_basename_guard_checked_before_scope_guard(self, mock_mtd, mock_vm, tracker, protected_files):
-        """Basename guard fires before scope guard -- basename error returned first."""
+    def test_write_allowed_regardless_of_basename_and_scope(self, mock_mtd, mock_vm, tracker, protected_files):
+        """Behavioral guards (basename, scope) are not applied at dispatch level — LLM decides."""
         from agent.dispatch import dispatch_tool, DispatchContext
         ctx = DispatchContext(
             source_basename="2026-03-23__hn-foo.md",
             scope_constrained=True,
         )
         tracker.add("/out/2026-03-23__0000__hn-foo.md")
-        result = dispatch_tool(
+        dispatch_tool(
             mock_vm, "write_file",
             {"path": "/out/2026-03-23__0000__hn-foo.md", "content": "x"},
-            tracker, protected_files,
-            dispatch_ctx=ctx,
-        )
-        mock_vm.write.assert_not_called()
-        parsed = json.loads(result)
-        assert "error" in parsed
-        # The error should be from basename guard (checked first)
-        assert "mismatch" in parsed["error"].lower() or "Mismatch" in parsed["error"]
-
-    @patch("agent.dispatch.MessageToDict", return_value={"status": "ok"})
-    def test_scope_guard_fires_when_basename_passes(self, mock_mtd, mock_vm, tracker, protected_files):
-        """When basename guard passes but scope guard blocks, scope error is returned."""
-        from agent.dispatch import dispatch_tool, DispatchContext
-        ctx = DispatchContext(
-            source_basename="source.md",
-            scope_constrained=True,
-        )
-        tracker.add("/other/unrelated.md")
-        result = dispatch_tool(
-            mock_vm, "write_file",
-            {"path": "/other/unrelated.md", "content": "x"},
-            tracker, protected_files,
-            dispatch_ctx=ctx,
-        )
-        mock_vm.write.assert_not_called()
-        parsed = json.loads(result)
-        assert "error" in parsed
-        assert "scope" in parsed["error"].lower()
-
-    @patch("agent.dispatch.MessageToDict", return_value={"status": "ok"})
-    def test_both_guards_pass_allows_write(self, mock_mtd, mock_vm, tracker, protected_files):
-        """When both basename and scope guards pass, write proceeds."""
-        from agent.dispatch import dispatch_tool, DispatchContext
-        ctx = DispatchContext(
-            source_basename="report.md",
-            scope_constrained=True,
-            target_directories=("/output/",),
-        )
-        tracker.add("/output/report.md")
-        result = dispatch_tool(
-            mock_vm, "write_file",
-            {"path": "/output/report.md", "content": "content"},
             tracker, protected_files,
             dispatch_ctx=ctx,
         )
@@ -1754,8 +1642,8 @@ class TestGuardInteractions:
         mock_vm.write.assert_called_once()
 
     @patch("agent.dispatch.MessageToDict", return_value={"status": "ok"})
-    def test_dispatch_parallel_guards_applied_per_call(self, mock_mtd, mock_vm, tracker, protected_files):
-        """dispatch_parallel applies guards to each tool call independently."""
+    def test_dispatch_parallel_allows_all_writes(self, mock_mtd, mock_vm, tracker, protected_files):
+        """dispatch_parallel allows all writes — behavioral guards removed from dispatch."""
         from agent.dispatch import dispatch_parallel, DispatchContext
         from agent.llm import ToolCall
         ctx = DispatchContext(scope_constrained=True)
@@ -1769,11 +1657,7 @@ class TestGuardInteractions:
             dispatch_ctx=ctx,
         )
         assert len(results) == 2
-        # Find results by id
-        results_dict = dict(results)
-        # tc_1 should be blocked (readonly.md was tracked and scope constrained)
-        parsed_1 = json.loads(results_dict["tc_1"])
-        assert "error" in parsed_1
-        # tc_2 should succeed (new-file.md was not tracked)
-        parsed_2 = json.loads(results_dict["tc_2"])
-        assert "error" not in parsed_2
+        # Both writes should succeed (behavioral guards removed)
+        for _, result_text in results:
+            parsed = json.loads(result_text)
+            assert "error" not in parsed

@@ -490,16 +490,10 @@ def dispatch_tool(
     Returns error JSON if the tool_name is not recognized.
     """
     # Pre-dispatch guard checks (only when dispatch_ctx is provided)
+    # NOTE: Only safety-invariant guards are applied programmatically.
+    # Behavioral decisions (scope, filenames) are left to the LLM + skills.
     if dispatch_ctx is not None:
-        if tool_name == "write_file":
-            path = args.get("path", "")
-            error = _check_basename_guard(dispatch_ctx, path)
-            if error:
-                return json.dumps({"error": error}, ensure_ascii=False)
-            error = _check_scope_guard(dispatch_ctx, path, tracker)
-            if error:
-                return json.dumps({"error": error}, ensure_ascii=False)
-        elif tool_name == "delete_file":
+        if tool_name == "delete_file":
             path = args.get("path", "")
             error = _check_template_guard(dispatch_ctx, path)
             if error:
