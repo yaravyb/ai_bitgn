@@ -588,3 +588,52 @@ class TestContextConfigFromEnvVerification:
         monkeypatch.delenv("VERIFY_MAX_ATTEMPTS", raising=False)
         cfg = ContextConfig.from_env()
         assert cfg.verification_max_attempts == 2
+
+
+# ---------------------------------------------------------------------------
+# ResilienceConfig tests (Task 1: weak-model-resilience)
+# ---------------------------------------------------------------------------
+
+class TestResilienceConfigDefaults:
+    """ResilienceConfig dataclass has correct default values."""
+
+    def test_defaults(self):
+        from agent.context import ResilienceConfig
+        cfg = ResilienceConfig()
+        assert cfg.empty_retry_max == 3
+        assert cfg.text_tool_max == 2
+        assert cfg.error_threshold == 3
+        assert cfg.replan_interval == 8
+
+    def test_is_frozen(self):
+        from agent.context import ResilienceConfig
+        cfg = ResilienceConfig()
+        with pytest.raises(AttributeError):
+            cfg.empty_retry_max = 5
+
+
+class TestResilienceConfigFromEnv:
+    """ResilienceConfig.from_env() reads environment variables with fallback to defaults."""
+
+    def test_from_env_defaults(self, monkeypatch):
+        from agent.context import ResilienceConfig
+        for var in ("RESILIENCE_EMPTY_RETRY_MAX", "RESILIENCE_TEXT_TOOL_MAX",
+                     "RESILIENCE_ERROR_THRESHOLD", "RESILIENCE_REPLAN_INTERVAL"):
+            monkeypatch.delenv(var, raising=False)
+        cfg = ResilienceConfig.from_env()
+        assert cfg.empty_retry_max == 3
+        assert cfg.text_tool_max == 2
+        assert cfg.error_threshold == 3
+        assert cfg.replan_interval == 8
+
+    def test_from_env_custom(self, monkeypatch):
+        from agent.context import ResilienceConfig
+        monkeypatch.setenv("RESILIENCE_EMPTY_RETRY_MAX", "5")
+        monkeypatch.setenv("RESILIENCE_TEXT_TOOL_MAX", "4")
+        monkeypatch.setenv("RESILIENCE_ERROR_THRESHOLD", "6")
+        monkeypatch.setenv("RESILIENCE_REPLAN_INTERVAL", "12")
+        cfg = ResilienceConfig.from_env()
+        assert cfg.empty_retry_max == 5
+        assert cfg.text_tool_max == 4
+        assert cfg.error_threshold == 6
+        assert cfg.replan_interval == 12

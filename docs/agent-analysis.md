@@ -1,6 +1,6 @@
 # AI Agent Implementation Analysis
 
-> Living document — updated as the agent evolves. Last reviewed: 2026-03-25 (agent-guard-architecture update).
+> Living document — updated as the agent evolves. Last reviewed: 2026-03-25 (weak-model-resilience update).
 
 ---
 
@@ -14,12 +14,12 @@ The codebase follows a strict **leaf/orchestrator pattern**: leaf modules have z
 
 | Module | Type | Role | Imports from agent/ |
 |---|---|---|---|
-| `loop.py` | Orchestrator | Top-level lifecycle: scout -> constraint extraction -> executor loop. Only module permitted to import from all other agent/ modules. Constructs `DispatchContext`, manages verification state, applies context compression. | scout, llm, dispatch, verify, prompt, skills, tracker, tools, context |
+| `loop.py` | Orchestrator | Top-level lifecycle: scout -> constraint extraction -> executor loop. Only module permitted to import from all other agent/ modules. Constructs `DispatchContext`, manages verification state and resilience state (`ResilienceState`), applies context compression. Five-point weak-model resilience system with `_looks_like_tool_call()`, `_detect_tool_name()`, `_build_tool_name_list()` helpers. | scout, llm, dispatch, verify, prompt, skills, tracker, tools, context |
 | `scout.py` | Orchestrator | Two-phase workspace discovery: deterministic bootstrap (tree + meta-file reads) followed by LLM-driven explorer (tool-use loop with read-only tool subset). | llm, dispatch, tracker, tools, prompt, context |
 | `dispatch.py` | Leaf | Tool dispatch: maps tool names to VM operations. Defines `DispatchContext`, `TaskConstraints`, `TemplateGuardConfig` dataclasses. Contains standalone guard functions (`_check_basename_guard`, `_check_scope_guard`, `_check_template_guard`). Supports concurrent execution via `dispatch_parallel()`. | tracker, llm (ToolCall type only), context |
 | `verify.py` | Leaf | Self-verification: pure functions and dataclasses (`VerificationState`, `VerificationOutcome`, `should_verify`, `build_verification_prompt`, `detect_verification_outcome`). Supports externalized frame template via `frame_template` parameter. | None (zero agent/ imports) |
 | `prompt.py` | Leaf | System prompt builder: pure structural assembler. Accepts `embedded_skill_bodies` and `scout_summary` parameters. All behavioral rules come from skill files, not hardcoded here. | None (zero agent/ imports) |
-| `context.py` | Leaf | Context management: `ContextConfig` dataclass, `estimate_tokens()`, `micro_compact()`, `truncate_tool_result()`. Pure functions implementing the three-layer compression pipeline. | None (zero agent/ imports) |
+| `context.py` | Leaf | Context management: `ContextConfig` and `ResilienceConfig` dataclasses, `estimate_tokens()`, `micro_compact()`, `truncate_tool_result()`. Pure functions implementing the three-layer compression pipeline. `ResilienceConfig` provides env-configurable thresholds for the weak-model resilience system. | None (zero agent/ imports) |
 | `tracker.py` | Leaf | Grounding reference tracker: `GroundingTracker` class with thread-safe `add`/`contains`/`merge`/`all` operations. Uses `threading.Lock` for concurrent access safety. | None (zero agent/ imports) |
 | `tools.py` | Leaf | Tool schema definitions: OpenAI-compatible function calling schemas (`TOOL_SCHEMAS`, `SCOUT_TOOL_SCHEMAS`). `get_tool_schemas(runtime_type)` returns PCM-extended schemas when needed. | None (zero agent/ imports) |
 | `skills.py` | Leaf | Skill loader: reads `SKILL.md` files with YAML frontmatter. Provides Layer 1 metadata (descriptions) and Layer 2 body content. | None (zero agent/ imports) |
@@ -297,17 +297,37 @@ DispatchContext (frozen dataclass)             -- constructed once per task in l
 
 **Status**: New.
 
+### 16. Weak-Model Resilience System
+
+A five-point resilience mechanism in `loop.py` that handles three weak-model failure modes (empty LLM responses, tool calls as plain text, no error recovery) without adding overhead for strong models. All resilience state is tracked in a mutable `ResilienceState` dataclass; all thresholds are configurable via a frozen `ResilienceConfig` dataclass with `from_env()` pattern (same as `ContextConfig`).
+
+**Intervention points**:
+
+| Point | Trigger | Action | Config |
+|---|---|---|---|
+| A - Empty Response | LLM returns empty/whitespace with no tool calls | Retry with nudge (includes available tool names); fallback submit with `OUTCOME_ERR_INTERNAL` after max retries | `RESILIENCE_EMPTY_RETRY_MAX` (default 3) |
+| B - Text-as-Tool | LLM outputs tool-call JSON as plain text (not via function calling) | Inject correction message naming the detected tool; fall through to auto-submit after max re-prompts | `RESILIENCE_TEXT_TOOL_MAX` (default 2) |
+| C - Error Recovery | Tool dispatch returns NOT_FOUND or consecutive errors | Append recovery hint to tool result; escalation message with tool names after threshold | `RESILIENCE_ERROR_THRESHOLD` (default 3) |
+| D - Post-Loop Guard | Loop exits without `report_completion` called | Submit fallback (verification answer if available, else `OUTCOME_ERR_INTERNAL`) | Always active |
+| E - Re-Planning | 3 identical tool calls (repetition) or N steps without completion (stall) | Auto-compact context + inject checkpoint prompt (no tool names in checkpoint) | `RESILIENCE_REPLAN_INTERVAL` (default 8) |
+
+**Detection helpers**: `_looks_like_tool_call()` checks for distinguishing parameter combinations (e.g., `{path, content}` -> write_file, `{pattern}` -> search) but returns False for ambiguous cases (`{path}` alone) and for dicts containing `answer` (handled by `_try_extract_completion`). Pre-check: returns False immediately if text does not start/end with `{}` (zero overhead for non-JSON text).
+
+**Known model behavior pattern (Root Cause 2)**: Weaker models (e.g., openai.gpt-oss-120b) sometimes output tool-call JSON as raw text instead of using the function calling mechanism. This affects 3/9 failures at the 47% score level. The text-as-tool detector (Point B) handles this by detecting the JSON pattern and re-prompting the model to use function calling.
+
+**Zero-overhead design**: When the model behaves correctly (valid tool calls, valid text responses), no resilience logic executes beyond lightweight counter increments and a boolean check at loop exit. No extra LLM calls, no string parsing, no message injections.
+
+**Status**: New (spec: weak-model-resilience).
+
 ---
 
 ## Weaknesses
 
-### 1. No Error Recovery or Re-Planning
+### 1. ~~No Error Recovery or Re-Planning~~
 
-The executor loop is a simple linear sequence. If the LLM goes down a wrong path, there is no mechanism to detect this and re-plan. Only safeguards: 30-step hard limit and auto-submit on text-only responses.
+~~The executor loop is a simple linear sequence. If the LLM goes down a wrong path, there is no mechanism to detect this and re-plan. Only safeguards: 30-step hard limit and auto-submit on text-only responses.~~
 
-**Impact**: Wasted tokens and potentially lower benchmark scores.
-**Mitigation ideas**: Reflection/self-critique loops, progress heuristics (e.g., if same tool called 3+ times in a row, inject a "step back" prompt).
-**Status**: Open.
+**Status**: **Addressed** (see Strength #16). Five-point resilience system: empty response retry with nudge, text-as-tool detection and correction, error recovery hints with escalation, guaranteed answer submission post-loop guard, and re-planning checkpoints with repetition detection. All configurable via environment variables, zero overhead for strong models.
 
 ### 2. ~~No Memory / Context Management~~
 
@@ -408,9 +428,9 @@ Every `run_agent()` starts fresh. Scout re-explores the workspace even if unchan
 | Context management  | Strong   | Three-layer compression pipeline (truncation, micro-compact, auto-compact) |
 | Self-verification   | Strong   | Pre-submission verification loop with policy-aware prompt, text extraction, fallbacks |
 | Observability       | Partial  | LLM calls traced; Langfuse host reachability check; tool dispatch ops not traced |
-| Error handling      | Moderate | Retries on LLM, verification fallbacks, graceful unknown tool handling  |
+| Error handling      | Strong   | 5-point weak-model resilience (empty retry, text-as-tool, error recovery, post-loop guard, re-planning); LLM retries; verification fallbacks |
 | Scalability         | Moderate | Context managed, but no caching layer                                  |
-| Testability         | Strong   | Comprehensive TDD suite (715+ tests); full guard coverage               |
+| Testability         | Strong   | Comprehensive TDD suite (738+ tests); full guard coverage; resilience tests |
 | Robustness          | Strong   | Thread-safe tracker, frozen DispatchContext, 67 guard tests             |
 | SDK integration     | Strong   | SDK v2 line-range reads/writes, depth-limited tree, all PCM tools      |
 | Outcome vocabulary  | Strong   | All 5 PCM outcome codes, self-documenting enum names                   |
@@ -427,3 +447,4 @@ Every `run_agent()` starts fresh. Scout re-explores the workspace even if unchan
 | 2026-03-23 | Added self-verification loop (verify.py); weakness #9 addressed; structured text extraction for weaker models; graceful unknown tool handling; LiteLLM/Langfuse log suppression; per-task timing in benchmark runner; test count 436→501 |
 | 2026-03-24 | Full PCM outcome codes (5 codes, self-documenting names); embedded skills system (security-posture, execution-discipline, self-verification); programmatic dispatch guards (basename mismatch, scope constraint, template protection); SDK v2 upgrade (line-range read/write, depth-limited tree); prompt.py made pure structural assembler; injection response protocol; spec `agent-guard-architecture` generated for remaining gaps (globals→context, regex→LLM, tests); test count 501→534 |
 | 2026-03-25 | Spec `agent-guard-architecture` fully implemented (Tasks 1-8): thread-safe tracker (Lock), frozen DispatchContext (eliminates globals), scout SDK v2 depth-limited tree, externalized verification frame, hybrid LLM constraint extraction (regex fast-path + LLM fallback), configurable template guard, 67 guard tests, weaknesses #6/#11/#12/#13 addressed; test count 534→715+ |
+| 2026-03-25 | Spec `weak-model-resilience` fully implemented (Tasks 1-11): 5-point resilience system (empty response retry, text-as-tool detection, error recovery hints, post-loop guard, re-planning checkpoints); ResilienceConfig/ResilienceState dataclasses; _looks_like_tool_call/_detect_tool_name helpers; 37 new tests; weakness #1 addressed; error handling rating Moderate→Strong; test count 715→738+ |

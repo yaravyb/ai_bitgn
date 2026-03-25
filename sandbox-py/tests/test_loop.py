@@ -2079,3 +2079,807 @@ class TestLLMConstraintExtractionInRunAgent:
         )
 
         mock_llm_extract.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Task 2: ResilienceState, _looks_like_tool_call, _detect_tool_name
+# ---------------------------------------------------------------------------
+
+class TestResilienceState:
+    """ResilienceState is a mutable dataclass with correct defaults."""
+
+    def test_default_values(self):
+        from agent.loop import ResilienceState
+        s = ResilienceState()
+        assert s.consecutive_empty == 0
+        assert s.consecutive_text_tool == 0
+        assert s.consecutive_errors == 0
+        assert s.completion_submitted is False
+        assert s.steps_since_completion_attempt == 0
+        assert s.recent_tool_calls == []
+
+    def test_mutable(self):
+        from agent.loop import ResilienceState
+        s = ResilienceState()
+        s.consecutive_empty = 5
+        assert s.consecutive_empty == 5
+
+
+class TestLooksLikeToolCall:
+    """_looks_like_tool_call detects tool-call JSON in text responses."""
+
+    def test_non_json_returns_false(self):
+        from agent.loop import _looks_like_tool_call
+        assert _looks_like_tool_call("just plain text") is False
+
+    def test_path_alone_returns_false(self):
+        from agent.loop import _looks_like_tool_call
+        assert _looks_like_tool_call('{"path": "/some/file"}') is False
+
+    def test_answer_key_returns_false(self):
+        from agent.loop import _looks_like_tool_call
+        assert _looks_like_tool_call('{"answer": "TODO"}') is False
+
+    def test_path_content_returns_true(self):
+        from agent.loop import _looks_like_tool_call
+        assert _looks_like_tool_call('{"path": "/f.txt", "content": "hello"}') is True
+
+    def test_path_level_returns_true(self):
+        from agent.loop import _looks_like_tool_call
+        assert _looks_like_tool_call('{"path": "/", "level": 2}') is True
+
+    def test_path_number_returns_true(self):
+        from agent.loop import _looks_like_tool_call
+        assert _looks_like_tool_call('{"path": "/f.txt", "number": true}') is True
+
+    def test_path_start_line_returns_true(self):
+        from agent.loop import _looks_like_tool_call
+        assert _looks_like_tool_call('{"path": "/f.txt", "start_line": 1}') is True
+
+    def test_pattern_returns_true(self):
+        from agent.loop import _looks_like_tool_call
+        assert _looks_like_tool_call('{"pattern": "TODO"}') is True
+
+    def test_name_with_root_returns_true(self):
+        from agent.loop import _looks_like_tool_call
+        assert _looks_like_tool_call('{"name": "foo", "root": "/"}') is True
+
+    def test_name_with_kind_returns_true(self):
+        from agent.loop import _looks_like_tool_call
+        assert _looks_like_tool_call('{"name": "foo", "kind": "files"}') is True
+
+    def test_invalid_json_returns_false(self):
+        from agent.loop import _looks_like_tool_call
+        assert _looks_like_tool_call('{not valid json}') is False
+
+    def test_json_list_returns_false(self):
+        from agent.loop import _looks_like_tool_call
+        assert _looks_like_tool_call('[1, 2, 3]') is False
+
+
+class TestDetectToolName:
+    """_detect_tool_name returns the most likely tool name."""
+
+    def test_write_file(self):
+        from agent.loop import _detect_tool_name
+        assert _detect_tool_name('{"path": "/f.txt", "content": "hi"}') == "write_file"
+
+    def test_tree(self):
+        from agent.loop import _detect_tool_name
+        assert _detect_tool_name('{"path": "/", "level": 2}') == "tree"
+
+    def test_read_file_number(self):
+        from agent.loop import _detect_tool_name
+        assert _detect_tool_name('{"path": "/f.txt", "number": true}') == "read_file"
+
+    def test_read_file_start_line(self):
+        from agent.loop import _detect_tool_name
+        assert _detect_tool_name('{"path": "/f.txt", "start_line": 1}') == "read_file"
+
+    def test_search(self):
+        from agent.loop import _detect_tool_name
+        assert _detect_tool_name('{"pattern": "TODO"}') == "search"
+
+    def test_find(self):
+        from agent.loop import _detect_tool_name
+        assert _detect_tool_name('{"name": "foo", "root": "/"}') == "find"
+
+    def test_ambiguous_path_returns_none(self):
+        from agent.loop import _detect_tool_name
+        assert _detect_tool_name('{"path": "/foo"}') is None
+
+    def test_non_json_returns_none(self):
+        from agent.loop import _detect_tool_name
+        assert _detect_tool_name("plain text") is None
+
+
+# ---------------------------------------------------------------------------
+# Task 10: Resilience mechanism integration tests (15 tests)
+# ---------------------------------------------------------------------------
+
+class TestEmptyResponseRetry:
+    """test_empty_response_retry: 2 empties then valid tool call -- nudge injected, loop continues."""
+
+    @patch("agent.loop.dispatch_tool")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    def test_empty_response_retry(
+        self, mock_call_llm, mock_run_scout, mock_dp, mock_dispatch_tool,
+    ):
+        from agent.loop import run_agent
+
+        mock_runtime = _make_mock_runtime()
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        tc_complete = ToolCall(
+            id="tc1", name="report_completion",
+            arguments={"answer": "done", "grounding_refs": [], "steps": [], "code": "OUTCOME_OK"},
+        )
+        mock_call_llm.side_effect = [
+            # Step 1: empty response
+            MagicMock(content="", tool_calls=[], raw=None),
+            # Step 2: empty response again
+            MagicMock(content="   ", tool_calls=[], raw=None),
+            # Step 3: valid tool call (report_completion)
+            MagicMock(content=None, tool_calls=[tc_complete], raw=None),
+        ]
+        mock_dispatch_tool.return_value = '{"ok": true}'
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            runtime=mock_runtime,
+            task_text="do something",
+        )
+
+        # Should have 3 call_llm calls (3 steps)
+        assert mock_call_llm.call_count == 3
+
+        # dispatch_tool should be called for report_completion
+        mock_dispatch_tool.assert_called_once()
+        dt_args = mock_dispatch_tool.call_args[0]
+        assert dt_args[1] == "report_completion"
+        assert dt_args[2]["answer"] == "done"
+
+        # Check nudge messages were injected
+        last_messages = mock_call_llm.call_args_list[-1][0][1]
+        nudge_msgs = [
+            m for m in last_messages
+            if m.get("role") == "user" and "empty" in m.get("content", "").lower()
+        ]
+        assert len(nudge_msgs) >= 1
+
+
+class TestEmptyResponseFallback:
+    """test_empty_response_fallback: 3 consecutive empties -- fallback submission."""
+
+    @patch("agent.loop.dispatch_tool")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    def test_empty_response_fallback(
+        self, mock_call_llm, mock_run_scout, mock_dispatch_tool,
+    ):
+        from agent.loop import run_agent
+
+        mock_runtime = _make_mock_runtime()
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        mock_call_llm.side_effect = [
+            # Steps 1-3: all empty
+            MagicMock(content="", tool_calls=[], raw=None),
+            MagicMock(content="", tool_calls=[], raw=None),
+            MagicMock(content="", tool_calls=[], raw=None),
+        ]
+        mock_dispatch_tool.return_value = '{"ok": true}'
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            runtime=mock_runtime,
+            task_text="do something",
+        )
+
+        # dispatch_tool should have been called with OUTCOME_ERR_INTERNAL
+        assert mock_dispatch_tool.call_count >= 1
+        dt_args = mock_dispatch_tool.call_args[0]
+        assert dt_args[1] == "report_completion"
+        assert dt_args[2]["code"] == "OUTCOME_ERR_INTERNAL"
+
+
+class TestEmptyResponseCounterReset:
+    """test_empty_response_counter_reset: empty, valid, empty -- counter resets."""
+
+    @patch("agent.loop.dispatch_tool")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    def test_empty_response_counter_reset(
+        self, mock_call_llm, mock_run_scout, mock_dp, mock_dispatch_tool,
+    ):
+        from agent.loop import run_agent
+
+        mock_runtime = _make_mock_runtime()
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        tc_read = ToolCall(id="tc1", name="read_file", arguments={"path": "x.md"})
+        tc_complete = ToolCall(
+            id="tc2", name="report_completion",
+            arguments={"answer": "done", "grounding_refs": [], "steps": [], "code": "OUTCOME_OK"},
+        )
+        mock_call_llm.side_effect = [
+            # Step 1: empty
+            MagicMock(content="", tool_calls=[], raw=None),
+            # Step 2: valid tool call (resets counter)
+            MagicMock(content=None, tool_calls=[tc_read], raw=None),
+            # Step 3: empty (counter back to 1, not 2)
+            MagicMock(content="", tool_calls=[], raw=None),
+            # Step 4: valid completion
+            MagicMock(content=None, tool_calls=[tc_complete], raw=None),
+        ]
+        mock_dp.return_value = [("tc1", '{"content": "ok"}')]
+        mock_dispatch_tool.return_value = '{"ok": true}'
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            runtime=mock_runtime,
+            task_text="do something",
+        )
+
+        # Should NOT have triggered fallback (counter reset between empties)
+        assert mock_call_llm.call_count == 4
+        dt_args = mock_dispatch_tool.call_args[0]
+        assert dt_args[2]["answer"] == "done"  # Normal completion, not fallback
+
+
+class TestTextToolDetection:
+    """test_text_tool_detection: JSON as text -- correction injected, not auto-submitted."""
+
+    @patch("agent.loop.dispatch_tool")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    def test_text_tool_detection(
+        self, mock_call_llm, mock_run_scout, mock_dispatch_tool,
+    ):
+        from agent.loop import run_agent
+
+        mock_runtime = _make_mock_runtime()
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        tc_complete = ToolCall(
+            id="tc1", name="report_completion",
+            arguments={"answer": "done", "grounding_refs": [], "steps": [], "code": "OUTCOME_OK"},
+        )
+        mock_call_llm.side_effect = [
+            # Step 1: text-as-tool (write_file pattern)
+            MagicMock(content='{"path": "/foo.txt", "content": "hello"}', tool_calls=[], raw=None),
+            # Step 2: proper tool call
+            MagicMock(content=None, tool_calls=[tc_complete], raw=None),
+        ]
+        mock_dispatch_tool.return_value = '{"ok": true}'
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            runtime=mock_runtime,
+            task_text="do something",
+        )
+
+        # Should have 2 call_llm calls, not auto-submitted the JSON text
+        assert mock_call_llm.call_count == 2
+        # The final dispatch should be report_completion with "done"
+        dt_args = mock_dispatch_tool.call_args[0]
+        assert dt_args[2]["answer"] == "done"
+
+        # Check correction message was injected
+        step2_messages = mock_call_llm.call_args_list[-1][0][1]
+        correction_msgs = [
+            m for m in step2_messages
+            if m.get("role") == "user" and "function calling" in m.get("content", "").lower()
+        ]
+        assert len(correction_msgs) >= 1
+
+
+class TestTextToolMaxExceeded:
+    """test_text_tool_max_exceeded: 3 consecutive text-tool responses -- after 2 re-prompts, 3rd auto-submitted."""
+
+    @patch("agent.loop.dispatch_tool")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    def test_text_tool_max_exceeded(
+        self, mock_call_llm, mock_run_scout, mock_dispatch_tool,
+    ):
+        from agent.loop import run_agent
+
+        mock_runtime = _make_mock_runtime()
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        mock_call_llm.side_effect = [
+            # Steps 1-3: all text-as-tool (write_file pattern)
+            MagicMock(content='{"path": "/f.txt", "content": "a"}', tool_calls=[], raw=None),
+            MagicMock(content='{"path": "/f.txt", "content": "b"}', tool_calls=[], raw=None),
+            MagicMock(content='{"path": "/f.txt", "content": "c"}', tool_calls=[], raw=None),
+        ]
+        mock_dispatch_tool.return_value = '{"ok": true}'
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            runtime=mock_runtime,
+            task_text="do something",
+        )
+
+        # After 2 re-prompts (steps 1, 2), the 3rd should be auto-submitted as text
+        assert mock_call_llm.call_count == 3
+        dt_args = mock_dispatch_tool.call_args[0]
+        assert dt_args[1] == "report_completion"
+
+
+class TestTryExtractCompletionPriority:
+    """test_try_extract_completion_priority: text with {"answer": "..."} -- existing path, no text-tool detection."""
+
+    @patch("agent.loop.dispatch_tool")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    def test_try_extract_completion_priority(
+        self, mock_call_llm, mock_run_scout, mock_dispatch_tool,
+    ):
+        from agent.loop import run_agent
+
+        mock_runtime = _make_mock_runtime()
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        mock_call_llm.side_effect = [
+            # Text with "answer" key -- should be handled by _try_extract_completion
+            MagicMock(content='{"answer": "my answer", "code": "OUTCOME_OK"}', tool_calls=[], raw=None),
+        ]
+        mock_dispatch_tool.return_value = '{"ok": true}'
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            runtime=mock_runtime,
+            task_text="do something",
+        )
+
+        # Should auto-submit with extracted answer, not trigger text-tool detection
+        assert mock_call_llm.call_count == 1
+        dt_args = mock_dispatch_tool.call_args[0]
+        assert dt_args[2]["answer"] == "my answer"
+
+
+class TestErrorRecoveryNotFound:
+    """test_error_recovery_not_found: tool returns NOT_FOUND error -- hint appended."""
+
+    @patch("agent.loop.dispatch_tool")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    def test_error_recovery_not_found(
+        self, mock_call_llm, mock_run_scout, mock_dp, mock_dispatch_tool,
+    ):
+        from agent.loop import run_agent
+
+        mock_runtime = _make_mock_runtime()
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        tc_read = ToolCall(id="tc1", name="read_file", arguments={"path": "/bad/file.md"})
+        tc_complete = ToolCall(
+            id="tc2", name="report_completion",
+            arguments={"answer": "done", "grounding_refs": [], "steps": [], "code": "OUTCOME_OK"},
+        )
+        mock_call_llm.side_effect = [
+            # Step 1: tool call that returns NOT_FOUND
+            MagicMock(content=None, tool_calls=[tc_read], raw=None),
+            # Step 2: complete
+            MagicMock(content=None, tool_calls=[tc_complete], raw=None),
+        ]
+        mock_dp.return_value = [("tc1", '{"error": "NOT_FOUND: /bad/file.md"}')]
+        mock_dispatch_tool.return_value = '{"ok": true}'
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            runtime=mock_runtime,
+            task_text="do something",
+        )
+
+        # The second call_llm should have a tool result with a hint appended
+        step2_messages = mock_call_llm.call_args_list[-1][0][1]
+        tool_msgs = [m for m in step2_messages if m.get("role") == "tool"]
+        assert any("list" in m.get("content", "").lower() or "directory" in m.get("content", "").lower()
+                    for m in tool_msgs)
+
+
+class TestErrorEscalation:
+    """test_error_escalation: 3 consecutive tool errors -- escalated message injected."""
+
+    @patch("agent.loop.dispatch_tool")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    def test_error_escalation(
+        self, mock_call_llm, mock_run_scout, mock_dp, mock_dispatch_tool,
+    ):
+        from agent.loop import run_agent
+
+        mock_runtime = _make_mock_runtime()
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        tc1 = ToolCall(id="tc1", name="read_file", arguments={"path": "/bad1.md"})
+        tc2 = ToolCall(id="tc2", name="read_file", arguments={"path": "/bad2.md"})
+        tc3 = ToolCall(id="tc3", name="read_file", arguments={"path": "/bad3.md"})
+        tc_complete = ToolCall(
+            id="tc4", name="report_completion",
+            arguments={"answer": "done", "grounding_refs": [], "steps": [], "code": "OUTCOME_OK"},
+        )
+        mock_call_llm.side_effect = [
+            # Steps 1-3: all return errors
+            MagicMock(content=None, tool_calls=[tc1], raw=None),
+            MagicMock(content=None, tool_calls=[tc2], raw=None),
+            MagicMock(content=None, tool_calls=[tc3], raw=None),
+            # Step 4: complete
+            MagicMock(content=None, tool_calls=[tc_complete], raw=None),
+        ]
+        mock_dp.side_effect = [
+            [("tc1", '{"error": "NOT_FOUND: /bad1.md"}')],
+            [("tc2", '{"error": "NOT_FOUND: /bad2.md"}')],
+            [("tc3", '{"error": "NOT_FOUND: /bad3.md"}')],
+        ]
+        mock_dispatch_tool.return_value = '{"ok": true}'
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            runtime=mock_runtime,
+            task_text="do something",
+        )
+
+        # After 3 errors, an escalation user message should be injected
+        step4_messages = mock_call_llm.call_args_list[-1][0][1]
+        escalation_msgs = [
+            m for m in step4_messages
+            if m.get("role") == "user" and "consecutive errors" in m.get("content", "").lower()
+        ]
+        assert len(escalation_msgs) >= 1
+
+
+class TestGuaranteedSubmissionStepLimit:
+    """test_guaranteed_submission_step_limit: 30 steps with no completion -- post-loop guard fires."""
+
+    @patch("agent.loop.dispatch_tool")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    def test_guaranteed_submission_step_limit(
+        self, mock_call_llm, mock_run_scout, mock_dp, mock_dispatch_tool,
+    ):
+        from agent.loop import run_agent
+
+        mock_runtime = _make_mock_runtime()
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        tc = ToolCall(id="tc1", name="read_file", arguments={"path": "x.md"})
+        mock_call_llm.side_effect = [
+            # 30 steps of tool calls without completion
+            MagicMock(content="working", tool_calls=[tc], raw=None),
+        ] * 30
+        mock_dp.return_value = [("tc1", '{"content": "ok"}')]
+        mock_dispatch_tool.return_value = '{"ok": true}'
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            runtime=mock_runtime,
+            task_text="do something",
+        )
+
+        # Post-loop guard should call report_completion with OUTCOME_ERR_INTERNAL
+        # Find the last dispatch_tool call
+        assert mock_dispatch_tool.call_count >= 1
+        last_dt = mock_dispatch_tool.call_args_list[-1][0]
+        assert last_dt[1] == "report_completion"
+        assert last_dt[2]["code"] == "OUTCOME_ERR_INTERNAL"
+
+
+class TestGuaranteedSubmissionVerification:
+    """test_guaranteed_submission_verification: loop ends during verification -- original answer submitted."""
+
+    @patch("agent.loop.ContextConfig.from_env")
+    @patch("agent.loop.dispatch_tool")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    def test_guaranteed_submission_verification(
+        self, mock_call_llm, mock_run_scout, mock_dp, mock_dispatch_tool, mock_from_env,
+    ):
+        from agent.loop import run_agent
+        from agent.context import ContextConfig
+
+        mock_runtime = _make_mock_runtime()
+        mock_from_env.return_value = ContextConfig(
+            verification_enabled=True, verification_max_attempts=2,
+        )
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        tc_read = ToolCall(id="tc1", name="read_file", arguments={"path": "x.md"})
+        tc_complete = ToolCall(
+            id="tc_c", name="report_completion",
+            arguments={"answer": "original answer", "grounding_refs": [], "steps": [], "code": "OUTCOME_OK"},
+        )
+        mock_call_llm.side_effect = [
+            # Step 1: report_completion -> intercepted for verification
+            MagicMock(content=None, tool_calls=[tc_complete], raw=None),
+        ] + [
+            # Steps 2-30: tool calls that never complete (exhaust step limit)
+            MagicMock(content="working", tool_calls=[tc_read], raw=None),
+        ] * 29
+        mock_dp.return_value = [("tc1", '{"content": "ok"}')]
+        mock_dispatch_tool.return_value = '{"ok": true}'
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            runtime=mock_runtime,
+            task_text="do something",
+        )
+
+        # Post-loop guard should submit the original answer
+        last_dt = mock_dispatch_tool.call_args_list[-1][0]
+        assert last_dt[1] == "report_completion"
+        assert last_dt[2]["answer"] == "original answer"
+
+
+class TestStrongModelNoOverhead:
+    """test_strong_model_no_overhead: normal tool calls -- zero resilience interventions."""
+
+    @patch("agent.loop.dispatch_tool")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    def test_strong_model_no_overhead(
+        self, mock_call_llm, mock_run_scout, mock_dp, mock_dispatch_tool,
+    ):
+        from agent.loop import run_agent
+
+        mock_runtime = _make_mock_runtime()
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        tc_read = ToolCall(id="tc1", name="read_file", arguments={"path": "x.md"})
+        tc_complete = ToolCall(
+            id="tc2", name="report_completion",
+            arguments={"answer": "42", "grounding_refs": [], "steps": [], "code": "OUTCOME_OK"},
+        )
+        mock_call_llm.side_effect = [
+            # Step 1: normal tool call
+            MagicMock(content="Let me read the file", tool_calls=[tc_read], raw=None),
+            # Step 2: completion
+            MagicMock(content=None, tool_calls=[tc_complete], raw=None),
+        ]
+        mock_dp.return_value = [("tc1", '{"content": "file content"}')]
+        mock_dispatch_tool.return_value = '{"ok": true}'
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            runtime=mock_runtime,
+            task_text="do something",
+        )
+
+        # Only 2 call_llm calls (2 steps)
+        assert mock_call_llm.call_count == 2
+        # No nudge or correction messages injected
+        step2_messages = mock_call_llm.call_args_list[-1][0][1]
+        resilience_msgs = [
+            m for m in step2_messages
+            if m.get("role") == "user" and (
+                "empty" in m.get("content", "").lower()
+                or "function calling" in m.get("content", "").lower()
+                or "consecutive errors" in m.get("content", "").lower()
+                or "<checkpoint>" in m.get("content", "")
+            )
+        ]
+        assert len(resilience_msgs) == 0
+
+
+class TestReplanCheckpointInjected:
+    """test_replan_checkpoint_injected: 8 steps without completion -- checkpoint injected."""
+
+    @patch("agent.loop.dispatch_tool")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    def test_replan_checkpoint_injected(
+        self, mock_call_llm, mock_run_scout, mock_dp, mock_dispatch_tool,
+    ):
+        from agent.loop import run_agent
+
+        mock_runtime = _make_mock_runtime()
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        # Create unique tool calls to avoid repetition detection
+        def make_tc(i):
+            return ToolCall(id=f"tc{i}", name="read_file", arguments={"path": f"file{i}.md"})
+
+        tc_complete = ToolCall(
+            id="tc_done", name="report_completion",
+            arguments={"answer": "done", "grounding_refs": [], "steps": [], "code": "OUTCOME_OK"},
+        )
+
+        mock_call_llm.side_effect = [
+            # Steps 1-8: unique tool calls without completion
+            MagicMock(content=None, tool_calls=[make_tc(i)], raw=None) for i in range(8)
+        ] + [
+            # Step 9: completion after checkpoint
+            MagicMock(content=None, tool_calls=[tc_complete], raw=None),
+        ]
+        mock_dp.side_effect = [
+            [(f"tc{i}", '{"content": "ok"}')] for i in range(8)
+        ]
+        mock_dispatch_tool.return_value = '{"ok": true}'
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            runtime=mock_runtime,
+            task_text="do something",
+        )
+
+        # After 8 steps, a checkpoint message should have been injected
+        last_messages = mock_call_llm.call_args_list[-1][0][1]
+        checkpoint_msgs = [
+            m for m in last_messages
+            if m.get("role") == "user" and "<checkpoint>" in m.get("content", "")
+        ]
+        assert len(checkpoint_msgs) >= 1
+
+
+class TestReplanCounterResets:
+    """test_replan_counter_resets: checkpoint at step 8, then more steps -- no double-trigger."""
+
+    @patch("agent.loop.dispatch_tool")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    def test_replan_counter_resets(
+        self, mock_call_llm, mock_run_scout, mock_dp, mock_dispatch_tool,
+    ):
+        from agent.loop import run_agent
+
+        mock_runtime = _make_mock_runtime()
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        def make_tc(i):
+            return ToolCall(id=f"tc{i}", name="read_file", arguments={"path": f"file{i}.md"})
+
+        tc_complete = ToolCall(
+            id="tc_done", name="report_completion",
+            arguments={"answer": "done", "grounding_refs": [], "steps": [], "code": "OUTCOME_OK"},
+        )
+
+        # 8 steps -> checkpoint resets counter -> 4 more steps (under 8) -> complete
+        mock_call_llm.side_effect = [
+            # Steps 1-8: unique tool calls
+            MagicMock(content=None, tool_calls=[make_tc(i)], raw=None) for i in range(8)
+        ] + [
+            # Steps 9-12: 4 more unique tool calls (after checkpoint, counter reset)
+            MagicMock(content=None, tool_calls=[make_tc(100 + i)], raw=None) for i in range(4)
+        ] + [
+            # Step 13: completion
+            MagicMock(content=None, tool_calls=[tc_complete], raw=None),
+        ]
+        mock_dp.side_effect = [
+            [(f"tc{i}", '{"content": "ok"}')] for i in range(8)
+        ] + [
+            [(f"tc{100 + i}", '{"content": "ok"}')] for i in range(4)
+        ]
+        mock_dispatch_tool.return_value = '{"ok": true}'
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            runtime=mock_runtime,
+            task_text="do something",
+        )
+
+        # Check that there is exactly 1 checkpoint message (at step 8, not again at step 12)
+        last_messages = mock_call_llm.call_args_list[-1][0][1]
+        checkpoint_msgs = [
+            m for m in last_messages
+            if m.get("role") == "user" and "<checkpoint>" in m.get("content", "")
+        ]
+        assert len(checkpoint_msgs) == 1
+
+
+class TestRepetitionDetection:
+    """test_repetition_detection: same tool+args 3x -- checkpoint triggered by repetition."""
+
+    @patch("agent.loop.dispatch_tool")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    def test_repetition_detection(
+        self, mock_call_llm, mock_run_scout, mock_dp, mock_dispatch_tool,
+    ):
+        from agent.loop import run_agent
+
+        mock_runtime = _make_mock_runtime()
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        # Same tool call 3 times
+        tc_same = ToolCall(id="tc1", name="read_file", arguments={"path": "/same/file.md"})
+        tc_complete = ToolCall(
+            id="tc_done", name="report_completion",
+            arguments={"answer": "done", "grounding_refs": [], "steps": [], "code": "OUTCOME_OK"},
+        )
+
+        mock_call_llm.side_effect = [
+            # Steps 1-3: same tool call repeated
+            MagicMock(content=None, tool_calls=[tc_same], raw=None),
+            MagicMock(content=None, tool_calls=[tc_same], raw=None),
+            MagicMock(content=None, tool_calls=[tc_same], raw=None),
+            # Step 4: completion after checkpoint
+            MagicMock(content=None, tool_calls=[tc_complete], raw=None),
+        ]
+        mock_dp.side_effect = [
+            [("tc1", '{"content": "ok"}')] for _ in range(3)
+        ]
+        mock_dispatch_tool.return_value = '{"ok": true}'
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            runtime=mock_runtime,
+            task_text="do something",
+        )
+
+        # A checkpoint should have been triggered by repetition (before 8 steps)
+        last_messages = mock_call_llm.call_args_list[-1][0][1]
+        checkpoint_msgs = [
+            m for m in last_messages
+            if m.get("role") == "user" and "<checkpoint>" in m.get("content", "")
+        ]
+        assert len(checkpoint_msgs) >= 1
+
+
+class TestRepetitionWithDifferentArgs:
+    """test_repetition_with_different_args: same tool, different args -- no checkpoint."""
+
+    @patch("agent.loop.dispatch_tool")
+    @patch("agent.loop.dispatch_parallel")
+    @patch("agent.loop.run_scout")
+    @patch("agent.loop.call_llm")
+    def test_repetition_with_different_args(
+        self, mock_call_llm, mock_run_scout, mock_dp, mock_dispatch_tool,
+    ):
+        from agent.loop import run_agent
+
+        mock_runtime = _make_mock_runtime()
+        mock_run_scout.return_value = _make_scout_summary_mock()
+
+        # Same tool name but different arguments
+        tc1 = ToolCall(id="tc1", name="read_file", arguments={"path": "/file1.md"})
+        tc2 = ToolCall(id="tc2", name="read_file", arguments={"path": "/file2.md"})
+        tc3 = ToolCall(id="tc3", name="read_file", arguments={"path": "/file3.md"})
+        tc_complete = ToolCall(
+            id="tc_done", name="report_completion",
+            arguments={"answer": "done", "grounding_refs": [], "steps": [], "code": "OUTCOME_OK"},
+        )
+
+        mock_call_llm.side_effect = [
+            # Steps 1-3: same tool, different args
+            MagicMock(content=None, tool_calls=[tc1], raw=None),
+            MagicMock(content=None, tool_calls=[tc2], raw=None),
+            MagicMock(content=None, tool_calls=[tc3], raw=None),
+            # Step 4: completion
+            MagicMock(content=None, tool_calls=[tc_complete], raw=None),
+        ]
+        mock_dp.side_effect = [
+            [("tc1", '{"content": "ok"}')],
+            [("tc2", '{"content": "ok"}')],
+            [("tc3", '{"content": "ok"}')],
+        ]
+        mock_dispatch_tool.return_value = '{"ok": true}'
+
+        run_agent(
+            executor_model="openai/gpt-4.1",
+            runtime=mock_runtime,
+            task_text="do something",
+        )
+
+        # Only 4 call_llm calls (4 steps)
+        assert mock_call_llm.call_count == 4
+        # No checkpoint injected (different args = not stuck)
+        last_messages = mock_call_llm.call_args_list[-1][0][1]
+        checkpoint_msgs = [
+            m for m in last_messages
+            if m.get("role") == "user" and "<checkpoint>" in m.get("content", "")
+        ]
+        assert len(checkpoint_msgs) == 0

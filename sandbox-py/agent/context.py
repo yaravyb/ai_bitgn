@@ -24,6 +24,31 @@ COMPACT_SENTINEL: str = "__COMPACT_SENTINEL__"
 # Configuration
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class ResilienceConfig:
+    """Configuration for weak-model resilience mechanisms.
+
+    All parameters have sensible defaults and are overridable via environment
+    variables through the ``from_env()`` factory method.  Frozen and immutable
+    -- constructed once per ``run_agent`` call.
+    """
+
+    empty_retry_max: int = 3
+    text_tool_max: int = 2
+    error_threshold: int = 3
+    replan_interval: int = 8
+
+    @classmethod
+    def from_env(cls) -> ResilienceConfig:
+        """Create a ResilienceConfig reading from environment variables with fallback to defaults."""
+        return cls(
+            empty_retry_max=int(os.environ.get("RESILIENCE_EMPTY_RETRY_MAX", "3")),
+            text_tool_max=int(os.environ.get("RESILIENCE_TEXT_TOOL_MAX", "2")),
+            error_threshold=int(os.environ.get("RESILIENCE_ERROR_THRESHOLD", "3")),
+            replan_interval=int(os.environ.get("RESILIENCE_REPLAN_INTERVAL", "8")),
+        )
+
+
 @dataclass
 class ContextConfig:
     """Configuration for the three-layer context compression pipeline.

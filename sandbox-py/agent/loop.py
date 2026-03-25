@@ -33,12 +33,111 @@ from agent.tracker import GroundingTracker
 from agent.tools import get_tool_schemas
 from agent.context import (
     ContextConfig,
+    ResilienceConfig,
     estimate_tokens,
     micro_compact,
     COMPACT_SENTINEL,
 )
 
+from dataclasses import dataclass, field
+
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Resilience data structures (weak-model-resilience)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ResilienceState:
+    """Mutable counters for weak-model resilience mechanisms.
+
+    Constructed once per ``run_agent`` call, alongside ``VerificationState``.
+    """
+
+    consecutive_empty: int = 0
+    consecutive_text_tool: int = 0
+    consecutive_errors: int = 0
+    completion_submitted: bool = False
+    steps_since_completion_attempt: int = 0
+    recent_tool_calls: list = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Resilience helper functions (weak-model-resilience)
+# ---------------------------------------------------------------------------
+
+# Distinguishing parameter combinations for tool-call detection.
+# Each entry: (required_keys_frozenset, tool_name)
+_TOOL_PARAM_COMBOS: list[tuple[frozenset[str], str]] = [
+    (frozenset({"path", "content"}), "write_file"),
+    (frozenset({"path", "level"}), "tree"),
+    (frozenset({"path", "number"}), "read_file"),
+    (frozenset({"path", "start_line"}), "read_file"),
+    (frozenset({"pattern"}), "search"),
+    (frozenset({"name", "root"}), "find"),
+    (frozenset({"name", "kind"}), "find"),
+]
+
+
+def _looks_like_tool_call(text: str) -> bool:
+    """Return True if *text* looks like a tool-call JSON dict (not a completion).
+
+    Pre-check: return False immediately if text does not start with ``{`` and
+    end with ``}`` (zero overhead for non-JSON text).
+    """
+    stripped = text.strip()
+    if not stripped.startswith("{") or not stripped.endswith("}"):
+        return False
+
+    try:
+        data = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        return False
+
+    if not isinstance(data, dict):
+        return False
+
+    # Dicts with "answer" key are handled by _try_extract_completion
+    if "answer" in data:
+        return False
+
+    keys = set(data.keys())
+    for combo, _tool_name in _TOOL_PARAM_COMBOS:
+        if combo.issubset(keys):
+            return True
+
+    return False
+
+
+def _detect_tool_name(text: str) -> str | None:
+    """Return the most likely tool name for a text-based tool call, or None."""
+    stripped = text.strip()
+    if not stripped.startswith("{") or not stripped.endswith("}"):
+        return None
+
+    try:
+        data = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    keys = set(data.keys())
+    for combo, tool_name in _TOOL_PARAM_COMBOS:
+        if combo.issubset(keys):
+            return tool_name
+
+    return None
+
+
+def _build_tool_name_list(runtime_type: str = "mini") -> str:
+    """Return a comma-separated string of available tool names."""
+    schemas = get_tool_schemas(runtime_type)
+    names = [s["function"]["name"] for s in schemas]
+    return ", ".join(names)
+
 
 CLI_RED = "\x1B[31m"
 CLI_GREEN = "\x1B[32m"
@@ -484,10 +583,55 @@ def run_agent(
     # Verification state (self-verification feature)
     verification_state = VerificationState()
 
+    # Resilience state (weak-model-resilience)
+    resilience_config = ResilienceConfig.from_env()
+    resilience_state = ResilienceState()
+
     step_num = 0
     for step in range(30):  # 30 step limit (Req 12.1)
         step_num = step + 1
         print(f"\nStep {step_num}... ", end="", flush=True)
+
+        # --- Point E: Re-planning checkpoint (Req 14, 15, 16) ---
+        _replan_triggered = False
+        if resilience_state.recent_tool_calls:
+            # Repetition detection: last 3 entries identical
+            if len(resilience_state.recent_tool_calls) >= 3:
+                last3 = resilience_state.recent_tool_calls[-3:]
+                if len(set(last3)) == 1:
+                    _replan_triggered = True
+                    log.info("Re-plan: repetition detected at step %d (tool=%s)", step_num, last3[0][0])
+        if not _replan_triggered and resilience_state.steps_since_completion_attempt >= resilience_config.replan_interval:
+            _replan_triggered = True
+            log.info("Re-plan: progress stall at step %d (%d steps since last completion attempt)",
+                     step_num, resilience_state.steps_since_completion_attempt)
+
+        if _replan_triggered:
+            # Step 1: Auto-compact if context is substantial (Req 16)
+            if estimate_tokens(messages) > 20_000:
+                messages[:] = _apply_auto_compact(
+                    messages, context_config, executor_model, trace_metadata,
+                    reason="replan_recovery",
+                )
+                log.info("Re-plan: auto-compacted context at step %d", step_num)
+                print(f"  [replan] auto-compacted context")
+
+            # Step 2: Inject checkpoint prompt (Req 14) -- NO tool names (Req 17)
+            checkpoint_msg = (
+                "<checkpoint>\n"
+                f"You have been working for {resilience_state.steps_since_completion_attempt} steps without completing.\n"
+                "Step back and assess:\n"
+                "1. What have you accomplished so far?\n"
+                "2. What remains to be done?\n"
+                "3. Are you stuck? If so, try a different approach.\n"
+                "4. If the task is done, call report_completion.\n"
+                "</checkpoint>"
+            )
+            messages.append({"role": "user", "content": checkpoint_msg})
+            resilience_state.steps_since_completion_attempt = 0
+            resilience_state.recent_tool_calls.clear()
+            log.info("Re-plan checkpoint injected at step %d", step_num)
+            print(f"  [replan] checkpoint injected")
 
         # Layer 2: Micro-compact old tool results
         cleared_count, chars_saved = _apply_micro_compact(messages, context_config)
@@ -507,6 +651,9 @@ def run_agent(
 
         tool_schemas = get_tool_schemas(runtime.runtime_type)
         response = call_llm(executor_model, messages, tools=tool_schemas, metadata=trace_metadata)
+
+        # Increment steps_since_completion_attempt (Req 14)
+        resilience_state.steps_since_completion_attempt += 1
 
         # Build assistant message
         assistant_msg: dict[str, Any] = {"role": "assistant", "content": response.content}
@@ -531,6 +678,9 @@ def run_agent(
 
         # Print tool calls with arguments
         if response.tool_calls:
+            # Reset consecutive_empty on any response with tool calls
+            resilience_state.consecutive_empty = 0
+
             for tc in response.tool_calls:
                 args_preview = json.dumps(tc.arguments)
                 if len(args_preview) > 150:
@@ -539,14 +689,42 @@ def run_agent(
         else:
             # LLM responded with text only -- no tool calls.
             if response.content and response.content.strip():
+                # Reset consecutive_empty on non-empty text
+                resilience_state.consecutive_empty = 0
                 raw_text = response.content.strip()
 
                 # Weaker models sometimes output tool calls as text instead of
                 # using the tool mechanism. Extract the answer if possible.
                 extracted = _try_extract_completion(raw_text)
-                text_answer = extracted["answer"] if extracted else raw_text
                 if extracted:
+                    # Valid completion extracted -- reset text-tool counter
+                    resilience_state.consecutive_text_tool = 0
+                    text_answer = extracted["answer"]
                     print(f"  (extracted answer from structured text)")
+                else:
+                    # --- Point B: Text-as-Tool Detector (Req 3, 4) ---
+                    if _looks_like_tool_call(raw_text):
+                        resilience_state.consecutive_text_tool += 1
+                        if resilience_state.consecutive_text_tool <= resilience_config.text_tool_max:
+                            detected_tool = _detect_tool_name(raw_text) or "unknown"
+                            log.info("Text-as-tool detected: tool=%s, text=%s",
+                                     detected_tool, raw_text[:120])
+                            tool_names = _build_tool_name_list(runtime.runtime_type)
+                            correction_msg = (
+                                f"You wrote a tool call as plain text instead of using the "
+                                f"function calling mechanism. Please invoke the '{detected_tool}' "
+                                f"tool properly using function calling. Do not output JSON "
+                                f"directly in your response. Available tools: {tool_names}."
+                            )
+                            messages.append({"role": "user", "content": correction_msg})
+                            print(f"  [resilience] text-as-tool correction injected (tool={detected_tool})")
+                            continue  # Next iteration
+                        else:
+                            # Exhausted re-prompts, fall through to auto-submit
+                            resilience_state.consecutive_text_tool = 0
+                            log.info("Text-as-tool max exceeded, falling through to auto-submit")
+
+                    text_answer = raw_text
 
                 # --- VERIFICATION INTERCEPTION: text-only path (Task 6.2) ---
                 if should_verify(verification_state, context_config.verification_enabled,
@@ -585,6 +763,7 @@ def run_agent(
                         "steps": extracted.get("steps", []) if extracted else [],
                         "code": extracted.get("code", "OUTCOME_OK") if extracted else "OUTCOME_OK",
                     }
+                    resilience_state.completion_submitted = True
                     dispatch_tool(
                         runtime, "report_completion", submit_args,
                         tracker, protected_files, skill_loader,
@@ -618,6 +797,7 @@ def run_agent(
                 # Empty/whitespace LLM response during verification cycle.
                 # Submit the captured answer rather than dropping it.
                 print(f"  (empty response during verification -- submitting captured answer)")
+                resilience_state.completion_submitted = True
                 dispatch_tool(
                     runtime, "report_completion",
                     {"answer": verification_state.original_answer, "grounding_refs": [],
@@ -626,6 +806,36 @@ def run_agent(
                     context_config=context_config,
                 )
                 print(f"  Auto-submitted answer: {verification_state.original_answer[:120]}")
+            else:
+                # --- Point A: Empty Response Handler (Req 1, 2) ---
+                resilience_state.consecutive_empty += 1
+                if resilience_state.consecutive_empty < resilience_config.empty_retry_max:
+                    log.warning("Empty response at step %d (retry %d/%d)",
+                                step_num, resilience_state.consecutive_empty,
+                                resilience_config.empty_retry_max)
+                    tool_names = _build_tool_name_list(runtime.runtime_type)
+                    nudge_msg = (
+                        "Your previous response was empty. Continue working on the task "
+                        f"using the available tools: {tool_names}. "
+                        "Do not repeat yourself -- take the next action."
+                    )
+                    messages.append({"role": "user", "content": nudge_msg})
+                    print(f"  [resilience] empty response nudge injected "
+                          f"(retry {resilience_state.consecutive_empty}/{resilience_config.empty_retry_max})")
+                    continue  # Next iteration (consumes a step)
+                else:
+                    log.warning("Empty response retry exhausted at step %d", step_num)
+                    resilience_state.completion_submitted = True
+                    dispatch_tool(
+                        runtime, "report_completion",
+                        {"answer": "Agent loop ended: model stopped responding after "
+                         f"{resilience_config.empty_retry_max} empty responses.",
+                         "grounding_refs": [], "steps": [],
+                         "code": "OUTCOME_ERR_INTERNAL"},
+                        tracker, protected_files, skill_loader,
+                        context_config=context_config,
+                    )
+                    print(f"  [resilience] empty response fallback submitted")
             break
 
         # --- VERIFICATION INTERCEPTION: tool-call path (Task 6.1) ---
@@ -648,6 +858,7 @@ def run_agent(
             )
 
             # Append tool results, detect compact sentinel
+            # --- Point C: Error Recovery Hint Injector (Req 5) ---
             for tool_call_id, result_text in results:
                 if result_text == COMPACT_SENTINEL:
                     compact_requested = True
@@ -657,15 +868,51 @@ def run_agent(
                         "content": "Compacting context...",
                     })
                 else:
+                    # Check for errors in tool results (Req 5)
+                    content_to_append = result_text
+                    if '"error"' in result_text:
+                        resilience_state.consecutive_errors += 1
+                        if "not_found" in result_text.lower() or "NOT_FOUND" in result_text:
+                            # Extract path from error for hint
+                            hint = (
+                                "\n\n[Hint: The file was not found. Try using list_dir or "
+                                "tree on the parent directory to find the correct filename.]"
+                            )
+                            content_to_append = result_text + hint
+                            log.info("Error recovery hint injected for NOT_FOUND (tool_call=%s)", tool_call_id)
+                    else:
+                        resilience_state.consecutive_errors = 0
+
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call_id,
-                        "content": result_text,
+                        "content": content_to_append,
                     })
                 preview = result_text[:200].replace("\n", "\\n")
                 if len(result_text) > 200:
                     preview += "..."
                 print(f"  {CLI_GREEN}result({tool_call_id}){CLI_CLR}: {preview}")
+
+            # Error escalation (Req 5)
+            if resilience_state.consecutive_errors >= resilience_config.error_threshold:
+                tool_names = _build_tool_name_list(runtime.runtime_type)
+                escalation_msg = (
+                    f"You have encountered {resilience_state.consecutive_errors} "
+                    f"consecutive errors. Consider an alternative approach. "
+                    f"Available tools: {tool_names}."
+                )
+                messages.append({"role": "user", "content": escalation_msg})
+                resilience_state.consecutive_errors = 0
+                log.info("Error escalation message injected after %d consecutive errors",
+                         resilience_config.error_threshold)
+                print(f"  [resilience] error escalation injected")
+
+            # Track tool calls in rolling window (Req 15)
+            for tc in other_tool_calls:
+                args_hash = hash(json.dumps(tc.arguments, sort_keys=True))
+                resilience_state.recent_tool_calls.append((tc.name, args_hash))
+                if len(resilience_state.recent_tool_calls) > 5:
+                    resilience_state.recent_tool_calls.pop(0)
 
         # Handle compact sentinel
         if compact_requested:
@@ -723,6 +970,8 @@ def run_agent(
                 continue  # Next iteration of executor loop
             else:
                 # Dispatch report_completion normally (verification disabled or max attempts reached)
+                resilience_state.completion_submitted = True
+                resilience_state.steps_since_completion_attempt = 0
                 dispatch_tool(
                     runtime, "report_completion", completion_tc.arguments,
                     tracker, protected_files, skill_loader,
@@ -769,12 +1018,32 @@ def run_agent(
                 print(f"\n{CLI_GREEN}Agent completed.{CLI_CLR}")
                 break
 
-    # Fallback: if the loop ended while verification was in progress
-    # (step limit reached or empty response), ensure an answer is submitted.
-    if verification_state.in_verification and verification_state.original_answer:
-        # Check if an answer was already submitted by inspecting the loop exit
-        # (this fallback only runs if the for-loop exhausted its range)
-        log.info("Loop ended during verification -- original answer may have been submitted as fallback")
+    # --- Point D: Post-loop guard -- guaranteed answer submission (Req 13) ---
+    if not resilience_state.completion_submitted:
+        log.warning("Loop exited without report_completion (step=%d)", step_num)
+        if verification_state.in_verification and verification_state.original_answer:
+            # Submit the captured original answer from verification state
+            dispatch_tool(
+                runtime, "report_completion",
+                {"answer": verification_state.original_answer,
+                 "grounding_refs": [], "steps": [],
+                 "code": verification_state.original_code},
+                tracker, protected_files, skill_loader,
+                context_config=context_config,
+            )
+            print(f"  [guard] submitted captured verification answer")
+        else:
+            # Generic fallback
+            dispatch_tool(
+                runtime, "report_completion",
+                {"answer": "Agent loop ended without producing an answer.",
+                 "grounding_refs": [], "steps": [],
+                 "code": "OUTCOME_ERR_INTERNAL"},
+                tracker, protected_files, skill_loader,
+                context_config=context_config,
+            )
+            print(f"  [guard] submitted fallback answer (OUTCOME_ERR_INTERNAL)")
+        resilience_state.completion_submitted = True
 
     print(f"\n--- Executor finished after {step_num} steps. "
           f"Tracker: {len(tracker)} files ---")
