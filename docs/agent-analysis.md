@@ -1,6 +1,6 @@
 # AI Agent Implementation Analysis
 
-> Living document — updated as the agent evolves. Last reviewed: 2026-03-25 (weak-model-resilience update).
+> Living document — updated as the agent evolves. Last reviewed: 2026-03-26 (persistent-task-planner + smart micro-compact update).
 
 ---
 
@@ -14,14 +14,14 @@ The codebase follows a strict **leaf/orchestrator pattern**: leaf modules have z
 
 | Module | Type | Role | Imports from agent/ |
 |---|---|---|---|
-| `loop.py` | Orchestrator | Top-level lifecycle: scout -> constraint extraction -> executor loop. Only module permitted to import from all other agent/ modules. Constructs `DispatchContext`, manages verification state and resilience state (`ResilienceState`), applies context compression. Five-point weak-model resilience system with `_looks_like_tool_call()`, `_detect_tool_name()`, `_build_tool_name_list()` helpers. | scout, llm, dispatch, verify, prompt, skills, tracker, tools, context |
+| `loop.py` | Orchestrator | Top-level lifecycle: scout -> constraint extraction -> executor loop. Only module permitted to import from all other agent/ modules. Constructs `DispatchContext`, manages verification state and resilience state (`ResilienceState`), applies context compression. Five-point weak-model resilience system with `_looks_like_tool_call()`, `_detect_tool_name()`, `_build_tool_name_list()` helpers. Plan-aware checkpoint (`_read_plan_for_checkpoint`) and verification (`_read_plan_for_verification`) helpers read plan state from local storage. Initialises plan storage via `init_plan_storage(trace_id)`. Verification interception resets replan timer to prevent post-completion damage. | scout, llm, dispatch, verify, prompt, skills, tracker, tools, context |
 | `scout.py` | Orchestrator | Two-phase workspace discovery: deterministic bootstrap (tree + meta-file reads) followed by LLM-driven explorer (tool-use loop with read-only tool subset). | llm, dispatch, tracker, tools, prompt, context |
-| `dispatch.py` | Leaf | Tool dispatch: maps tool names to VM operations. Defines `DispatchContext`, `TaskConstraints`, `TemplateGuardConfig` dataclasses. Contains standalone guard functions (`_check_basename_guard`, `_check_scope_guard`, `_check_template_guard`). Supports concurrent execution via `dispatch_parallel()`. | tracker, llm (ToolCall type only), context |
+| `dispatch.py` | Leaf | Tool dispatch: maps tool names to VM operations. Defines `DispatchContext`, `TaskConstraints`, `TemplateGuardConfig` dataclasses. Contains standalone guard functions (`_check_basename_guard`, `_check_scope_guard`, `_check_template_guard`). Supports concurrent execution via `dispatch_parallel()`. Hosts persistent plan storage (`init_plan_storage`, `get_plan_file_path`, `_read_plan`) on the host filesystem (`/tmp/ai-bitgn-plans/{uuid}/`) — separate from the sandbox VM to avoid polluting benchmark-scored filesystems. Plan handlers: `_handle_plan_create`, `_handle_plan_status`, `_handle_plan_step_done` (batch indices), `_handle_plan_step_skip`, `_handle_plan_note`. | tracker, llm (ToolCall type only), context |
 | `verify.py` | Leaf | Self-verification: pure functions and dataclasses (`VerificationState`, `VerificationOutcome`, `should_verify`, `build_verification_prompt`, `detect_verification_outcome`). Supports externalized frame template via `frame_template` parameter. | None (zero agent/ imports) |
 | `prompt.py` | Leaf | System prompt builder: pure structural assembler. Accepts `embedded_skill_bodies` and `scout_summary` parameters. All behavioral rules come from skill files, not hardcoded here. | None (zero agent/ imports) |
-| `context.py` | Leaf | Context management: `ContextConfig` and `ResilienceConfig` dataclasses, `estimate_tokens()`, `micro_compact()`, `truncate_tool_result()`. Pure functions implementing the three-layer compression pipeline. `ResilienceConfig` provides env-configurable thresholds for the weak-model resilience system. | None (zero agent/ imports) |
+| `context.py` | Leaf | Context management: `ContextConfig` and `ResilienceConfig` dataclasses, `estimate_tokens()`, `micro_compact()`, `truncate_tool_result()`. Pure functions implementing the three-layer compression pipeline. Smart micro-compact (`_summarize_tool_result`, `_extract_file_summary`) replaces old tool results with format-aware summaries instead of deleting them. `ResilienceConfig` provides env-configurable thresholds for the weak-model resilience system. | None (zero agent/ imports) |
 | `tracker.py` | Leaf | Grounding reference tracker: `GroundingTracker` class with thread-safe `add`/`contains`/`merge`/`all` operations. Uses `threading.Lock` for concurrent access safety. | None (zero agent/ imports) |
-| `tools.py` | Leaf | Tool schema definitions: OpenAI-compatible function calling schemas (`TOOL_SCHEMAS`, `SCOUT_TOOL_SCHEMAS`). `get_tool_schemas(runtime_type)` returns PCM-extended schemas when needed. | None (zero agent/ imports) |
+| `tools.py` | Leaf | Tool schema definitions: OpenAI-compatible function calling schemas (`TOOL_SCHEMAS`, `SCOUT_TOOL_SCHEMAS`). 14 base tools (including 5 plan tools: `plan_create`, `plan_step_done`, `plan_step_skip`, `plan_status`, `plan_note`). `get_tool_schemas(runtime_type)` returns PCM-extended schemas when needed. | None (zero agent/ imports) |
 | `skills.py` | Leaf | Skill loader: reads `SKILL.md` files with YAML frontmatter. Provides Layer 1 metadata (descriptions) and Layer 2 body content. | None (zero agent/ imports) |
 | `runtime.py` | Leaf | Runtime adapters: `RuntimeAdapter` Protocol, `MiniRuntime`, `PcmRuntime`. Unified interface over Mini and PCM VMs with SDK v2 parameter support. | None (imports only from bitgn SDK) |
 | `llm.py` | Leaf | LLM client: wraps LiteLLM's completion API. Provider-agnostic access with retry logic (3 retries, exponential backoff). `ToolCall` and `LLMResponse` dataclasses. | None (zero agent/ imports) |
@@ -116,7 +116,7 @@ Every module has dedicated tests. `conftest.py` handles pre-mocking of `bitgn` a
 A defense-in-depth strategy against unbounded context growth, implemented as three independent layers in `context.py` (pure functions) with orchestration in `loop.py`:
 
 - **Layer 1 — Tool result truncation**: Applied at the `dispatch_tool()` boundary. JSON-aware truncation preserves the JSON envelope while cutting the largest string value within the character budget. Configurable limit (default 10K chars). `report_completion` is exempt.
-- **Layer 2 — Micro-compact**: A zero-cost pass before every `call_llm()` that replaces old tool result content with `"[Previous tool result cleared]"`. Batch-based detection preserves the N most recent tool-use turns (default 3). Never removes messages or `tool_call_id` linkage.
+- **Layer 2 — Smart micro-compact**: A zero-cost pass before every `call_llm()` that replaces old tool results with **format-aware summaries** instead of deleting them. `_summarize_tool_result()` dispatches to `_extract_file_summary()` which handles five content types: JSON records (extracts scalar fields like IDs, names, emails, dates; drops arrays and body text), emails (extracts From/Subject/To headers), markdown (skips frontmatter and HTML comments, takes title + first meaningful line), line-numbered content (strips `"     1\t..."` prefixes first), and generic text (first 150 chars). Batch-based detection preserves the N most recent tool-use turns (default 10). Never removes messages or `tool_call_id` linkage. The model sees `[compacted] read_file "outbox/seq.json": {"id": 84845}` instead of `[Previous tool result cleared]`, eliminating the need to re-read files.
 - **Layer 3 — Auto-compact**: When estimated tokens exceed a configurable threshold (default 80K), an LLM summarization call compresses the entire conversation into [system, summary, ack]. Pre-compaction transcripts are saved as JSONL for audit/debugging.
 
 Additionally exposes a `compact` tool that lets the LLM trigger summarization on-demand (sentinel pattern, same as `report_completion`). Scout phase uses Layer 1 + Layer 2 only (no auto-compact), with independently tunable settings.
@@ -155,7 +155,7 @@ Behavioral rules live in skill markdown files (`SKILL.md` with YAML frontmatter)
 
 **Key design decisions**:
 - `prompt.py` is a pure structural assembler -- zero behavioral content. All rules come from skill files.
-- `verification-frame` externalizes the verification prompt structure (`<verification>` tags, section headings, instruction text) into a skill template with `{{ANSWER}}`, `{{CODE}}`, `{{POLICY_SECTION}}`, `{{CHECKLIST_SECTION}}`, `{{SOURCE_BASENAME_SECTION}}` placeholders. When the skill file is missing, `build_verification_prompt()` falls back to the inline frame (backward compatible).
+- `verification-frame` externalizes the verification prompt structure (`<verification>` tags, section headings, instruction text) into a skill template with `{{ANSWER}}`, `{{CODE}}`, `{{POLICY_SECTION}}`, `{{CHECKLIST_SECTION}}`, `{{SOURCE_BASENAME_SECTION}}`, `{{PLAN_STATUS_SECTION}}` placeholders. When the skill file is missing, `build_verification_prompt()` falls back to the inline frame (backward compatible). The `plan_status` parameter injects plan completion status into the verification prompt so the verifier can check whether all planned steps were completed.
 - Always-on skills are loaded unconditionally; on-demand skills are catalog-only until the LLM explicitly requests them.
 
 **Status**: Enhanced (added `verification-frame` skill with placeholder substitution).
@@ -317,7 +317,35 @@ A five-point resilience mechanism in `loop.py` that handles three weak-model fai
 
 **Zero-overhead design**: When the model behaves correctly (valid tool calls, valid text responses), no resilience logic executes beyond lightweight counter increments and a boolean check at loop exit. No extra LLM calls, no string parsing, no message injections.
 
-**Status**: New (spec: weak-model-resilience).
+**Verification-replan collision fix**: Verification interception now resets `steps_since_completion_attempt` at both interception points (text-only auto-submit and `report_completion`). This prevents the replan checkpoint from firing during verification cycles, which previously caused post-completion damage (spurious `mkdir`, double-writes to `seq.json`).
+
+**Status**: Enhanced (spec: weak-model-resilience + persistent-task-planner).
+
+### 17. Persistent Task Planner
+
+A plan-on-disk system that lets the model decompose tasks into steps and save key facts, with all state stored on the **host filesystem** (`/tmp/ai-bitgn-plans/{uuid}/steps.json`) rather than the sandbox VM. Plans survive context compression because they exist outside the conversation.
+
+**Five plan tools**:
+
+| Tool | Purpose | Key Design |
+|---|---|---|
+| `plan_create` | Decompose task into discrete steps | Writes `steps.json` on host; overwrites existing plan |
+| `plan_step_done` | Mark steps completed | Accepts single int or **batch array** (`[0, 1, 2]`) to reduce step overhead |
+| `plan_step_skip` | Mark steps unnecessary | Skipped steps excluded from incomplete count in summary |
+| `plan_status` | Read plan from disk | Used after context compression to reorient |
+| `plan_note` | Save key facts (IDs, emails, dates) | Appended to `notes` array in plan JSON; surfaced in replan checkpoints |
+
+**Integration points**:
+
+- **Replan checkpoint (Point E)**: `_read_plan_for_checkpoint()` reads the plan from disk and injects a `<plan-status>` block showing step completion markers (`[DONE]`, `[PENDING]`, `[SKIPPED]`), saved notes, and revision guidance. When all steps are done, suggests `report_completion`.
+- **Pre-completion verification**: `_read_plan_for_verification()` injects plan status into the verification prompt via `{{PLAN_STATUS_SECTION}}` placeholder, showing incomplete steps with review instructions.
+- **Execution-discipline skill**: Updated to teach `plan_create` (persist step list), `plan_step_done` (batch marking), `plan_note` (save key facts immediately after reads), and `plan_status` (review before completion).
+
+**Host-side storage design**: Plans are stored under `/tmp/ai-bitgn-plans/{uuid}/` using the `trace_id` generated at `run_agent()` start. This prevents plan artifacts from appearing in the sandbox VM filesystem, which is diff-scored by benchmarks. `init_plan_storage()` creates the directory; all plan handlers use `get_plan_file_path()` and Python's built-in file I/O (no VM read/write, no protobuf).
+
+**Summary format**: Adapts to skipped steps — `"3/5 steps completed"` vs. `"3/4 actionable steps completed, 1 skipped"` (denominator = total - skipped).
+
+**Status**: New (spec: persistent-task-planner).
 
 ---
 
@@ -425,12 +453,12 @@ Every `run_agent()` starts fresh. Scout re-explores the workspace even if unchan
 | Safety              | Strong   | Protected files, template guards, injection protocol, basename/scope guards |
 | Provider flexibility| Strong   | LiteLLM-based, config-driven                                           |
 | Scout intelligence  | Strong   | Task-aware LLM explorer with structured analysis                       |
-| Context management  | Strong   | Three-layer compression pipeline (truncation, micro-compact, auto-compact) |
+| Context management  | Strong   | Three-layer compression: truncation, **smart micro-compact** (format-aware summaries), auto-compact; persistent plan-on-disk |
 | Self-verification   | Strong   | Pre-submission verification loop with policy-aware prompt, text extraction, fallbacks |
 | Observability       | Partial  | LLM calls traced; Langfuse host reachability check; tool dispatch ops not traced |
-| Error handling      | Strong   | 5-point weak-model resilience (empty retry, text-as-tool, error recovery, post-loop guard, re-planning); LLM retries; verification fallbacks |
+| Error handling      | Strong   | 5-point resilience + persistent plan tools; verification-replan collision fix; smart micro-compact preserves key facts |
 | Scalability         | Moderate | Context managed, but no caching layer                                  |
-| Testability         | Strong   | Comprehensive TDD suite (738+ tests); full guard coverage; resilience tests |
+| Testability         | Strong   | Comprehensive TDD suite (812 tests); full guard coverage; resilience + plan tool tests |
 | Robustness          | Strong   | Thread-safe tracker, frozen DispatchContext, 67 guard tests             |
 | SDK integration     | Strong   | SDK v2 line-range reads/writes, depth-limited tree, all PCM tools      |
 | Outcome vocabulary  | Strong   | All 5 PCM outcome codes, self-documenting enum names                   |
@@ -448,3 +476,4 @@ Every `run_agent()` starts fresh. Scout re-explores the workspace even if unchan
 | 2026-03-24 | Full PCM outcome codes (5 codes, self-documenting names); embedded skills system (security-posture, execution-discipline, self-verification); programmatic dispatch guards (basename mismatch, scope constraint, template protection); SDK v2 upgrade (line-range read/write, depth-limited tree); prompt.py made pure structural assembler; injection response protocol; spec `agent-guard-architecture` generated for remaining gaps (globals→context, regex→LLM, tests); test count 501→534 |
 | 2026-03-25 | Spec `agent-guard-architecture` fully implemented (Tasks 1-8): thread-safe tracker (Lock), frozen DispatchContext (eliminates globals), scout SDK v2 depth-limited tree, externalized verification frame, hybrid LLM constraint extraction (regex fast-path + LLM fallback), configurable template guard, 67 guard tests, weaknesses #6/#11/#12/#13 addressed; test count 534→715+ |
 | 2026-03-25 | Spec `weak-model-resilience` fully implemented (Tasks 1-11): 5-point resilience system (empty response retry, text-as-tool detection, error recovery hints, post-loop guard, re-planning checkpoints); ResilienceConfig/ResilienceState dataclasses; _looks_like_tool_call/_detect_tool_name helpers; 37 new tests; weakness #1 addressed; error handling rating Moderate→Strong; test count 715→738+ |
+| 2026-03-26 | Spec `persistent-task-planner` fully implemented with iterative benchmark-driven fixes: 5 plan tools (plan_create, plan_step_done with batch indices, plan_step_skip, plan_status, plan_note) on host-side local storage (`/tmp/ai-bitgn-plans/{uuid}/`); smart micro-compact replaces destructive deletion with format-aware summaries (`_summarize_tool_result`, `_extract_file_summary` — handles JSON records, emails, markdown, line-numbered content); micro_compact_keep_batches 5→10; verification-replan collision fix (reset replan timer on verification interception to prevent post-completion damage); `{{PLAN_STATUS_SECTION}}` placeholder in verification-frame; execution-discipline skill updated with plan tool guidance and softened OUTCOME_NONE_CLARIFICATION; test count 738→812 |
