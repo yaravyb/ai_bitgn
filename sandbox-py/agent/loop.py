@@ -19,7 +19,7 @@ from typing import Any
 
 from agent.scout import run_scout, ScoutSummary, ScoutConfig
 from agent.llm import call_llm, LLMResponse
-from agent.dispatch import dispatch_parallel, dispatch_tool, DispatchContext, TemplateGuardConfig, TaskConstraints
+from agent.dispatch import dispatch_parallel, dispatch_tool, DispatchContext, TemplateGuardConfig, TaskConstraints, init_plan_storage, get_plan_file_path
 from agent.verify import (
     VerificationState,
     VerificationOutcome,
@@ -61,6 +61,110 @@ class ResilienceState:
     completion_submitted: bool = False
     steps_since_completion_attempt: int = 0
     recent_tool_calls: list = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Plan helpers (persistent-task-planner)
+# ---------------------------------------------------------------------------
+
+def _read_plan_for_checkpoint() -> str | None:
+    """Read plan from local storage and format for checkpoint injection.
+
+    Returns a formatted string with plan status and revision guidance,
+    or None if no plan exists.
+    Errors are silently caught (fail-open: checkpoint works without plan).
+    """
+    plan_path = get_plan_file_path()
+    if not os.path.isfile(plan_path):
+        return None
+    try:
+        with open(plan_path, encoding="utf-8") as f:
+            plan = json.load(f)
+    except (json.JSONDecodeError, ValueError, OSError):
+        return None
+
+    steps = plan.get("steps", [])
+    if not steps:
+        return None
+
+    total = plan.get("total", len(steps))
+    completed = plan.get("completed", 0)
+    skipped = plan.get("skipped", 0)
+    pending_count = sum(1 for s in steps if s.get("status") == "pending")
+
+    # Build summary line
+    actionable = total - skipped
+    if skipped > 0:
+        summary = f"{completed}/{actionable} actionable steps completed, {skipped} skipped"
+    else:
+        summary = f"{completed}/{total} steps completed"
+
+    # Build numbered list
+    lines = [f"<plan-status>", f"Your execution plan ({summary}):"]
+    for step in steps:
+        status = step.get("status", "pending")
+        marker = {"done": "[DONE]", "pending": "[PENDING]", "skipped": "[SKIPPED]"}.get(status, "[PENDING]")
+        desc = step.get("description", "")
+        lines.append(f"{step.get('index', 0) + 1}. {marker} {desc}")
+
+    # Include saved notes
+    notes = plan.get("notes", [])
+    if notes:
+        lines.append("")
+        lines.append("Your saved notes:")
+        for note in notes:
+            lines.append(f"- {note}")
+
+    lines.append("")
+
+    if pending_count > 0:
+        lines.append("If your current approach is not working, you can:")
+        lines.append("- Call plan_create with a revised step list to replace this plan.")
+        lines.append("- Call plan_step_skip to skip steps that are unnecessary or blocked.")
+        lines.append("You may also continue with the current plan if it is still viable.")
+    else:
+        lines.append("All plan steps are completed. Consider calling report_completion.")
+
+    lines.append("</plan-status>")
+    return "\n".join(lines)
+
+
+def _read_plan_for_verification() -> str:
+    """Read plan from local storage and format as a verification section.
+
+    Returns formatted plan status string, or empty string if no plan exists.
+    """
+    plan_path = get_plan_file_path()
+    if not os.path.isfile(plan_path):
+        return ""
+    try:
+        with open(plan_path, encoding="utf-8") as f:
+            plan = json.load(f)
+    except (json.JSONDecodeError, ValueError, OSError):
+        return ""
+
+    steps = plan.get("steps", [])
+    if not steps:
+        return ""
+
+    total = plan.get("total", len(steps))
+    completed = plan.get("completed", 0)
+    skipped = plan.get("skipped", 0)
+    pending_steps = [s for s in steps if s.get("status") == "pending"]
+    actionable = total - skipped
+
+    if pending_steps:
+        lines = [f"## Plan Status -- Incomplete Steps Detected"]
+        lines.append(f"Your execution plan has {len(pending_steps)} of {actionable} actionable steps still pending:")
+        for s in pending_steps:
+            lines.append(f"- Step {s.get('index', 0)}: [PENDING] {s.get('description', '')}")
+        lines.append("")
+        lines.append("Review these incomplete steps. Either complete them before re-submitting,")
+        lines.append("or confirm they are intentionally skipped by calling plan_step_skip.")
+        return "\n".join(lines)
+    else:
+        skipped_note = f" ({skipped} skipped)" if skipped > 0 else ""
+        return f"## Plan Status\nAll {completed} plan steps completed{skipped_note}."
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +642,9 @@ def run_agent(
         },
     }
 
+    # Initialise local plan storage with this run's UUID
+    init_plan_storage(trace_metadata["trace_id"])
+
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
     ]
@@ -650,6 +757,12 @@ def run_agent(
                 "report_completion with OUTCOME_NONE_CLARIFICATION.\n"
                 "</checkpoint>"
             )
+            # --- Plan-aware checkpoint augmentation ---
+            plan_section = _read_plan_for_checkpoint()
+            if plan_section:
+                checkpoint_msg = checkpoint_msg.replace("</checkpoint>", plan_section + "\n</checkpoint>")
+                log.info("Re-plan checkpoint: plan steps included (%d/%d completed)", 0, 0)  # counts already logged
+
             messages.append({"role": "user", "content": checkpoint_msg})
             resilience_state.steps_since_completion_attempt = 0
             resilience_state.recent_tool_calls.clear()
@@ -760,6 +873,9 @@ def run_agent(
                         verification_state.original_code = extracted.get("code", "OUTCOME_OK") if extracted else "OUTCOME_OK"
                     verification_state.in_verification = True
                     verification_state.attempts += 1
+                    # Reset replan timer — don't let the replan checkpoint fire
+                    # during the verification cycle (causes post-completion damage)
+                    resilience_state.steps_since_completion_attempt = 0
 
                     # Log verification start (Task 7)
                     print(f"  [verify] attempt {verification_state.attempts}: "
@@ -768,11 +884,13 @@ def run_agent(
                              verification_state.attempts)
 
                     # Build and inject verification prompt
+                    plan_status_text = _read_plan_for_verification()
                     prompt = build_verification_prompt(
                         text_answer, "OUTCOME_OK", summary.policy_files,
                         checklist_body=verification_checklist,
                         source_basename=None,
                         frame_template=verification_frame,
+                        plan_status=plan_status_text,
                     )
                     messages.append({
                         "role": "user",
@@ -962,6 +1080,9 @@ def run_agent(
                     verification_state.original_code = code
                 verification_state.in_verification = True
                 verification_state.attempts += 1
+                # Reset replan timer — don't let the replan checkpoint fire
+                # during the verification cycle (causes post-completion damage)
+                resilience_state.steps_since_completion_attempt = 0
 
                 # Log verification start (Task 7)
                 answer_preview = answer[:120]
@@ -971,11 +1092,13 @@ def run_agent(
                          verification_state.attempts)
 
                 # Build and inject verification prompt
+                plan_status_text = _read_plan_for_verification()
                 prompt = build_verification_prompt(
                     answer, code, summary.policy_files,
                     checklist_body=verification_checklist,
                     source_basename=None,
                     frame_template=verification_frame,
+                    plan_status=plan_status_text,
                 )
 
                 # Append synthetic tool result for report_completion

@@ -14,9 +14,9 @@ def test_tool_schemas_is_list():
     assert isinstance(TOOL_SCHEMAS, list)
 
 
-def test_tool_schemas_has_nine_entries():
+def test_tool_schemas_has_thirteen_entries():
     from agent.tools import TOOL_SCHEMAS
-    assert len(TOOL_SCHEMAS) == 9
+    assert len(TOOL_SCHEMAS) == 14
 
 
 def test_tool_names_is_set():
@@ -24,9 +24,9 @@ def test_tool_names_is_set():
     assert isinstance(TOOL_NAMES, set)
 
 
-def test_tool_names_has_nine_entries():
+def test_tool_names_has_thirteen_entries():
     from agent.tools import TOOL_NAMES
-    assert len(TOOL_NAMES) == 9
+    assert len(TOOL_NAMES) == 14
 
 
 EXPECTED_TOOL_NAMES = {
@@ -39,6 +39,11 @@ EXPECTED_TOOL_NAMES = {
     "report_completion",
     "load_skill",
     "compact",
+    "plan_create",
+    "plan_step_done",
+    "plan_step_skip",
+    "plan_status",
+    "plan_note",
 }
 
 
@@ -218,8 +223,8 @@ class TestScoutToolSchemas:
     def test_existing_exports_unchanged(self):
         """TOOL_SCHEMAS and TOOL_NAMES must still be present and correct."""
         from agent.tools import TOOL_SCHEMAS, TOOL_NAMES
-        assert len(TOOL_SCHEMAS) == 9
-        assert len(TOOL_NAMES) == 9
+        assert len(TOOL_SCHEMAS) == 14
+        assert len(TOOL_NAMES) == 14
 
 
 class TestGetToolSchemas:
@@ -262,6 +267,74 @@ class TestGetToolSchemas:
         mini = get_tool_schemas("mini")
         pcm = get_tool_schemas("pcm")
         assert len(pcm) == len(mini) + 3
+
+
+# ---------------------------------------------------------------------------
+# Plan tool schema tests (Task 7.2)
+# ---------------------------------------------------------------------------
+
+class TestPlanToolSchemas:
+    """Task 7.2: Plan tool schemas have correct structure and parameters."""
+
+    @pytest.fixture
+    def schema_map(self):
+        from agent.tools import TOOL_SCHEMAS
+        return {s["function"]["name"]: s for s in TOOL_SCHEMAS}
+
+    def test_plan_create_exists(self, schema_map):
+        assert "plan_create" in schema_map
+
+    def test_plan_create_steps_param_is_array_of_strings(self, schema_map):
+        params = schema_map["plan_create"]["function"]["parameters"]
+        assert "steps" in params["properties"]
+        steps_prop = params["properties"]["steps"]
+        assert steps_prop["type"] == "array"
+        assert steps_prop["items"]["type"] == "string"
+        assert "steps" in params["required"]
+
+    def test_plan_step_done_exists(self, schema_map):
+        assert "plan_step_done" in schema_map
+
+    def test_plan_step_done_step_index_required(self, schema_map):
+        params = schema_map["plan_step_done"]["function"]["parameters"]
+        assert "step_index" in params["properties"]
+        assert "step_index" in params["required"]
+
+    def test_plan_step_skip_exists(self, schema_map):
+        assert "plan_step_skip" in schema_map
+
+    def test_plan_step_skip_has_step_index_and_optional_reason(self, schema_map):
+        params = schema_map["plan_step_skip"]["function"]["parameters"]
+        assert "step_index" in params["properties"]
+        assert params["properties"]["step_index"]["type"] == "integer"
+        assert "step_index" in params["required"]
+        assert "reason" in params["properties"]
+        assert params["properties"]["reason"]["type"] == "string"
+        # reason should NOT be required
+        assert "reason" not in params["required"]
+
+    def test_plan_status_exists(self, schema_map):
+        assert "plan_status" in schema_map
+
+    def test_plan_status_has_no_required_params(self, schema_map):
+        params = schema_map["plan_status"]["function"]["parameters"]
+        assert params["properties"] == {}
+
+    def test_plan_tools_not_in_scout_schemas(self):
+        from agent.tools import SCOUT_TOOL_SCHEMAS
+        names = {s["function"]["name"] for s in SCOUT_TOOL_SCHEMAS}
+        for plan_tool in ("plan_create", "plan_step_done", "plan_step_skip", "plan_status"):
+            assert plan_tool not in names
+
+    def test_get_tool_schemas_mini_returns_thirteen(self):
+        from agent.tools import get_tool_schemas
+        schemas = get_tool_schemas("mini")
+        assert len(schemas) == 14
+
+    def test_get_tool_schemas_pcm_returns_sixteen(self):
+        from agent.tools import get_tool_schemas
+        schemas = get_tool_schemas("pcm")
+        assert len(schemas) == 17
 
 
 class TestToolsModuleIsLeaf:

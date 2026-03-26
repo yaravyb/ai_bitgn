@@ -16,6 +16,8 @@ Answer: {{ANSWER}}
 
 {{SOURCE_BASENAME_SECTION}}
 
+{{PLAN_STATUS_SECTION}}
+
 ## Instructions
 - If the answer is correct, use the report_completion tool with the SAME answer and code.
 - If the answer needs correction, use the report_completion tool with the CORRECTED answer.

@@ -2943,3 +2943,134 @@ class TestCyclingDetection:
             if m.get("role") == "user" and "<checkpoint>" in m.get("content", "")
         ]
         assert len(checkpoint_msgs) >= 1
+
+
+# ===========================================================================
+# Plan checkpoint and verification helper tests (persistent-task-planner)
+# ===========================================================================
+
+class TestReadPlanForCheckpoint:
+    """_read_plan_for_checkpoint returns formatted plan status or None (local filesystem)."""
+
+    def test_returns_plan_status_with_pending_steps(self, tmp_path):
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        from agent.loop import _read_plan_for_checkpoint
+        plan_data = {
+            "steps": [
+                {"index": 0, "description": "Read inbox", "status": "done"},
+                {"index": 1, "description": "Write email", "status": "pending"},
+                {"index": 2, "description": "Update seq", "status": "pending"},
+            ],
+            "total": 3, "completed": 1, "skipped": 0,
+        }
+        (tmp_path / "steps.json").write_text(json.dumps(plan_data))
+        result = _read_plan_for_checkpoint()
+        assert result is not None
+        assert "<plan-status>" in result
+        assert "</plan-status>" in result
+        assert "[DONE]" in result
+        assert "[PENDING]" in result
+        assert "plan_create" in result  # revision guidance
+        assert "plan_step_skip" in result  # skip guidance
+
+    def test_returns_completion_suggestion_when_all_done(self, tmp_path):
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        from agent.loop import _read_plan_for_checkpoint
+        plan_data = {
+            "steps": [
+                {"index": 0, "description": "Read inbox", "status": "done"},
+                {"index": 1, "description": "Write email", "status": "done"},
+            ],
+            "total": 2, "completed": 2, "skipped": 0,
+        }
+        (tmp_path / "steps.json").write_text(json.dumps(plan_data))
+        result = _read_plan_for_checkpoint()
+        assert result is not None
+        assert "report_completion" in result
+
+    def test_returns_none_when_no_plan(self, tmp_path):
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        from agent.loop import _read_plan_for_checkpoint
+        result = _read_plan_for_checkpoint()
+        assert result is None
+
+    def test_shows_skipped_steps(self, tmp_path):
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        from agent.loop import _read_plan_for_checkpoint
+        plan_data = {
+            "steps": [
+                {"index": 0, "description": "Step A", "status": "done"},
+                {"index": 1, "description": "Step B", "status": "skipped", "skip_reason": "not needed"},
+                {"index": 2, "description": "Step C", "status": "pending"},
+            ],
+            "total": 3, "completed": 1, "skipped": 1,
+        }
+        (tmp_path / "steps.json").write_text(json.dumps(plan_data))
+        result = _read_plan_for_checkpoint()
+        assert "[SKIPPED]" in result
+
+    def test_includes_saved_notes(self, tmp_path):
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        from agent.loop import _read_plan_for_checkpoint
+        plan_data = {
+            "steps": [
+                {"index": 0, "description": "Read seq.json", "status": "done"},
+                {"index": 1, "description": "Write email", "status": "pending"},
+            ],
+            "total": 2, "completed": 1, "skipped": 0,
+            "notes": ["seq.json id=87565, use as filename", "contact email: rick@example.com"],
+        }
+        (tmp_path / "steps.json").write_text(json.dumps(plan_data))
+        result = _read_plan_for_checkpoint()
+        assert "saved notes" in result.lower()
+        assert "seq.json id=87565" in result
+        assert "rick@example.com" in result
+
+
+class TestReadPlanForVerification:
+    """_read_plan_for_verification returns formatted section or empty string (local filesystem)."""
+
+    def test_returns_section_with_incomplete_steps(self, tmp_path):
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        from agent.loop import _read_plan_for_verification
+        plan_data = {
+            "steps": [
+                {"index": 0, "description": "Step A", "status": "done"},
+                {"index": 1, "description": "Step B", "status": "pending"},
+            ],
+            "total": 2, "completed": 1, "skipped": 0,
+        }
+        (tmp_path / "steps.json").write_text(json.dumps(plan_data))
+        result = _read_plan_for_verification()
+        assert "Incomplete Steps Detected" in result
+        assert "[PENDING]" in result
+
+    def test_returns_all_completed_message(self, tmp_path):
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        from agent.loop import _read_plan_for_verification
+        plan_data = {
+            "steps": [
+                {"index": 0, "description": "Step A", "status": "done"},
+                {"index": 1, "description": "Step B", "status": "done"},
+            ],
+            "total": 2, "completed": 2, "skipped": 0,
+        }
+        (tmp_path / "steps.json").write_text(json.dumps(plan_data))
+        result = _read_plan_for_verification()
+        assert "completed" in result.lower()
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+    def test_returns_empty_string_when_no_plan(self, tmp_path):
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        from agent.loop import _read_plan_for_verification
+        result = _read_plan_for_verification()
+        assert result == ""

@@ -95,18 +95,21 @@ def build_verification_prompt(
     checklist_body: str = "",
     source_basename: str | None = None,
     frame_template: str | None = None,
+    plan_status: str = "",
 ) -> str:
     """Construct the verification prompt injected as a user message.
 
     When ``frame_template`` is provided, performs placeholder substitution:
       ``{{ANSWER}}``, ``{{CODE}}``, ``{{POLICY_SECTION}}``,
-      ``{{CHECKLIST_SECTION}}``, ``{{SOURCE_BASENAME_SECTION}}``.
+      ``{{CHECKLIST_SECTION}}``, ``{{SOURCE_BASENAME_SECTION}}``,
+      ``{{PLAN_STATUS_SECTION}}``.
     When ``frame_template`` is ``None``, uses the inline fallback frame
     for backward compatibility.
 
     The verification checklist content comes from the ``checklist_body``
     parameter (loaded from a skill file externally).
     When ``source_basename`` is provided, a concrete filename check is added.
+    When ``plan_status`` is provided, plan status is injected into the prompt.
     """
     # Build dynamic section content used by both paths
     policy_section = _build_policy_section(policy_contents)
@@ -121,6 +124,7 @@ def build_verification_prompt(
         result = result.replace("{{POLICY_SECTION}}", policy_section)
         result = result.replace("{{CHECKLIST_SECTION}}", checklist_section)
         result = result.replace("{{SOURCE_BASENAME_SECTION}}", source_section)
+        result = result.replace("{{PLAN_STATUS_SECTION}}", plan_status)
         return result
 
     # --- Fallback: inline frame construction ---
@@ -146,6 +150,10 @@ def build_verification_prompt(
     if source_section:
         parts.append("")
         parts.append(source_section)
+
+    if plan_status:
+        parts.append("")
+        parts.append(plan_status)
 
     parts.append("")
     parts.append("## Instructions")

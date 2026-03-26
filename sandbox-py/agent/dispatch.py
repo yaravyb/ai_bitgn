@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import posixpath
 import re
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, NotRequired, TypedDict
 
 from google.protobuf.json_format import MessageToDict
 from connectrpc.errors import ConnectError
@@ -22,6 +24,73 @@ from agent.llm import ToolCall
 from agent.context import ContextConfig, truncate_tool_result, COMPACT_SENTINEL
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Plan storage: local filesystem (host-side, not sandbox VM)
+# ---------------------------------------------------------------------------
+
+_plan_dir: str = ""
+
+
+def init_plan_storage(run_id: str) -> None:
+    """Initialise local plan directory for this agent run.
+
+    Called once from ``run_agent()`` with the trace-id UUID.
+    Plans are stored under ``/tmp/ai-bitgn-plans/<run_id>/`` so they
+    never pollute the sandbox VM filesystem (which is scored by benchmarks).
+    """
+    global _plan_dir
+    _plan_dir = os.path.join(tempfile.gettempdir(), "ai-bitgn-plans", run_id)
+    os.makedirs(_plan_dir, exist_ok=True)
+
+
+def get_plan_file_path() -> str:
+    """Return the absolute path to the plan file on the host."""
+    return os.path.join(_plan_dir, "steps.json")
+
+
+class _PlanStep(TypedDict):
+    index: int
+    description: str
+    status: str  # "pending" | "done" | "skipped"
+    skip_reason: NotRequired[str]
+
+
+class _PlanData(TypedDict):
+    steps: list[_PlanStep]
+    total: int
+    completed: int
+    skipped: int
+    notes: NotRequired[list[str]]
+
+
+def _read_plan() -> tuple[_PlanData | None, str | None]:
+    """Read and parse the plan file from local storage.
+
+    Returns (plan_data, None) on success, or (None, error_json) on failure.
+    """
+    plan_path = get_plan_file_path()
+    if not os.path.isfile(plan_path):
+        return (None, json.dumps({"error": "No plan exists. Call plan_create first."}, ensure_ascii=False))
+    try:
+        with open(plan_path, encoding="utf-8") as f:
+            plan: _PlanData = json.load(f)
+    except (json.JSONDecodeError, ValueError, OSError) as exc:
+        log.debug("Plan file read failed: %s", exc)
+        return (None, json.dumps({"error": f"Plan file is corrupted: {exc}"}, ensure_ascii=False))
+    return (plan, None)
+
+
+def _format_plan_response(plan: _PlanData) -> str:
+    """Format a plan data dict as an indented JSON string with summary."""
+    actionable = plan["total"] - plan["skipped"]
+    if plan["skipped"] > 0:
+        summary = f"{plan['completed']}/{actionable} actionable steps completed, {plan['skipped']} skipped"
+    else:
+        summary = f"{plan['completed']}/{plan['total']} steps completed"
+    plan["summary"] = summary  # type: ignore[typeddict-unknown-key]
+    return json.dumps(plan, indent=2, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +371,165 @@ def _handle_compact(
 
 
 # ---------------------------------------------------------------------------
+# Plan tool handlers (persistent-task-planner)
+# ---------------------------------------------------------------------------
+
+def _handle_plan_create(
+    vm,
+    args: dict[str, Any],
+    tracker: GroundingTracker,
+    protected_files: set[str],
+    skill_loader: Any | None,
+) -> str:
+    steps_input: list[str] = args.get("steps", [])
+    if not steps_input:
+        return json.dumps(
+            {"error": "plan_create requires at least one step"},
+            ensure_ascii=False,
+        )
+    steps: list[_PlanStep] = [
+        {"index": i, "description": desc, "status": "pending"}
+        for i, desc in enumerate(steps_input)
+    ]
+    plan: _PlanData = {
+        "steps": steps,
+        "total": len(steps),
+        "completed": 0,
+        "skipped": 0,
+    }
+    json_content = json.dumps(plan, indent=2, ensure_ascii=False)
+    plan_path = get_plan_file_path()
+    with open(plan_path, "w", encoding="utf-8") as f:
+        f.write(json_content)
+    log.info("plan_create: %d steps created", len(steps))
+    return _format_plan_response(plan)
+
+
+def _handle_plan_status(
+    vm,
+    args: dict[str, Any],
+    tracker: GroundingTracker,
+    protected_files: set[str],
+    skill_loader: Any | None,
+) -> str:
+    plan, error = _read_plan()
+    if plan is None:
+        return json.dumps(
+            {"message": "No plan has been created yet. Use plan_create to create one."},
+            ensure_ascii=False,
+        )
+    log.info("plan_status: %d/%d steps completed", plan["completed"], plan["total"])
+    return _format_plan_response(plan)
+
+
+def _handle_plan_step_done(
+    vm,
+    args: dict[str, Any],
+    tracker: GroundingTracker,
+    protected_files: set[str],
+    skill_loader: Any | None,
+) -> str:
+    raw = args.get("step_index", 0)
+    # Accept single int or array of ints
+    indices: list[int] = raw if isinstance(raw, list) else [raw]
+    plan, error = _read_plan()
+    if plan is None:
+        return error  # type: ignore[return-value]
+    for idx in indices:
+        if idx < 0 or idx >= plan["total"]:
+            return json.dumps(
+                {"error": f"step_index {idx} is out of range. Valid range: 0 to {plan['total'] - 1}."},
+                ensure_ascii=False,
+            )
+    for idx in indices:
+        plan["steps"][idx]["status"] = "done"
+        plan["steps"][idx].pop("skip_reason", None)
+    # Recompute counts
+    plan["completed"] = sum(1 for s in plan["steps"] if s["status"] == "done")
+    plan["skipped"] = sum(1 for s in plan["steps"] if s["status"] == "skipped")
+    # Preserve notes if present
+    notes = plan.get("notes", [])  # type: ignore[assignment]
+    write_data: dict[str, Any] = {
+        "steps": plan["steps"], "total": plan["total"],
+        "completed": plan["completed"], "skipped": plan["skipped"],
+    }
+    if notes:
+        write_data["notes"] = notes
+    json_content = json.dumps(write_data, indent=2, ensure_ascii=False)
+    plan_path = get_plan_file_path()
+    with open(plan_path, "w", encoding="utf-8") as f:
+        f.write(json_content)
+    log.info("plan_step_done: marked %d steps done (%d/%d completed)", len(indices), plan["completed"], plan["total"])
+    return _format_plan_response(plan)
+
+
+def _handle_plan_step_skip(
+    vm,
+    args: dict[str, Any],
+    tracker: GroundingTracker,
+    protected_files: set[str],
+    skill_loader: Any | None,
+) -> str:
+    step_index: int = args.get("step_index", 0)
+    reason: str = args.get("reason", "")
+    plan, error = _read_plan()
+    if plan is None:
+        return error  # type: ignore[return-value]
+    if step_index < 0 or step_index >= plan["total"]:
+        return json.dumps(
+            {"error": f"step_index {step_index} is out of range. Valid range: 0 to {plan['total'] - 1}."},
+            ensure_ascii=False,
+        )
+    plan["steps"][step_index]["status"] = "skipped"
+    if reason:
+        plan["steps"][step_index]["skip_reason"] = reason
+    # Recompute counts
+    plan["completed"] = sum(1 for s in plan["steps"] if s["status"] == "done")
+    plan["skipped"] = sum(1 for s in plan["steps"] if s["status"] == "skipped")
+    notes = plan.get("notes", [])  # type: ignore[assignment]
+    write_data: dict[str, Any] = {
+        "steps": plan["steps"], "total": plan["total"],
+        "completed": plan["completed"], "skipped": plan["skipped"],
+    }
+    if notes:
+        write_data["notes"] = notes
+    json_content = json.dumps(write_data, indent=2, ensure_ascii=False)
+    plan_path = get_plan_file_path()
+    with open(plan_path, "w", encoding="utf-8") as f:
+        f.write(json_content)
+    desc = plan["steps"][step_index]["description"]
+    log.info("plan_step_skip: step %d '%s' skipped (%d/%d completed, %d skipped)", step_index, desc, plan["completed"], plan["total"], plan["skipped"])
+    return _format_plan_response(plan)
+
+
+def _handle_plan_note(
+    vm,
+    args: dict[str, Any],
+    tracker: GroundingTracker,
+    protected_files: set[str],
+    skill_loader: Any | None,
+) -> str:
+    note: str = args.get("note", "").strip()
+    if not note:
+        return json.dumps({"error": "plan_note requires a non-empty note"}, ensure_ascii=False)
+    plan_path = get_plan_file_path()
+    if os.path.isfile(plan_path):
+        with open(plan_path, encoding="utf-8") as f:
+            plan: _PlanData = json.load(f)
+    else:
+        # Allow notes even without a plan — create a minimal plan structure
+        plan = {"steps": [], "total": 0, "completed": 0, "skipped": 0, "notes": []}
+    notes: list[str] = plan.get("notes", [])  # type: ignore[assignment]
+    notes.append(note)
+    plan["notes"] = notes  # type: ignore[typeddict-unknown-key]
+    json_content = json.dumps(plan, indent=2, ensure_ascii=False)
+    with open(plan_path, "w", encoding="utf-8") as f:
+        f.write(json_content)
+    log.info("plan_note: saved note (%d notes total)", len(notes))
+    return json.dumps({"saved": note, "total_notes": len(notes)}, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
 # Guard functions (standalone, pure, testable -- called by dispatch_tool)
 # ---------------------------------------------------------------------------
 
@@ -461,6 +689,11 @@ DISPATCH_MAP: dict[str, Callable] = {
     "find": _handle_find,
     "mkdir": _handle_mkdir,
     "move": _handle_move,
+    "plan_create": _handle_plan_create,
+    "plan_step_done": _handle_plan_step_done,
+    "plan_step_skip": _handle_plan_step_skip,
+    "plan_status": _handle_plan_status,
+    "plan_note": _handle_plan_note,
 }
 
 

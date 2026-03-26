@@ -512,3 +512,96 @@ class TestVerificationOutcome:
         from agent.verify import VerificationOutcome
         assert isinstance(VerificationOutcome.CONFIRMED, str)
         assert isinstance(VerificationOutcome.REVISED, str)
+
+
+# ---------------------------------------------------------------------------
+# build_verification_prompt -- plan_status parameter tests (Task 7.4)
+# ---------------------------------------------------------------------------
+
+# Template with the new {{PLAN_STATUS_SECTION}} placeholder
+_FRAME_TEMPLATE_WITH_PLAN = """\
+<verification>
+You are about to submit the following answer. Before submitting, verify it is correct.
+
+## Proposed Answer
+Code: {{CODE}}
+Answer: {{ANSWER}}
+
+{{POLICY_SECTION}}
+
+{{CHECKLIST_SECTION}}
+
+{{SOURCE_BASENAME_SECTION}}
+
+{{PLAN_STATUS_SECTION}}
+
+## Instructions
+- If the answer is correct, use the report_completion tool with the SAME answer and code.
+- If the answer needs correction, use the report_completion tool with the CORRECTED answer.
+- You may use other tools (read_file, list_dir, etc.) to verify file operations before submitting.
+- IMPORTANT: Submit ONLY by calling the report_completion tool. Do NOT write the answer as plain text or JSON.
+</verification>"""
+
+
+class TestBuildVerificationPromptPlanStatus:
+    """Task 7.4: plan_status parameter substitutes {{PLAN_STATUS_SECTION}}."""
+
+    def test_template_substitutes_plan_status(self):
+        from agent.verify import build_verification_prompt
+        plan_text = "## Plan Status\nAll 3 plan steps completed."
+        prompt = build_verification_prompt(
+            answer="ans",
+            code="code",
+            policy_contents={},
+            frame_template=_FRAME_TEMPLATE_WITH_PLAN,
+            plan_status=plan_text,
+        )
+        assert "All 3 plan steps completed" in prompt
+        assert "{{PLAN_STATUS_SECTION}}" not in prompt
+
+    def test_template_empty_plan_status_no_change(self):
+        from agent.verify import build_verification_prompt
+        prompt = build_verification_prompt(
+            answer="ans",
+            code="code",
+            policy_contents={},
+            frame_template=_FRAME_TEMPLATE_WITH_PLAN,
+            plan_status="",
+        )
+        assert "{{PLAN_STATUS_SECTION}}" not in prompt
+        assert "Plan Status" not in prompt
+
+    def test_fallback_includes_plan_status_when_provided(self):
+        from agent.verify import build_verification_prompt
+        plan_text = "## Plan Status -- Incomplete Steps Detected\nStep 1 pending."
+        prompt = build_verification_prompt(
+            answer="ans",
+            code="code",
+            policy_contents={},
+            plan_status=plan_text,
+        )
+        assert "Incomplete Steps Detected" in prompt
+
+    def test_fallback_no_plan_status_when_empty(self):
+        from agent.verify import build_verification_prompt
+        prompt = build_verification_prompt(
+            answer="ans",
+            code="code",
+            policy_contents={},
+            plan_status="",
+        )
+        assert "Plan Status" not in prompt
+
+    def test_all_placeholders_substituted_with_plan_status(self):
+        from agent.verify import build_verification_prompt
+        prompt = build_verification_prompt(
+            answer="my answer",
+            code="OUTCOME_OK",
+            policy_contents={"p.md": "policy content"},
+            checklist_body="## Checklist\n1. Check it.",
+            source_basename="data.json",
+            frame_template=_FRAME_TEMPLATE_WITH_PLAN,
+            plan_status="## Plan Status\nAll done.",
+        )
+        assert "{{" not in prompt
+        assert "}}" not in prompt

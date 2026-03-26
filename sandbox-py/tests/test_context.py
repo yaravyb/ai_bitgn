@@ -21,7 +21,7 @@ class TestContextConfigDefaults:
         from agent.context import ContextConfig
         cfg = ContextConfig()
         assert cfg.truncation_limit == 10_000
-        assert cfg.micro_compact_keep_batches == 5
+        assert cfg.micro_compact_keep_batches == 10
         assert cfg.micro_compact_min_length == 100
         assert cfg.auto_compact_threshold == 80_000
         assert cfg.transcript_dir == ".transcripts/"
@@ -60,7 +60,7 @@ class TestContextConfigFromEnv:
 
         cfg = ContextConfig.from_env()
         assert cfg.truncation_limit == 10_000
-        assert cfg.micro_compact_keep_batches == 5
+        assert cfg.micro_compact_keep_batches == 10
         assert cfg.micro_compact_min_length == 100
         assert cfg.auto_compact_threshold == 80_000
         assert cfg.transcript_dir == ".transcripts/"
@@ -210,6 +210,141 @@ class TestTruncateToolResultJsonFallback:
 
 
 # ---------------------------------------------------------------------------
+# _summarize_tool_result tests
+# ---------------------------------------------------------------------------
+
+class TestExtractFileSummary:
+    """_extract_file_summary extracts useful info from various file formats."""
+
+    def test_json_record_extracts_scalars(self):
+        from agent.context import _extract_file_summary
+        content = json.dumps({
+            "id": "acct_001", "name": "Nordlicht Health",
+            "legal_name": "Nordlicht Health GmbH", "industry": "healthcare",
+            "region": "DACH", "next_follow_up_on": "2026-10-17",
+        })
+        result = _extract_file_summary(content)
+        assert "acct_001" in result
+        assert "Nordlicht Health" in result
+
+    def test_json_with_lines_array(self):
+        from agent.context import _extract_file_summary
+        content = json.dumps({
+            "number": "INV-007-02", "account_id": "acct_007",
+            "issued_on": "2026-06-10",
+            "lines": [{"name": "Platform", "amount": 100}],
+            "total": 100,
+        })
+        result = _extract_file_summary(content)
+        assert "INV-007-02" in result
+        assert "acct_007" in result
+
+    def test_simple_json(self):
+        from agent.context import _extract_file_summary
+        result = _extract_file_summary('{"id": 84845}')
+        assert "84845" in result
+
+    def test_email_headers(self):
+        from agent.context import _extract_file_summary
+        content = (
+            "From: Arjan van den Heuvel <arjan@example.com>\n"
+            "Subject: Could you resend the last invoice?\n"
+            "\n"
+            "Hi,\n\nBody text here..."
+        )
+        result = _extract_file_summary(content)
+        assert "Arjan" in result
+        assert "Subject:" in result or "resend" in result
+
+    def test_line_numbered_content(self):
+        from agent.context import _extract_file_summary
+        content = "     1\t{\"id\": 84845}\n     2\t"
+        result = _extract_file_summary(content)
+        assert "84845" in result
+
+    def test_markdown_skips_frontmatter_and_comments(self):
+        from agent.context import _extract_file_summary
+        content = (
+            "---\nname: test\n---\n"
+            "<!-- AGENT_EDITABLE_START -->\n"
+            "\n"
+            "# AI Engineering Foundations\n"
+            "Actual content here."
+        )
+        result = _extract_file_summary(content)
+        assert "AI Engineering" in result
+
+    def test_empty_file(self):
+        from agent.context import _extract_file_summary
+        assert _extract_file_summary("") == "(empty file)"
+        assert _extract_file_summary("  \n  \n  ") == "(empty file)"
+
+
+class TestSummarizeToolResult:
+    """_summarize_tool_result extracts key facts instead of deleting."""
+
+    def test_read_file_json_record(self):
+        from agent.context import _summarize_tool_result
+        file_json = json.dumps({"id": "cont_007", "account_id": "acct_007",
+                                "full_name": "Arjan van den Heuvel",
+                                "email": "arjan@example.com"})
+        content = json.dumps({"path": "contacts/cont_007.json", "content": file_json})
+        result = _summarize_tool_result(content)
+        assert "cont_007.json" in result
+        assert "Arjan" in result
+        assert "arjan@example.com" in result
+
+    def test_read_file_seq_json(self):
+        from agent.context import _summarize_tool_result
+        content = json.dumps({"path": "outbox/seq.json", "content": '{"id": 84845}'})
+        result = _summarize_tool_result(content)
+        assert "seq.json" in result
+        assert "84845" in result
+
+    def test_read_file_line_numbered(self):
+        from agent.context import _summarize_tool_result
+        content = json.dumps({"path": "outbox/seq.json",
+                              "content": "     1\t{\n     2\t  \"id\": 84845\n     3\t}"})
+        result = _summarize_tool_result(content)
+        assert "84845" in result
+
+    def test_list_dir_result(self):
+        from agent.context import _summarize_tool_result
+        content = json.dumps({"entries": [{"name": "a.json"}, {"name": "b.json"}, {"name": "c.json"}]})
+        result = _summarize_tool_result(content)
+        assert "list_dir" in result
+        assert "3 items" in result
+
+    def test_search_result(self):
+        from agent.context import _summarize_tool_result
+        content = json.dumps({"matches": [
+            {"path": "contacts/cont_001.json", "line": 4, "lineText": "email"},
+        ]})
+        result = _summarize_tool_result(content)
+        assert "search" in result
+        assert "1 match" in result
+
+    def test_search_no_matches(self):
+        from agent.context import _summarize_tool_result
+        content = json.dumps({"matches": []})
+        result = _summarize_tool_result(content)
+        assert "no matches" in result
+
+    def test_error_result(self):
+        from agent.context import _summarize_tool_result
+        content = json.dumps({"error": "Code.NOT_FOUND: file not found"})
+        result = _summarize_tool_result(content)
+        assert "error" in result
+        assert "NOT_FOUND" in result
+
+    def test_non_json_content(self):
+        from agent.context import _summarize_tool_result
+        result = _summarize_tool_result("some plain text response that is long enough to trigger compaction")
+        assert "[compacted]" in result
+        assert "some plain text" in result
+
+
+# ---------------------------------------------------------------------------
 # micro_compact tests
 # ---------------------------------------------------------------------------
 
@@ -304,7 +439,7 @@ class TestMicroCompactClearsOldBatches:
             {"role": "tool", "tool_call_id": "tc2", "content": "y" * 200},
         ]
         micro_compact(messages, cfg)
-        assert messages[3]["content"] == "[Previous tool result cleared]"
+        assert messages[3]["content"] .startswith("[compacted]")
         assert messages[5]["content"] == "y" * 200
 
     def test_multiple_old_batches_cleared(self):
@@ -329,8 +464,8 @@ class TestMicroCompactClearsOldBatches:
             {"role": "tool", "tool_call_id": "tc3", "content": "c" * 200},
         ]
         micro_compact(messages, cfg)
-        assert messages[2]["content"] == "[Previous tool result cleared]"
-        assert messages[4]["content"] == "[Previous tool result cleared]"
+        assert messages[2]["content"] .startswith("[compacted]")
+        assert messages[4]["content"] .startswith("[compacted]")
         assert messages[6]["content"] == "c" * 200
 
 
@@ -437,8 +572,8 @@ class TestMicroCompactBatchDetection:
         ]
         micro_compact(messages, cfg)
         # Both tool results from batch 1 should be cleared
-        assert messages[2]["content"] == "[Previous tool result cleared]"
-        assert messages[3]["content"] == "[Previous tool result cleared]"
+        assert messages[2]["content"] .startswith("[compacted]")
+        assert messages[3]["content"] .startswith("[compacted]")
         # Batch 2 preserved
         assert messages[5]["content"] == "z" * 200
 

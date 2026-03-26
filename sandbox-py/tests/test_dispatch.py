@@ -1661,3 +1661,474 @@ class TestGuardInteractions:
         for _, result_text in results:
             parsed = json.loads(result_text)
             assert "error" not in parsed
+
+
+# ===========================================================================
+# Plan tool dispatch tests (persistent-task-planner: Tasks 2, 3, 4, 7.3)
+# ===========================================================================
+
+class TestPlanStorage:
+    """Task 2: plan storage initialisation."""
+
+    def test_init_plan_storage_creates_dir(self, tmp_path):
+        import agent.dispatch as d
+        plan_dir = str(tmp_path / "test-run-id")
+        d._plan_dir = ""
+        d.init_plan_storage.__wrapped__ = None  # just call directly
+        # Directly test the function
+        import os, tempfile
+        run_id = "test-uuid-1234"
+        d.init_plan_storage(run_id)
+        expected = os.path.join(tempfile.gettempdir(), "ai-bitgn-plans", run_id)
+        assert d._plan_dir == expected
+        assert os.path.isdir(expected)
+
+    def test_get_plan_file_path(self, tmp_path):
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        path = d.get_plan_file_path()
+        assert path.endswith("steps.json")
+        assert str(tmp_path) in path
+
+
+class TestPlanTypeDefinitions:
+    """Task 2: _PlanStep and _PlanData TypedDicts exist."""
+
+    def test_plan_step_typeddict_exists(self):
+        from agent.dispatch import _PlanStep
+        # TypedDicts should be usable as dict constructors
+        step = _PlanStep(index=0, description="test", status="pending")
+        assert step["index"] == 0
+        assert step["description"] == "test"
+        assert step["status"] == "pending"
+
+    def test_plan_data_typeddict_exists(self):
+        from agent.dispatch import _PlanData
+        data = _PlanData(
+            steps=[{"index": 0, "description": "test", "status": "pending"}],
+            total=1,
+            completed=0,
+            skipped=0,
+        )
+        assert data["total"] == 1
+        assert data["completed"] == 0
+        assert data["skipped"] == 0
+
+
+class TestFormatPlanResponse:
+    """Task 2: _format_plan_response helper."""
+
+    def test_format_no_skipped(self):
+        from agent.dispatch import _format_plan_response
+        plan = {
+            "steps": [
+                {"index": 0, "description": "Step 1", "status": "done"},
+                {"index": 1, "description": "Step 2", "status": "pending"},
+            ],
+            "total": 2,
+            "completed": 1,
+            "skipped": 0,
+        }
+        result = _format_plan_response(plan)
+        parsed = json.loads(result)
+        assert parsed["summary"] == "1/2 steps completed"
+
+    def test_format_with_skipped(self):
+        from agent.dispatch import _format_plan_response
+        plan = {
+            "steps": [
+                {"index": 0, "description": "Step 1", "status": "done"},
+                {"index": 1, "description": "Step 2", "status": "skipped"},
+                {"index": 2, "description": "Step 3", "status": "pending"},
+            ],
+            "total": 3,
+            "completed": 1,
+            "skipped": 1,
+        }
+        result = _format_plan_response(plan)
+        parsed = json.loads(result)
+        assert parsed["summary"] == "1/2 actionable steps completed, 1 skipped"
+
+    def test_format_returns_indented_json(self):
+        from agent.dispatch import _format_plan_response
+        plan = {
+            "steps": [{"index": 0, "description": "A", "status": "pending"}],
+            "total": 1,
+            "completed": 0,
+            "skipped": 0,
+        }
+        result = _format_plan_response(plan)
+        assert "\n" in result  # indented JSON has newlines
+        parsed = json.loads(result)
+        assert "summary" in parsed
+
+
+class TestReadPlan:
+    """Task 2: _read_plan helper function (local filesystem)."""
+
+    def test_read_plan_success(self, tmp_path, mock_vm):
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        plan_data_in = {
+            "steps": [{"index": 0, "description": "Step 1", "status": "pending"}],
+            "total": 1, "completed": 0, "skipped": 0,
+        }
+        (tmp_path / "steps.json").write_text(json.dumps(plan_data_in))
+        plan_data, error = d._read_plan()
+        assert plan_data is not None
+        assert error is None
+        assert plan_data["total"] == 1
+
+    def test_read_plan_file_not_found(self, tmp_path, mock_vm):
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        plan_data, error = d._read_plan()
+        assert plan_data is None
+        assert error is not None
+        assert "No plan exists" in error or "error" in error
+
+
+class TestHandlePlanCreate:
+    """Task 3: _handle_plan_create handler (local filesystem)."""
+
+    def test_plan_create_writes_and_returns_plan(self, tmp_path, mock_vm, tracker, protected_files):
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        result = d._handle_plan_create(
+            mock_vm,
+            {"steps": ["Read file", "Write output"]},
+            tracker, protected_files, None,
+        )
+        assert (tmp_path / "steps.json").exists()
+        parsed = json.loads(result)
+        assert parsed["total"] == 2
+        assert parsed["completed"] == 0
+        assert parsed["skipped"] == 0
+        assert len(parsed["steps"]) == 2
+        assert parsed["steps"][0]["status"] == "pending"
+        assert parsed["steps"][0]["description"] == "Read file"
+        assert parsed["steps"][1]["description"] == "Write output"
+        assert "summary" in parsed
+
+    def test_plan_create_empty_steps_returns_error(self, tmp_path, mock_vm, tracker, protected_files):
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        result = d._handle_plan_create(
+            mock_vm, {"steps": []}, tracker, protected_files, None,
+        )
+        parsed = json.loads(result)
+        assert "error" in parsed
+        assert "at least one step" in parsed["error"]
+
+    def test_plan_create_registered_in_dispatch_map(self):
+        from agent.dispatch import DISPATCH_MAP
+        assert "plan_create" in DISPATCH_MAP
+        assert callable(DISPATCH_MAP["plan_create"])
+
+
+class TestHandlePlanStatus:
+    """Task 3: _handle_plan_status handler (local filesystem)."""
+
+    def test_plan_status_returns_plan(self, tmp_path, mock_vm, tracker, protected_files):
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        plan_data = {
+            "steps": [
+                {"index": 0, "description": "Step 1", "status": "done"},
+                {"index": 1, "description": "Step 2", "status": "pending"},
+            ],
+            "total": 2, "completed": 1, "skipped": 0,
+        }
+        (tmp_path / "steps.json").write_text(json.dumps(plan_data))
+        result = d._handle_plan_status(mock_vm, {}, tracker, protected_files, None)
+        parsed = json.loads(result)
+        assert parsed["total"] == 2
+        assert parsed["completed"] == 1
+        assert "summary" in parsed
+
+    def test_plan_status_no_plan_returns_message(self, tmp_path, mock_vm, tracker, protected_files):
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        result = d._handle_plan_status(mock_vm, {}, tracker, protected_files, None)
+        parsed = json.loads(result)
+        assert "message" in parsed
+        assert "No plan" in parsed["message"]
+
+    def test_plan_status_registered_in_dispatch_map(self):
+        from agent.dispatch import DISPATCH_MAP
+        assert "plan_status" in DISPATCH_MAP
+        assert callable(DISPATCH_MAP["plan_status"])
+
+
+class TestHandlePlanStepDone:
+    """Task 4: _handle_plan_step_done handler (local filesystem)."""
+
+    def test_plan_step_done_updates_step(self, tmp_path, mock_vm, tracker, protected_files):
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        plan_data = {
+            "steps": [
+                {"index": 0, "description": "Step 1", "status": "pending"},
+                {"index": 1, "description": "Step 2", "status": "pending"},
+            ],
+            "total": 2, "completed": 0, "skipped": 0,
+        }
+        (tmp_path / "steps.json").write_text(json.dumps(plan_data))
+        result = d._handle_plan_step_done(
+            mock_vm, {"step_index": 0}, tracker, protected_files, None,
+        )
+        parsed = json.loads(result)
+        assert parsed["steps"][0]["status"] == "done"
+        assert parsed["completed"] == 1
+        # Verify file was actually updated on disk
+        disk_plan = json.loads((tmp_path / "steps.json").read_text())
+        assert disk_plan["steps"][0]["status"] == "done"
+
+    def test_plan_step_done_invalid_index(self, tmp_path, mock_vm, tracker, protected_files):
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        plan_data = {
+            "steps": [{"index": 0, "description": "Step 1", "status": "pending"}],
+            "total": 1, "completed": 0, "skipped": 0,
+        }
+        (tmp_path / "steps.json").write_text(json.dumps(plan_data))
+        result = d._handle_plan_step_done(
+            mock_vm, {"step_index": 5}, tracker, protected_files, None,
+        )
+        parsed = json.loads(result)
+        assert "error" in parsed
+        assert "out of range" in parsed["error"]
+
+    def test_plan_step_done_no_plan_returns_error(self, tmp_path, mock_vm, tracker, protected_files):
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        result = d._handle_plan_step_done(
+            mock_vm, {"step_index": 0}, tracker, protected_files, None,
+        )
+        parsed = json.loads(result)
+        assert "error" in parsed
+        assert "No plan" in parsed["error"]
+
+    def test_plan_step_done_removes_skip_reason(self, tmp_path, mock_vm, tracker, protected_files):
+        """When a previously skipped step is marked done, skip_reason is removed."""
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        plan_data = {
+            "steps": [
+                {"index": 0, "description": "Step 1", "status": "skipped", "skip_reason": "not needed"},
+            ],
+            "total": 1, "completed": 0, "skipped": 1,
+        }
+        (tmp_path / "steps.json").write_text(json.dumps(plan_data))
+        result = d._handle_plan_step_done(
+            mock_vm, {"step_index": 0}, tracker, protected_files, None,
+        )
+        parsed = json.loads(result)
+        assert parsed["steps"][0]["status"] == "done"
+        assert "skip_reason" not in parsed["steps"][0]
+
+    def test_plan_step_done_batch_indices(self, tmp_path, mock_vm, tracker, protected_files):
+        """plan_step_done accepts an array of indices to mark multiple steps at once."""
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        plan_data = {
+            "steps": [
+                {"index": 0, "description": "Step 1", "status": "pending"},
+                {"index": 1, "description": "Step 2", "status": "pending"},
+                {"index": 2, "description": "Step 3", "status": "pending"},
+            ],
+            "total": 3, "completed": 0, "skipped": 0,
+        }
+        (tmp_path / "steps.json").write_text(json.dumps(plan_data))
+        result = d._handle_plan_step_done(
+            mock_vm, {"step_index": [0, 2]}, tracker, protected_files, None,
+        )
+        parsed = json.loads(result)
+        assert parsed["steps"][0]["status"] == "done"
+        assert parsed["steps"][1]["status"] == "pending"
+        assert parsed["steps"][2]["status"] == "done"
+        assert parsed["completed"] == 2
+
+    def test_plan_step_done_batch_invalid_index(self, tmp_path, mock_vm, tracker, protected_files):
+        """Batch with one invalid index returns error without modifying plan."""
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        plan_data = {
+            "steps": [{"index": 0, "description": "Step 1", "status": "pending"}],
+            "total": 1, "completed": 0, "skipped": 0,
+        }
+        (tmp_path / "steps.json").write_text(json.dumps(plan_data))
+        result = d._handle_plan_step_done(
+            mock_vm, {"step_index": [0, 5]}, tracker, protected_files, None,
+        )
+        parsed = json.loads(result)
+        assert "error" in parsed
+
+    def test_plan_step_done_preserves_notes(self, tmp_path, mock_vm, tracker, protected_files):
+        """plan_step_done preserves notes in the plan file."""
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        plan_data = {
+            "steps": [{"index": 0, "description": "Step 1", "status": "pending"}],
+            "total": 1, "completed": 0, "skipped": 0,
+            "notes": ["seq.json id=100"],
+        }
+        (tmp_path / "steps.json").write_text(json.dumps(plan_data))
+        d._handle_plan_step_done(
+            mock_vm, {"step_index": 0}, tracker, protected_files, None,
+        )
+        disk = json.loads((tmp_path / "steps.json").read_text())
+        assert disk["notes"] == ["seq.json id=100"]
+
+    def test_plan_step_done_registered_in_dispatch_map(self):
+        from agent.dispatch import DISPATCH_MAP
+        assert "plan_step_done" in DISPATCH_MAP
+        assert callable(DISPATCH_MAP["plan_step_done"])
+
+
+class TestHandlePlanStepSkip:
+    """Task 4: _handle_plan_step_skip handler (local filesystem)."""
+
+    def test_plan_step_skip_updates_step(self, tmp_path, mock_vm, tracker, protected_files):
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        plan_data = {
+            "steps": [
+                {"index": 0, "description": "Step 1", "status": "pending"},
+                {"index": 1, "description": "Step 2", "status": "pending"},
+            ],
+            "total": 2, "completed": 0, "skipped": 0,
+        }
+        (tmp_path / "steps.json").write_text(json.dumps(plan_data))
+        result = d._handle_plan_step_skip(
+            mock_vm, {"step_index": 1, "reason": "not applicable"}, tracker, protected_files, None,
+        )
+        parsed = json.loads(result)
+        assert parsed["steps"][1]["status"] == "skipped"
+        assert parsed["steps"][1]["skip_reason"] == "not applicable"
+        assert parsed["skipped"] == 1
+
+    def test_plan_step_skip_without_reason(self, tmp_path, mock_vm, tracker, protected_files):
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        plan_data = {
+            "steps": [{"index": 0, "description": "Step 1", "status": "pending"}],
+            "total": 1, "completed": 0, "skipped": 0,
+        }
+        (tmp_path / "steps.json").write_text(json.dumps(plan_data))
+        result = d._handle_plan_step_skip(
+            mock_vm, {"step_index": 0}, tracker, protected_files, None,
+        )
+        parsed = json.loads(result)
+        assert parsed["steps"][0]["status"] == "skipped"
+        assert "skip_reason" not in parsed["steps"][0]
+
+    def test_plan_step_skip_invalid_index(self, tmp_path, mock_vm, tracker, protected_files):
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        plan_data = {
+            "steps": [{"index": 0, "description": "Step 1", "status": "pending"}],
+            "total": 1, "completed": 0, "skipped": 0,
+        }
+        (tmp_path / "steps.json").write_text(json.dumps(plan_data))
+        result = d._handle_plan_step_skip(
+            mock_vm, {"step_index": 5}, tracker, protected_files, None,
+        )
+        parsed = json.loads(result)
+        assert "error" in parsed
+        assert "out of range" in parsed["error"]
+
+    def test_plan_step_skip_no_plan_returns_error(self, tmp_path, mock_vm, tracker, protected_files):
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        result = d._handle_plan_step_skip(
+            mock_vm, {"step_index": 0}, tracker, protected_files, None,
+        )
+        parsed = json.loads(result)
+        assert "error" in parsed
+        assert "No plan" in parsed["error"]
+
+    def test_plan_step_skip_adjusts_summary_counts(self, tmp_path, mock_vm, tracker, protected_files):
+        """Skipped steps adjust the summary denominator correctly."""
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        plan_data = {
+            "steps": [
+                {"index": 0, "description": "Step 1", "status": "done"},
+                {"index": 1, "description": "Step 2", "status": "done"},
+                {"index": 2, "description": "Step 3", "status": "pending"},
+                {"index": 3, "description": "Step 4", "status": "pending"},
+            ],
+            "total": 4, "completed": 2, "skipped": 0,
+        }
+        (tmp_path / "steps.json").write_text(json.dumps(plan_data))
+        result = d._handle_plan_step_skip(
+            mock_vm, {"step_index": 2, "reason": "impossible"}, tracker, protected_files, None,
+        )
+        parsed = json.loads(result)
+        assert parsed["completed"] == 2
+        assert parsed["skipped"] == 1
+        assert parsed["total"] == 4
+        # actionable = 4 - 1 = 3
+        assert parsed["summary"] == "2/3 actionable steps completed, 1 skipped"
+
+    def test_plan_step_skip_registered_in_dispatch_map(self):
+        from agent.dispatch import DISPATCH_MAP
+        assert "plan_step_skip" in DISPATCH_MAP
+        assert callable(DISPATCH_MAP["plan_step_skip"])
+
+
+class TestHandlePlanNote:
+    """plan_note handler saves notes to local plan file."""
+
+    def test_plan_note_appends_to_existing_plan(self, tmp_path, mock_vm, tracker, protected_files):
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        plan_data = {
+            "steps": [{"index": 0, "description": "Step 1", "status": "pending"}],
+            "total": 1, "completed": 0, "skipped": 0,
+        }
+        (tmp_path / "steps.json").write_text(json.dumps(plan_data))
+        result = d._handle_plan_note(
+            mock_vm, {"note": "seq.json id=100"}, tracker, protected_files, None,
+        )
+        parsed = json.loads(result)
+        assert parsed["saved"] == "seq.json id=100"
+        assert parsed["total_notes"] == 1
+        disk = json.loads((tmp_path / "steps.json").read_text())
+        assert disk["notes"] == ["seq.json id=100"]
+
+    def test_plan_note_creates_plan_if_missing(self, tmp_path, mock_vm, tracker, protected_files):
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        result = d._handle_plan_note(
+            mock_vm, {"note": "important fact"}, tracker, protected_files, None,
+        )
+        parsed = json.loads(result)
+        assert parsed["total_notes"] == 1
+        disk = json.loads((tmp_path / "steps.json").read_text())
+        assert disk["notes"] == ["important fact"]
+        assert disk["steps"] == []
+
+    def test_plan_note_empty_returns_error(self, tmp_path, mock_vm, tracker, protected_files):
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        result = d._handle_plan_note(
+            mock_vm, {"note": ""}, tracker, protected_files, None,
+        )
+        parsed = json.loads(result)
+        assert "error" in parsed
+
+    def test_plan_note_accumulates(self, tmp_path, mock_vm, tracker, protected_files):
+        import agent.dispatch as d
+        d._plan_dir = str(tmp_path)
+        d._handle_plan_note(mock_vm, {"note": "note 1"}, tracker, protected_files, None)
+        d._handle_plan_note(mock_vm, {"note": "note 2"}, tracker, protected_files, None)
+        result = d._handle_plan_note(mock_vm, {"note": "note 3"}, tracker, protected_files, None)
+        parsed = json.loads(result)
+        assert parsed["total_notes"] == 3
+
+    def test_plan_note_registered_in_dispatch_map(self):
+        from agent.dispatch import DISPATCH_MAP
+        assert "plan_note" in DISPATCH_MAP
+        assert callable(DISPATCH_MAP["plan_note"])
