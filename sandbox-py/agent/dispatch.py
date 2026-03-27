@@ -459,9 +459,9 @@ def _handle_plan_step_done(
     # weak models may pass "0", "[0]", "[0, 1, 2]", or 0
     if isinstance(raw, str):
         raw = raw.strip()
-        if raw.startswith("["):
+        if raw.startswith("[") or "," in raw:
             try:
-                raw = json.loads(raw)
+                raw = json.loads(raw if raw.startswith("[") else f"[{raw}]")
             except (json.JSONDecodeError, ValueError):
                 raw = [int(x.strip()) for x in raw.strip("[]").split(",") if x.strip()]
     if isinstance(raw, list):
@@ -506,19 +506,30 @@ def _handle_plan_step_skip(
     protected_files: set[str],
     skill_loader: Any | None,
 ) -> str:
-    step_index: int = int(args.get("step_index", 0))
+    raw_idx = args.get("step_index", 0)
+    # Accept single int, string, or stringified array — weak models may pass "[5, 6]"
+    if isinstance(raw_idx, str):
+        raw_idx = raw_idx.strip()
+        if raw_idx.startswith("[") or "," in raw_idx:
+            try:
+                raw_idx = json.loads(raw_idx if raw_idx.startswith("[") else f"[{raw_idx}]")
+            except (json.JSONDecodeError, ValueError):
+                raw_idx = [int(x.strip()) for x in raw_idx.strip("[]").split(",") if x.strip()]
+    indices: list[int] = [int(i) for i in raw_idx] if isinstance(raw_idx, list) else [int(raw_idx)]
     reason: str = args.get("reason", "")
     plan, error = _read_plan()
     if plan is None:
         return error  # type: ignore[return-value]
-    if step_index < 0 or step_index >= plan["total"]:
-        return json.dumps(
-            {"error": f"step_index {step_index} is out of range. Valid range: 0 to {plan['total'] - 1}."},
-            ensure_ascii=False,
-        )
-    plan["steps"][step_index]["status"] = "skipped"
-    if reason:
-        plan["steps"][step_index]["skip_reason"] = reason
+    for idx in indices:
+        if idx < 0 or idx >= plan["total"]:
+            return json.dumps(
+                {"error": f"step_index {idx} is out of range. Valid range: 0 to {plan['total'] - 1}."},
+                ensure_ascii=False,
+            )
+    for idx in indices:
+        plan["steps"][idx]["status"] = "skipped"
+        if reason:
+            plan["steps"][idx]["skip_reason"] = reason
     # Recompute counts
     plan["completed"] = sum(1 for s in plan["steps"] if s["status"] == "done")
     plan["skipped"] = sum(1 for s in plan["steps"] if s["status"] == "skipped")
@@ -533,8 +544,7 @@ def _handle_plan_step_skip(
     plan_path = get_plan_file_path()
     with open(plan_path, "w", encoding="utf-8") as f:
         f.write(json_content)
-    desc = plan["steps"][step_index]["description"]
-    log.info("plan_step_skip: step %d '%s' skipped (%d/%d completed, %d skipped)", step_index, desc, plan["completed"], plan["total"], plan["skipped"])
+    log.info("plan_step_skip: marked %d steps skipped (%d/%d completed, %d skipped)", len(indices), plan["completed"], plan["total"], plan["skipped"])
     return _format_plan_response(plan)
 
 
