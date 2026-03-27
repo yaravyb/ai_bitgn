@@ -16,7 +16,7 @@ def test_tool_schemas_is_list():
 
 def test_tool_schemas_has_thirteen_entries():
     from agent.tools import TOOL_SCHEMAS
-    assert len(TOOL_SCHEMAS) == 14
+    assert len(TOOL_SCHEMAS) == 15
 
 
 def test_tool_names_is_set():
@@ -26,7 +26,7 @@ def test_tool_names_is_set():
 
 def test_tool_names_has_thirteen_entries():
     from agent.tools import TOOL_NAMES
-    assert len(TOOL_NAMES) == 14
+    assert len(TOOL_NAMES) == 15
 
 
 EXPECTED_TOOL_NAMES = {
@@ -44,6 +44,7 @@ EXPECTED_TOOL_NAMES = {
     "plan_step_skip",
     "plan_status",
     "plan_note",
+    "current_date",
 }
 
 
@@ -223,8 +224,8 @@ class TestScoutToolSchemas:
     def test_existing_exports_unchanged(self):
         """TOOL_SCHEMAS and TOOL_NAMES must still be present and correct."""
         from agent.tools import TOOL_SCHEMAS, TOOL_NAMES
-        assert len(TOOL_SCHEMAS) == 14
-        assert len(TOOL_NAMES) == 14
+        assert len(TOOL_SCHEMAS) == 15
+        assert len(TOOL_NAMES) == 15
 
 
 class TestGetToolSchemas:
@@ -329,12 +330,12 @@ class TestPlanToolSchemas:
     def test_get_tool_schemas_mini_returns_thirteen(self):
         from agent.tools import get_tool_schemas
         schemas = get_tool_schemas("mini")
-        assert len(schemas) == 14
+        assert len(schemas) == 15
 
     def test_get_tool_schemas_pcm_returns_sixteen(self):
         from agent.tools import get_tool_schemas
         schemas = get_tool_schemas("pcm")
-        assert len(schemas) == 17
+        assert len(schemas) == 18
 
 
 class TestToolsModuleIsLeaf:

@@ -179,44 +179,59 @@ def _extract_file_summary(file_content: str) -> str:
     if not clean_text:
         return "(empty file)"
 
-    # Try JSON: extract scalar fields (IDs, names, dates, emails, amounts)
+    # Try JSON: extract all fields except large nested objects and body text
     try:
         obj = json.loads(clean_text)
         if isinstance(obj, dict):
-            scalars = {
-                k: v for k, v in obj.items()
-                if isinstance(v, (str, int, float, bool)) and k != "body"
-            }
-            # Also extract "total" from nested structures if present
-            if "lines" in obj and isinstance(obj["lines"], list):
-                scalars["_line_count"] = len(obj["lines"])
-            if "total" in obj:
-                scalars["total"] = obj["total"]
-            compact = json.dumps(scalars, ensure_ascii=False)
-            if len(compact) <= 200:
+            summary: dict[str, Any] = {}
+            for k, v in obj.items():
+                if k == "body":
+                    continue  # Skip email body text
+                if isinstance(v, (str, int, float, bool)):
+                    summary[k] = v
+                elif isinstance(v, list):
+                    if len(v) <= 5 and all(isinstance(x, (str, int, float)) for x in v):
+                        # Preserve short scalar arrays (compliance_flags, tags, risk_flags)
+                        summary[k] = v
+                    else:
+                        summary[f"_{k}_count"] = len(v)
+            compact = json.dumps(summary, ensure_ascii=False)
+            if len(compact) <= 400:
                 return compact
-            # Too long — keep only the most identifying fields
+            # Too long — keep only the most identifying fields + arrays
             priority_keys = ["id", "number", "name", "full_name", "email", "to",
                              "subject", "account_id", "status", "due_on",
-                             "issued_on", "total"]
-            important = {k: v for k, v in scalars.items() if k in priority_keys}
-            return json.dumps(important, ensure_ascii=False)[:200]
+                             "issued_on", "next_follow_up_on", "total",
+                             "compliance_flags", "risk_flags", "tags"]
+            important = {k: v for k, v in summary.items() if k in priority_keys}
+            return json.dumps(important, ensure_ascii=False)[:400]
         # Simple scalar JSON (e.g. {"id": 84845})
         return json.dumps(obj, ensure_ascii=False)[:150]
     except (json.JSONDecodeError, ValueError):
         pass
 
-    # Email-style: extract From/Subject/To headers
+    # Email-style: extract From/Subject/To headers + first body lines
     header_lines = []
-    for line in stripped_lines[:10]:
+    body_lines = []
+    in_body = False
+    for line in stripped_lines[:20]:
         lower = line.lower()
         if lower.startswith(("from:", "subject:", "to:", "date:")):
             header_lines.append(line.strip())
+        elif not line.strip() and header_lines and not in_body:
+            in_body = True  # blank line after headers = body starts
+        elif in_body and line.strip() and len(body_lines) < 3:
+            body_lines.append(line.strip())
     if header_lines:
-        return " | ".join(header_lines)[:200]
+        parts = header_lines
+        if body_lines:
+            parts = parts + ["Body: " + " ".join(body_lines)]
+        return " | ".join(parts)[:400]
 
-    # Markdown: skip frontmatter (---), comments (<!--), blank lines
-    meaningful: list[str] = []
+    # Markdown: extract title + rule lines (bullets, numbered items).
+    # Process/policy files have critical rules in bullet points — preserve those.
+    title = ""
+    rules: list[str] = []
     in_frontmatter = False
     for line in stripped_lines:
         s = line.strip()
@@ -227,12 +242,25 @@ def _extract_file_summary(file_content: str) -> str:
             continue
         if s.startswith("<!--") or not s:
             continue
-        meaningful.append(s)
-        if len(meaningful) >= 2:
-            break
+        # Capture the title (first heading or first non-empty line)
+        if not title:
+            title = s
+            continue
+        # Capture rule lines (bullets and numbered items) — these are the actionable content
+        if s.startswith(("- ", "* ", "1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.")):
+            rules.append(s)
 
-    if meaningful:
-        return " | ".join(meaningful)[:200]
+    if title:
+        parts = [title]
+        if rules:
+            # Fit as many rules as possible within budget
+            budget = 350 - len(title)
+            for rule in rules:
+                if budget - len(rule) - 3 < 0:
+                    break
+                parts.append(rule)
+                budget -= len(rule) + 3
+        return " | ".join(parts)[:400]
 
     # Fallback
     return clean_text[:150]
@@ -326,4 +354,7 @@ def micro_compact(messages: list[dict[str, Any]], config: ContextConfig) -> None
             msg = messages[idx]
             content = msg.get("content")
             if isinstance(content, str) and len(content) > config.micro_compact_min_length:
+                # Skip already-compacted content to prevent double-summarization
+                if content.startswith("[compacted]"):
+                    continue
                 msg["content"] = _summarize_tool_result(content)

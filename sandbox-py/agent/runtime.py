@@ -23,6 +23,7 @@ from bitgn.vm.mini_pb2 import (
 from bitgn.vm.pcm_connect import PcmRuntimeClientSync
 from bitgn.vm.pcm_pb2 import (
     AnswerRequest as PcmAnswerRequest,
+    ContextRequest,
     DeleteRequest as PcmDeleteRequest,
     FindRequest,
     ListRequest as PcmListRequest,
@@ -156,6 +157,10 @@ class PcmRuntime:
 
     def move(self, from_name: str, to_name: str) -> Any:
         return self._vm.move(MoveRequest(from_name=from_name, to_name=to_name))
+
+    def get_context(self) -> Any:
+        """Get the sandbox's simulated current date/time."""
+        return self._vm.context(ContextRequest())
 
 
 def create_runtime(benchmark_id: str, harness_url: str) -> RuntimeAdapter:

@@ -1885,97 +1885,79 @@ class TestExistingTestsPassWithVerificationDisabled:
 
 @pytest.mark.no_default_constraints
 class TestExtractTaskConstraintsLLM:
-    """Test _extract_task_constraints_llm: LLM fallback for constraint extraction."""
+    """Test _extract_task_constraints_llm: tool-call-based classification."""
 
     @patch("agent.loop.call_llm")
-    def test_valid_json_response_parsed(self, mock_call_llm):
-        """Valid JSON response from LLM is parsed into TaskConstraints."""
+    def test_valid_tool_call_parsed(self, mock_call_llm):
+        """Valid classify_task tool call is parsed into TaskConstraints."""
         from agent.loop import _extract_task_constraints_llm
         from agent.dispatch import TaskConstraints
+        from agent.llm import ToolCall
 
         mock_call_llm.return_value = MagicMock(
-            content='{"source_file": "main.py", "scope_level": "focused", "target_directories": ["src/"]}',
-            tool_calls=[], raw=None,
+            content="",
+            tool_calls=[ToolCall(
+                id="tc1", name="classify_task",
+                arguments={"task_type": "specific_action", "source_file": "main.py",
+                           "scope_level": "focused", "target_directories": ["src/"]},
+            )],
+            raw=None,
         )
 
-        result = _extract_task_constraints_llm(
-            "openai/gpt-4.1", "Edit src/main.py", {}
-        )
+        result = _extract_task_constraints_llm("openai/gpt-4.1", "Edit src/main.py", {})
         assert isinstance(result, TaskConstraints)
+        assert result.task_type == "specific_action"
         assert result.source_file == "main.py"
         assert result.scope_level == "focused"
         assert result.target_directories == ("src/",)
 
     @patch("agent.loop.call_llm")
-    def test_null_source_file_parsed(self, mock_call_llm):
-        """JSON with null source_file is handled correctly."""
+    def test_collection_type_parsed(self, mock_call_llm):
+        """Collection task type is correctly extracted."""
         from agent.loop import _extract_task_constraints_llm
-        from agent.dispatch import TaskConstraints
+        from agent.llm import ToolCall
 
         mock_call_llm.return_value = MagicMock(
-            content='{"source_file": null, "scope_level": "normal", "target_directories": []}',
-            tool_calls=[], raw=None,
+            content="",
+            tool_calls=[ToolCall(
+                id="tc1", name="classify_task",
+                arguments={"task_type": "collection"},
+            )],
+            raw=None,
         )
 
-        result = _extract_task_constraints_llm(
-            "openai/gpt-4.1", "Do something", {}
-        )
+        result = _extract_task_constraints_llm("openai/gpt-4.1", "process the inbox", {})
+        assert result.task_type == "collection"
         assert result.source_file is None
-        assert result.scope_level == "normal"
-        assert result.target_directories == ()
 
     @patch("agent.loop.call_llm")
-    def test_malformed_json_returns_default(self, mock_call_llm):
-        """Malformed JSON response falls back to default TaskConstraints."""
+    def test_no_tool_call_falls_back(self, mock_call_llm):
+        """No tool call in response falls back to regex."""
         from agent.loop import _extract_task_constraints_llm
-        from agent.dispatch import TaskConstraints
 
         mock_call_llm.return_value = MagicMock(
-            content="not valid json {{{",
-            tool_calls=[], raw=None,
+            content="some text", tool_calls=[], raw=None,
         )
 
-        result = _extract_task_constraints_llm(
-            "openai/gpt-4.1", "Do something", {}
-        )
-        assert result == TaskConstraints()
+        result = _extract_task_constraints_llm("openai/gpt-4.1", "Do something", {})
         assert result.source_file is None
         assert result.scope_level == "normal"
-        assert result.target_directories == ()
 
     @patch("agent.loop.call_llm")
-    def test_llm_exception_returns_default(self, mock_call_llm):
-        """When call_llm raises an exception, returns default TaskConstraints."""
+    def test_llm_exception_falls_back(self, mock_call_llm):
+        """Exception from call_llm falls back to regex."""
         from agent.loop import _extract_task_constraints_llm
-        from agent.dispatch import TaskConstraints
 
         mock_call_llm.side_effect = Exception("LLM unavailable")
 
-        result = _extract_task_constraints_llm(
-            "openai/gpt-4.1", "Do something", {}
-        )
-        assert result == TaskConstraints()
+        result = _extract_task_constraints_llm("openai/gpt-4.1", "Do something", {})
+        assert result.source_file is None
+        assert result.scope_level == "normal"
 
     @patch("agent.loop.call_llm")
-    def test_empty_content_returns_default(self, mock_call_llm):
-        """Empty LLM content returns default TaskConstraints."""
+    def test_empty_response_falls_back(self, mock_call_llm):
+        """Empty response falls back to regex."""
         from agent.loop import _extract_task_constraints_llm
-        from agent.dispatch import TaskConstraints
-
-        mock_call_llm.return_value = MagicMock(
-            content="", tool_calls=[], raw=None,
-        )
-
-        result = _extract_task_constraints_llm(
-            "openai/gpt-4.1", "Do something", {}
-        )
-        assert result == TaskConstraints()
-
-    @patch("agent.loop.call_llm")
-    def test_none_content_returns_default(self, mock_call_llm):
-        """None LLM content returns default TaskConstraints."""
-        from agent.loop import _extract_task_constraints_llm
-        from agent.dispatch import TaskConstraints
 
         mock_call_llm.return_value = MagicMock(
             content=None, tool_calls=[], raw=None,
@@ -1984,43 +1966,31 @@ class TestExtractTaskConstraintsLLM:
         result = _extract_task_constraints_llm(
             "openai/gpt-4.1", "Do something", {}
         )
-        assert result == TaskConstraints()
-
-    @patch("agent.loop.call_llm")
-    def test_json_with_extra_text_parsed(self, mock_call_llm):
-        """JSON embedded in extra text (e.g., markdown) is extracted."""
-        from agent.loop import _extract_task_constraints_llm
-        from agent.dispatch import TaskConstraints
-
-        mock_call_llm.return_value = MagicMock(
-            content='```json\n{"source_file": "app.py", "scope_level": "normal", "target_directories": []}\n```',
-            tool_calls=[], raw=None,
-        )
-
-        result = _extract_task_constraints_llm(
-            "openai/gpt-4.1", "Edit app.py", {}
-        )
-        assert result.source_file == "app.py"
+        assert result.source_file is None
+        assert result.scope_level == "normal"
 
     @patch("agent.loop.call_llm")
     def test_prompt_contains_task_text(self, mock_call_llm):
-        """The LLM is prompted with the task text."""
+        """The LLM is called with the task text and classify_task tool."""
         from agent.loop import _extract_task_constraints_llm
+        from agent.llm import ToolCall
 
         mock_call_llm.return_value = MagicMock(
-            content='{"source_file": null, "scope_level": "normal", "target_directories": []}',
-            tool_calls=[], raw=None,
+            content="",
+            tool_calls=[ToolCall(id="tc1", name="classify_task",
+                                 arguments={"task_type": "specific_action"})],
+            raw=None,
         )
 
         _extract_task_constraints_llm(
             "openai/gpt-4.1", "My specific task text here", {"trace_id": "t1"}
         )
 
-        # Verify the prompt passed to call_llm contains the task text
+        # Verify the call includes the task text
         call_args = mock_call_llm.call_args
-        messages = call_args[0][1] if len(call_args[0]) > 1 else call_args[1]["messages"]
-        all_content = " ".join(m.get("content", "") or "" for m in messages)
-        assert "My specific task text here" in all_content
+        all_args_str = str(call_args)
+        assert "My specific task text here" in all_args_str
+        assert "classify_task" in all_args_str
 
 
 @pytest.mark.no_default_constraints

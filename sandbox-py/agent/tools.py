@@ -335,6 +335,22 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "current_date",
+            "description": (
+                "Get today's date from the sandbox environment. "
+                "Use when a task mentions a time reference. "
+                "Phrases like 'in two weeks', 'next month' mean relative to TODAY. "
+                "Phrases like 'push back by two weeks', 'delay by 10 days' mean relative to the existing date."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
 ]
 
 TOOL_NAMES: set[str] = {s["function"]["name"] for s in TOOL_SCHEMAS}

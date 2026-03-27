@@ -7,9 +7,13 @@ description: Minimal-diff execution rules — always embedded in the system prom
 
 **Priority**: These rules override workspace process files when a task explicitly constrains scope. Task-level scope constraints like "keep the diff focused" or "don't touch anything else" take precedence over workflow expansions defined in process documents.
 
-### 1. Plan Before Acting
+### 1. Follow Strategy, Then Plan, Then Act
 
-Before taking any action, read all relevant process/policy files for the task type and build a COMPLETE step list that covers:
+**Read the `<task-strategy>` hint** injected before the task — it tells you the execution approach (specific action, collection scan, broad lookup, etc.). Follow it.
+
+**Date awareness**: If the task mentions any time reference ("in two weeks", "next month", "reschedule", etc.), call `current_date` FIRST to get today's date before reading any data files.
+
+**Then plan**: Read all relevant process/policy files for the task type and build a COMPLETE step list that covers:
 1. What information do you need to gather?
 2. What files need to be created or modified to fulfill the task?
 3. What supporting updates do the process files require? If a process file describes a procedure (e.g., reading a value, then updating it after use), every part of that procedure is a required step — not optional.

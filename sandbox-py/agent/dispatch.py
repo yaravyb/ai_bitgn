@@ -114,6 +114,7 @@ class TaskConstraints:
     Immutable value object. Default values disable all constraint-based
     guards (fail-open).
     """
+    task_type: str = "specific_action"     # "specific_action" | "collection" | "lookup" | "unsupported" | "ambiguous"
     source_file: str | None = None
     scope_level: str = "normal"            # "focused" | "normal"
     target_directories: tuple[str, ...] = ()
@@ -236,6 +237,30 @@ def _handle_write_file(
     content = args.get("content", "")
     start_line = args.get("start_line", 0)
     end_line = args.get("end_line", 0)
+
+    # Weak models may pass content as a dict/list instead of a string
+    if not isinstance(content, str):
+        content = json.dumps(content, indent=2, ensure_ascii=False) + "\n"
+
+    # Sanitize JSON files: weak models may append trailing text after the JSON object.
+    # Re-serialize to ensure valid JSON before writing.
+    if path.endswith(".json") and not start_line:
+        try:
+            parsed = json.loads(content)
+            content = json.dumps(parsed, indent=2, ensure_ascii=False) + "\n"
+        except (json.JSONDecodeError, ValueError):
+            # Also try extracting the first valid JSON object from the content
+            brace = content.find("{")
+            if brace != -1:
+                for end in range(len(content) - 1, brace, -1):
+                    if content[end] == "}":
+                        try:
+                            parsed = json.loads(content[brace:end + 1])
+                            content = json.dumps(parsed, indent=2, ensure_ascii=False) + "\n"
+                            log.debug("write_file: extracted valid JSON from malformed content for %s", path)
+                            break
+                        except (json.JSONDecodeError, ValueError):
+                            continue
 
     resp = vm.write(path, content, start_line=start_line, end_line=end_line)
     return json.dumps(MessageToDict(resp), ensure_ascii=False)
@@ -430,8 +455,19 @@ def _handle_plan_step_done(
     skill_loader: Any | None,
 ) -> str:
     raw = args.get("step_index", 0)
-    # Accept single int or array of ints
-    indices: list[int] = raw if isinstance(raw, list) else [raw]
+    # Accept single int, string, stringified array, or actual array —
+    # weak models may pass "0", "[0]", "[0, 1, 2]", or 0
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if raw.startswith("["):
+            try:
+                raw = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                raw = [int(x.strip()) for x in raw.strip("[]").split(",") if x.strip()]
+    if isinstance(raw, list):
+        indices: list[int] = [int(i) for i in raw]
+    else:
+        indices = [int(raw)]
     plan, error = _read_plan()
     if plan is None:
         return error  # type: ignore[return-value]
@@ -470,7 +506,7 @@ def _handle_plan_step_skip(
     protected_files: set[str],
     skill_loader: Any | None,
 ) -> str:
-    step_index: int = args.get("step_index", 0)
+    step_index: int = int(args.get("step_index", 0))
     reason: str = args.get("reason", "")
     plan, error = _read_plan()
     if plan is None:
@@ -527,6 +563,25 @@ def _handle_plan_note(
         f.write(json_content)
     log.info("plan_note: saved note (%d notes total)", len(notes))
     return json.dumps({"saved": note, "total_notes": len(notes)}, ensure_ascii=False)
+
+
+def _handle_current_date(
+    vm,
+    args: dict[str, Any],
+    tracker: GroundingTracker,
+    protected_files: set[str],
+    skill_loader: Any | None,
+) -> str:
+    """Get the sandbox VM's current simulated date via the Context RPC."""
+    try:
+        resp = vm.get_context()
+        data = MessageToDict(resp)
+        time_str = data.get("time", "")
+        today = time_str[:10] if time_str else ""
+        return json.dumps({"today": today}, ensure_ascii=False)
+    except Exception as exc:
+        log.warning("current_date: Context RPC failed: %s", exc)
+        return json.dumps({"error": f"Could not get sandbox date: {exc}"}, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -694,6 +749,7 @@ DISPATCH_MAP: dict[str, Callable] = {
     "plan_step_skip": _handle_plan_step_skip,
     "plan_status": _handle_plan_status,
     "plan_note": _handle_plan_note,
+    "current_date": _handle_current_date,
 }
 
 
