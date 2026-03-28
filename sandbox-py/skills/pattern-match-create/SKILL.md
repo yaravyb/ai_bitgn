@@ -58,3 +58,4 @@ When creating new files:
 - **Meta-files are authoritative**: If a meta-file specifies a template or naming rule, follow it exactly.
 - **Consistency over creativity**: Match existing patterns precisely; do not introduce new conventions.
 - **Highest-numbered is freshest**: The highest-numbered file is usually the best template for new entries.
+- **Preserve source filenames**: When moving, copying, or capturing a file from one directory to another, keep the original filename as-is. Do NOT reformat or add segments (e.g. numbering, timestamps) to match existing files in the target directory. The source filename is the ground truth.

@@ -55,14 +55,20 @@ _REDIRECT_RE = re.compile(
 # Data structures
 # ---------------------------------------------------------------------------
 
+def _default_tree_level() -> int:
+    """Read SCOUT_TREE_LEVEL env var at instance creation time, default 3."""
+    return int(os.environ.get("SCOUT_TREE_LEVEL", "3"))
+
+
 @dataclass
 class ScoutConfig:
-    """Configuration for the two-phase scout."""
+    """Configuration for the two-phase scout. Extended with tree_level."""
 
     model: str                  # Required: LiteLLM model identifier for scout LLM
     task_instruction: str       # Required: user's task text for task-aware exploration
     max_steps: int = 20        # Maximum LLM call rounds in Phase 2
     max_workers: int = 4       # Thread pool size for parallel tool dispatch
+    tree_level: int = field(default_factory=_default_tree_level)  # Configurable via SCOUT_TREE_LEVEL env var
 
 
 @dataclass
@@ -138,6 +144,7 @@ def _run_bootstrap(
     tracker: GroundingTracker,
     protected_files: set[str],
     context_config: ContextConfig | None = None,
+    config: ScoutConfig | None = None,
 ) -> BootstrapContext:
     """Phase 1: tree("/") + read root-level text files.
 
@@ -146,13 +153,15 @@ def _run_bootstrap(
         tracker: GroundingTracker to record files read.
         protected_files: Set of protected file paths.
         context_config: Optional context config for tool result truncation.
+        config: Optional ScoutConfig for tree_level and other settings.
 
     Returns:
         BootstrapContext with directory tree, root files, and folder list.
     """
-    # Step 1: Get full directory tree
+    # Step 1: Get depth-limited directory tree (SDK v2: configurable tree_level)
+    tree_level = config.tree_level if config is not None else 3
     tree_result = dispatch_tool(
-        vm, "tree", {"path": "/"}, tracker, protected_files,
+        vm, "tree", {"path": "/", "level": tree_level}, tracker, protected_files,
         context_config=context_config,
     )
 
@@ -448,7 +457,7 @@ def run_scout(
 
     # Phase 1: Deterministic Bootstrap
     print("  Scout Phase 1: Bootstrap (tree + root files)...", flush=True)
-    bootstrap = _run_bootstrap(vm, tracker, protected_files, context_config=context_config)
+    bootstrap = _run_bootstrap(vm, tracker, protected_files, context_config=context_config, config=config)
     print(
         f"  Bootstrap: {len(bootstrap.folders_discovered)} folders, "
         f"{len(bootstrap.root_policy_files)} policy files, "

@@ -2,11 +2,17 @@
 
 Leaf module: no imports from other agent/ modules.
 Provides provider-agnostic LLM access with error handling and retry.
+
+Custom endpoint support: set LLM_API_BASE and LLM_API_KEY env vars
+to route all LLM calls to a custom OpenAI-compatible endpoint.
+Example: LLM_API_BASE=https://gpt.azati.com/llm-api LLM_API_KEY=test1
+         MODEL_ID=openai/qwen3.5:27b-q4_K_M
 """
 
 from __future__ import annotations
 
 import json
+import os
 import time
 import logging
 from dataclasses import dataclass
@@ -59,6 +65,12 @@ def _parse_response(response: Any) -> LLMResponse:
     message = response.choices[0].message
 
     content = message.content
+    # Reasoning models (Qwen, DeepSeek) may put output in reasoning_content
+    # with empty content field. Fall back to reasoning_content when available.
+    if not content:
+        reasoning = getattr(message, "reasoning_content", None)
+        if reasoning:
+            content = reasoning
 
     tool_calls: list[ToolCall] = []
     if message.tool_calls:
@@ -110,6 +122,13 @@ def call_llm(
         kwargs["parallel_tool_calls"] = True
     if metadata is not None:
         kwargs["metadata"] = metadata
+    # Custom endpoint support: route to a self-hosted OpenAI-compatible API
+    api_base = os.environ.get("LLM_API_BASE")
+    if api_base:
+        kwargs["api_base"] = api_base
+    api_key = os.environ.get("LLM_API_KEY")
+    if api_key:
+        kwargs["api_key"] = api_key
 
     last_exception: BaseException | None = None
     for attempt in range(_MAX_RETRIES):

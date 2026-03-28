@@ -23,6 +23,7 @@ from bitgn.vm.mini_pb2 import (
 from bitgn.vm.pcm_connect import PcmRuntimeClientSync
 from bitgn.vm.pcm_pb2 import (
     AnswerRequest as PcmAnswerRequest,
+    ContextRequest,
     DeleteRequest as PcmDeleteRequest,
     FindRequest,
     ListRequest as PcmListRequest,
@@ -46,10 +47,10 @@ class RuntimeAdapter(Protocol):
     @property
     def extra_tools(self) -> frozenset[str]: ...
 
-    def tree(self, path: str) -> Any: ...
+    def tree(self, path: str, level: int = 0) -> Any: ...
     def list_dir(self, path: str) -> Any: ...
-    def read(self, path: str) -> Any: ...
-    def write(self, path: str, content: str) -> Any: ...
+    def read(self, path: str, number: bool = False, start_line: int = 0, end_line: int = 0) -> Any: ...
+    def write(self, path: str, content: str, start_line: int = 0, end_line: int = 0) -> Any: ...
     def delete(self, path: str) -> Any: ...
     def search(self, root: str, pattern: str, limit: int) -> Any: ...
     def answer(self, answer: str, refs: list[str], code: str) -> Any: ...
@@ -67,16 +68,18 @@ class MiniRuntime:
     def __init__(self, vm: MiniRuntimeClientSync) -> None:
         self._vm = vm
 
-    def tree(self, path: str) -> Any:
+    def tree(self, path: str, level: int = 0) -> Any:
+        # SDK v2 note: MiniRuntime uses OutlineRequest which does not support
+        # a 'level' parameter. The level arg is accepted but gracefully ignored.
         return self._vm.outline(OutlineRequest(path=path))
 
     def list_dir(self, path: str) -> Any:
         return self._vm.list(MiniListRequest(path=path))
 
-    def read(self, path: str) -> Any:
+    def read(self, path: str, number: bool = False, start_line: int = 0, end_line: int = 0) -> Any:
         return self._vm.read(MiniReadRequest(path=path))
 
-    def write(self, path: str, content: str) -> Any:
+    def write(self, path: str, content: str, start_line: int = 0, end_line: int = 0) -> Any:
         return self._vm.write(MiniWriteRequest(path=path, content=content))
 
     def delete(self, path: str) -> Any:
@@ -101,6 +104,9 @@ class MiniRuntime:
 _CODE_TO_OUTCOME = {
     "completed": Outcome.OUTCOME_OK,
     "failed": Outcome.OUTCOME_ERR_INTERNAL,
+    "unsupported": Outcome.OUTCOME_NONE_UNSUPPORTED,
+    "denied": Outcome.OUTCOME_DENIED_SECURITY,
+    "clarification": Outcome.OUTCOME_NONE_CLARIFICATION,
     "OUTCOME_OK": Outcome.OUTCOME_OK,
     "OUTCOME_DENIED_SECURITY": Outcome.OUTCOME_DENIED_SECURITY,
     "OUTCOME_NONE_CLARIFICATION": Outcome.OUTCOME_NONE_CLARIFICATION,
@@ -120,17 +126,18 @@ class PcmRuntime:
     def __init__(self, vm: PcmRuntimeClientSync) -> None:
         self._vm = vm
 
-    def tree(self, path: str) -> Any:
-        return self._vm.tree(TreeRequest(root=path))
+    def tree(self, path: str, level: int = 0) -> Any:
+        # SDK v2: passes level to TreeRequest for depth-limited directory trees.
+        return self._vm.tree(TreeRequest(root=path, level=level))
 
     def list_dir(self, path: str) -> Any:
         return self._vm.list(PcmListRequest(name=path))
 
-    def read(self, path: str) -> Any:
-        return self._vm.read(PcmReadRequest(path=path))
+    def read(self, path: str, number: bool = False, start_line: int = 0, end_line: int = 0) -> Any:
+        return self._vm.read(PcmReadRequest(path=path, number=number, start_line=start_line, end_line=end_line))
 
-    def write(self, path: str, content: str) -> Any:
-        return self._vm.write(PcmWriteRequest(path=path, content=content))
+    def write(self, path: str, content: str, start_line: int = 0, end_line: int = 0) -> Any:
+        return self._vm.write(PcmWriteRequest(path=path, content=content, start_line=start_line, end_line=end_line))
 
     def delete(self, path: str) -> Any:
         return self._vm.delete(PcmDeleteRequest(path=path))
@@ -150,6 +157,10 @@ class PcmRuntime:
 
     def move(self, from_name: str, to_name: str) -> Any:
         return self._vm.move(MoveRequest(from_name=from_name, to_name=to_name))
+
+    def get_context(self) -> Any:
+        """Get the sandbox's simulated current date/time."""
+        return self._vm.context(ContextRequest())
 
 
 def create_runtime(benchmark_id: str, harness_url: str) -> RuntimeAdapter:

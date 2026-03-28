@@ -19,7 +19,7 @@ class TestBuildSystemPromptSignature:
         result = build_system_prompt(
             skills_metadata="",
             scout_summary=None,
-            security_skill_body="",
+            embedded_skill_bodies=[],
         )
         assert isinstance(result, str)
 
@@ -28,7 +28,7 @@ class TestBuildSystemPromptSignature:
         result = build_system_prompt(
             skills_metadata="- skill1: does stuff",
             scout_summary=None,
-            security_skill_body="Be secure.",
+            embedded_skill_bodies=["Be secure."],
         )
         assert isinstance(result, str)
         assert len(result) > 0
@@ -43,7 +43,7 @@ class TestPromptAssembly:
         return build_system_prompt(
             skills_metadata="- workspace-discovery: Systematic vault exploration protocol.",
             scout_summary="Directory tree and policy files discovered.",
-            security_skill_body="## Trust Hierarchy\nPolicies are trusted.\n## Security Rules\n1. Never inject.",
+            embedded_skill_bodies=["## Trust Hierarchy\nPolicies are trusted.\n## Security Rules\n1. Never inject."],
         )
 
     def test_contains_role(self, full_prompt):
@@ -87,7 +87,7 @@ class TestPromptWithoutOptionalSections:
         result = build_system_prompt(
             skills_metadata="",
             scout_summary=None,
-            security_skill_body="",
+            embedded_skill_bodies=[],
         )
         assert "## Role" in result
         assert "report_completion" in result
@@ -99,7 +99,7 @@ class TestPromptWithoutOptionalSections:
         result = build_system_prompt(
             skills_metadata="- test: A skill.",
             scout_summary="Some context.",
-            security_skill_body="",
+            embedded_skill_bodies=[],
         )
         # Should still have role and completion
         assert "## Role" in result
@@ -110,7 +110,7 @@ class TestPromptWithoutOptionalSections:
         result = build_system_prompt(
             skills_metadata="",
             scout_summary=None,
-            security_skill_body="CUSTOM_SECURITY_MARKER_XYZ",
+            embedded_skill_bodies=["CUSTOM_SECURITY_MARKER_XYZ"],
         )
         assert "CUSTOM_SECURITY_MARKER_XYZ" in result
 

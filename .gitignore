@@ -1,5 +1,8 @@
 .DS_Store
 .envrc
 .idea/
-/sandbox/py/.env
+__pycache__/
+*.pyc
+.transcripts/
+/sandbox-py/.env
 /sandbox/examples_of_agents/

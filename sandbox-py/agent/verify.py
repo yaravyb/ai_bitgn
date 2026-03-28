@@ -57,16 +57,77 @@ def should_verify(
     return True
 
 
+def _build_policy_section(policy_contents: dict[str, str]) -> str:
+    """Format policy file contents into a section string.
+
+    Returns an empty string when no policies are provided.
+    """
+    if not policy_contents:
+        return ""
+    parts: list[str] = ["## Policy Files"]
+    for path, content in sorted(policy_contents.items()):
+        parts.append(f"### {path}")
+        parts.append(content)
+    return "\n".join(parts)
+
+
+def _build_source_basename_section(source_basename: str | None) -> str:
+    """Format the source filename check section.
+
+    Returns an empty string when no source basename is provided.
+    """
+    if not source_basename:
+        return ""
+    return (
+        f"## Source Filename Check\n"
+        f"The task references source file `{source_basename}`. "
+        f"All derived files MUST use this exact basename. "
+        f"If any file you created has a different basename "
+        f"(e.g. extra segments added), delete it and recreate "
+        f"with the correct name before submitting."
+    )
+
+
 def build_verification_prompt(
     answer: str,
     code: str,
     policy_contents: dict[str, str],
+    checklist_body: str = "",
+    source_basename: str | None = None,
+    frame_template: str | None = None,
+    plan_status: str = "",
 ) -> str:
     """Construct the verification prompt injected as a user message.
 
-    The prompt includes the proposed answer/code verbatim, policy file
-    contents, a verification checklist, and submission instructions.
+    When ``frame_template`` is provided, performs placeholder substitution:
+      ``{{ANSWER}}``, ``{{CODE}}``, ``{{POLICY_SECTION}}``,
+      ``{{CHECKLIST_SECTION}}``, ``{{SOURCE_BASENAME_SECTION}}``,
+      ``{{PLAN_STATUS_SECTION}}``.
+    When ``frame_template`` is ``None``, uses the inline fallback frame
+    for backward compatibility.
+
+    The verification checklist content comes from the ``checklist_body``
+    parameter (loaded from a skill file externally).
+    When ``source_basename`` is provided, a concrete filename check is added.
+    When ``plan_status`` is provided, plan status is injected into the prompt.
     """
+    # Build dynamic section content used by both paths
+    policy_section = _build_policy_section(policy_contents)
+    checklist_section = checklist_body.strip() if checklist_body else ""
+    source_section = _build_source_basename_section(source_basename)
+
+    # --- Template-driven path ---
+    if frame_template:
+        result = frame_template
+        result = result.replace("{{ANSWER}}", answer)
+        result = result.replace("{{CODE}}", code)
+        result = result.replace("{{POLICY_SECTION}}", policy_section)
+        result = result.replace("{{CHECKLIST_SECTION}}", checklist_section)
+        result = result.replace("{{SOURCE_BASENAME_SECTION}}", source_section)
+        result = result.replace("{{PLAN_STATUS_SECTION}}", plan_status)
+        return result
+
+    # --- Fallback: inline frame construction ---
     parts: list[str] = []
     parts.append("<verification>")
     parts.append(
@@ -78,29 +139,21 @@ def build_verification_prompt(
     parts.append(f"Code: {code}")
     parts.append(f"Answer: {answer}")
 
-    if policy_contents:
+    if policy_section:
         parts.append("")
-        parts.append("## Policy Files")
-        for path, content in sorted(policy_contents.items()):
-            parts.append(f"### {path}")
-            parts.append(content)
+        parts.append(policy_section)
 
-    parts.append("")
-    parts.append("## Verification Checklist")
-    parts.append(
-        "1. Re-read the policy files above. Does the answer comply with "
-        "ALL format rules (exact casing, whitespace, punctuation, response codes)?"
-    )
-    parts.append(
-        "2. If you performed file operations (write_file, delete_file), "
-        "verify they succeeded by re-reading or listing the affected paths."
-    )
-    parts.append(
-        "3. Check that all grounding references point to files that actually exist."
-    )
-    parts.append(
-        "4. Verify the answer is complete and addresses the full task requirement."
-    )
+    if checklist_section:
+        parts.append("")
+        parts.append(checklist_section)
+
+    if source_section:
+        parts.append("")
+        parts.append(source_section)
+
+    if plan_status:
+        parts.append("")
+        parts.append(plan_status)
 
     parts.append("")
     parts.append("## Instructions")

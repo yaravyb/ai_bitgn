@@ -12,13 +12,14 @@ from __future__ import annotations
 def build_system_prompt(
     skills_metadata: str,
     scout_summary: str | None = None,
-    security_skill_body: str = "",
+    embedded_skill_bodies: list[str] | None = None,
 ) -> str:
     """Build the executor system prompt.
 
     The prompt is assembled from:
     - A minimal role definition (structural only)
-    - Security skill body (injected from skills/security-posture/SKILL.md)
+    - Embedded skill bodies (always-on skills like security-posture,
+      execution-discipline)
     - Skills catalog (Layer 1 descriptions)
     - Scout context (discovered workspace data)
     - A minimal completion format (structural only)
@@ -41,9 +42,11 @@ def build_system_prompt(
         "If AGENTS.MD redirects (e.g. 'See CLAUDE.MD'), the target is your policy."
     )
 
-    # Security — content comes entirely from the security-posture skill
-    if security_skill_body and security_skill_body.strip():
-        sections.append(security_skill_body)
+    # Embedded skills — always-on behavioral rules from skill files
+    if embedded_skill_bodies:
+        for body in embedded_skill_bodies:
+            if body and body.strip():
+                sections.append(body)
 
     # Skills catalog (Layer 1 descriptions)
     if skills_metadata and skills_metadata.strip():
@@ -63,7 +66,7 @@ def build_system_prompt(
             f"{scout_summary}"
         )
 
-    # Completion format — minimal structural frame
+    # Completion format — minimal structural frame (no behavioral rules)
     sections.append(
         "## Completion Format\n"
         "\n"
@@ -76,7 +79,7 @@ def build_system_prompt(
         "data files you read or created, rules files that defined formats. "
         "Exclude pure redirects and irrelevant files.\n"
         "- `steps`: Brief list of what you did.\n"
-        "- `code`: \"completed\" or \"failed\"."
+        "- `code`: PCM outcome that best matches the situation."
     )
 
     return "\n\n".join(sections)
@@ -142,7 +145,10 @@ def build_scout_prompt(
         "5. Use parallel tool calls to batch multiple reads or listings.\n"
         "6. Skip clearly irrelevant directories (e.g., `node_modules`, `.git`).\n"
         "7. You have the full directory tree already -- jump directly to any "
-        "path at any depth. No level-by-level traversal needed."
+        "path at any depth. No level-by-level traversal needed.\n"
+        "8. For files exceeding ~200 lines (visible from tree/list output), "
+        "use start_line/end_line parameters to read only relevant sections "
+        "rather than loading the entire file."
     )
 
     # 5. Completion instructions

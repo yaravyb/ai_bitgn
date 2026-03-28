@@ -1,0 +1,29 @@
+{
+  "featureName": "persistent-task-planner",
+  "description": "Add a persistent task planning system (inspired by s07_task_system.py) that lets the model decompose tasks into steps stored as JSON files on disk. Steps survive context compression, enabling the model to reorient after micro-compact/auto-compact by reading its plan. Addresses the cycling problem where weak models re-read the same files because they forget what they already did.",
+  "codeName": "persistent-task-planner",
+  "language": "en",
+  "createdAt": "2026-03-25T18:00:00Z",
+  "updatedAt": "2026-03-25T22:00:00Z",
+  "status": "implemented",
+  "phases": {
+    "requirements": "requirements-generated",
+    "design": "design-generated",
+    "tasks": "tasks-generated",
+    "implementation": "completed"
+  },
+  "approvals": {
+    "requirements": {
+      "generated": true,
+      "approved": true
+    },
+    "design": {
+      "generated": true,
+      "approved": true
+    },
+    "tasks": {
+      "generated": true,
+      "approved": true
+    }
+  }
+}

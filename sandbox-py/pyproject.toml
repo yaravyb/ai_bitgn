@@ -5,8 +5,8 @@ description = "Runnable Python sample for the BitGN sandbox benchmark"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "bitgn-api-connectrpc-python==0.9.0.1.20260323140311+cbbd8b9c3c20",
-    "bitgn-api-protocolbuffers-python==34.1.0.1.20260323140311+cbbd8b9c3c20",
+    "bitgn-api-connectrpc-python==0.9.0.1.20260324104753+6b18c777b19a",
+    "bitgn-api-protocolbuffers-python==34.1.0.1.20260324104753+6b18c777b19a",
     "boto3>=1.42.69",
     "litellm>=1.82.3",
     "pydantic>=2.12.5",
@@ -24,6 +24,11 @@ dev = [
 ]
 observability = [
     "langfuse>=2.0.0",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "no_default_constraints: opt out of the autouse _default_constraint_extraction fixture",
 ]
 
 [tool.uv]

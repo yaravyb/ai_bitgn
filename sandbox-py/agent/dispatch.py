@@ -8,9 +8,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import posixpath
+import re
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable
+from dataclasses import dataclass, field
+from typing import Any, Callable, NotRequired, TypedDict
 
 from google.protobuf.json_format import MessageToDict
 from connectrpc.errors import ConnectError
@@ -20,6 +24,114 @@ from agent.llm import ToolCall
 from agent.context import ContextConfig, truncate_tool_result, COMPACT_SENTINEL
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Plan storage: local filesystem (host-side, not sandbox VM)
+# ---------------------------------------------------------------------------
+
+_plan_dir: str = ""
+
+
+def init_plan_storage(run_id: str) -> None:
+    """Initialise local plan directory for this agent run.
+
+    Called once from ``run_agent()`` with the trace-id UUID.
+    Plans are stored under ``/tmp/ai-bitgn-plans/<run_id>/`` so they
+    never pollute the sandbox VM filesystem (which is scored by benchmarks).
+    """
+    global _plan_dir
+    _plan_dir = os.path.join(tempfile.gettempdir(), "ai-bitgn-plans", run_id)
+    os.makedirs(_plan_dir, exist_ok=True)
+
+
+def get_plan_file_path() -> str:
+    """Return the absolute path to the plan file on the host."""
+    return os.path.join(_plan_dir, "steps.json")
+
+
+class _PlanStep(TypedDict):
+    index: int
+    description: str
+    status: str  # "pending" | "done" | "skipped"
+    skip_reason: NotRequired[str]
+
+
+class _PlanData(TypedDict):
+    steps: list[_PlanStep]
+    total: int
+    completed: int
+    skipped: int
+    notes: NotRequired[list[str]]
+
+
+def _read_plan() -> tuple[_PlanData | None, str | None]:
+    """Read and parse the plan file from local storage.
+
+    Returns (plan_data, None) on success, or (None, error_json) on failure.
+    """
+    plan_path = get_plan_file_path()
+    if not os.path.isfile(plan_path):
+        return (None, json.dumps({"error": "No plan exists. Call plan_create first."}, ensure_ascii=False))
+    try:
+        with open(plan_path, encoding="utf-8") as f:
+            plan: _PlanData = json.load(f)
+    except (json.JSONDecodeError, ValueError, OSError) as exc:
+        log.debug("Plan file read failed: %s", exc)
+        return (None, json.dumps({"error": f"Plan file is corrupted: {exc}"}, ensure_ascii=False))
+    return (plan, None)
+
+
+def _format_plan_response(plan: _PlanData) -> str:
+    """Format a plan data dict as an indented JSON string with summary."""
+    actionable = plan["total"] - plan["skipped"]
+    if plan["skipped"] > 0:
+        summary = f"{plan['completed']}/{actionable} actionable steps completed, {plan['skipped']} skipped"
+    else:
+        summary = f"{plan['completed']}/{plan['total']} steps completed"
+    plan["summary"] = summary  # type: ignore[typeddict-unknown-key]
+    return json.dumps(plan, indent=2, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Guard configuration dataclasses (frozen, thread-safe by immutability)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TemplateGuardConfig:
+    """Configuration for the template deletion guard.
+
+    When protected_directories is empty, the guard defaults to blocking
+    all _-prefixed file deletions (backward compatibility).
+    """
+    protected_directories: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class TaskConstraints:
+    """Structured task constraints extracted by LLM or regex fast-path.
+
+    Immutable value object. Default values disable all constraint-based
+    guards (fail-open).
+    """
+    task_type: str = "specific_action"     # "specific_action" | "collection" | "lookup" | "unsupported" | "ambiguous"
+    source_file: str | None = None
+    scope_level: str = "normal"            # "focused" | "normal"
+    target_directories: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class DispatchContext:
+    """Immutable per-task guard configuration passed through dispatch calls.
+
+    Constructed once per task by loop.py. Passed by reference to
+    dispatch_tool() and dispatch_parallel(). Each concurrent thread
+    reads from this frozen snapshot without mutation.
+    """
+    source_basename: str | None = None
+    scope_constrained: bool = False
+    target_directories: tuple[str, ...] = ()
+    template_guard_config: TemplateGuardConfig = field(default_factory=TemplateGuardConfig)
 
 
 def _normalize_path(path: str) -> str:
@@ -47,7 +159,8 @@ def _handle_tree(
     skill_loader: Any | None,
 ) -> str:
     path = args.get("path", "/")
-    resp = vm.tree(path)
+    level = args.get("level", 0)
+    resp = vm.tree(path, level=level)
     # tree is a directory operation, not a file read — do not add to tracker
     return json.dumps(MessageToDict(resp), ensure_ascii=False)
 
@@ -72,9 +185,45 @@ def _handle_read_file(
     skill_loader: Any | None,
 ) -> str:
     path = args.get("path", "")
-    resp = vm.read(path)
+    number = args.get("number", False)
+    start_line = args.get("start_line", 0)
+    end_line = args.get("end_line", 0)
+    resp = vm.read(path, number=number, start_line=start_line, end_line=end_line)
     tracker.add(path)
     return json.dumps(MessageToDict(resp), ensure_ascii=False)
+
+
+_SLUG_PREFIX_RE = re.compile(r"^(?:\d[\d\-]*__(?:\d+__)*)")
+
+
+def _extract_slug(stem: str) -> str:
+    """Extract the non-date, non-numeric slug from a filename stem.
+
+    ``2026-03-23__0000__hn-foo`` → ``hn-foo``
+    ``2026-03-23__hn-foo``       → ``hn-foo``
+    ``report``                   → ``report``
+    """
+    return _SLUG_PREFIX_RE.sub("", stem)
+
+
+def _is_basename_mismatch(source_basename: str, written_path: str) -> bool:
+    """Detect if written file is a renamed derivative of the source.
+
+    Returns True when the written file shares the source's slug but has
+    extra segments inserted (e.g. ``__0000__``).  Returns False for exact
+    matches or unrelated filenames.
+    """
+    written_bn = posixpath.basename(written_path)
+    if written_bn == source_basename:
+        return False
+    src_stem = source_basename.rsplit(".", 1)[0]
+    dst_stem = written_bn.rsplit(".", 1)[0]
+    src_slug = _extract_slug(src_stem)
+    dst_slug = _extract_slug(dst_stem)
+    # Same slug but different full stem → segment was inserted
+    if src_slug and src_slug == dst_slug and src_stem != dst_stem:
+        return True
+    return False
 
 
 def _handle_write_file(
@@ -86,7 +235,34 @@ def _handle_write_file(
 ) -> str:
     path = args.get("path", "")
     content = args.get("content", "")
-    resp = vm.write(path, content)
+    start_line = args.get("start_line", 0)
+    end_line = args.get("end_line", 0)
+
+    # Weak models may pass content as a dict/list instead of a string
+    if not isinstance(content, str):
+        content = json.dumps(content, indent=2, ensure_ascii=False) + "\n"
+
+    # Sanitize JSON files: weak models may append trailing text after the JSON object.
+    # Re-serialize to ensure valid JSON before writing.
+    if path.endswith(".json") and not start_line:
+        try:
+            parsed = json.loads(content)
+            content = json.dumps(parsed, indent=2, ensure_ascii=False) + "\n"
+        except (json.JSONDecodeError, ValueError):
+            # Also try extracting the first valid JSON object from the content
+            brace = content.find("{")
+            if brace != -1:
+                for end in range(len(content) - 1, brace, -1):
+                    if content[end] == "}":
+                        try:
+                            parsed = json.loads(content[brace:end + 1])
+                            content = json.dumps(parsed, indent=2, ensure_ascii=False) + "\n"
+                            log.debug("write_file: extracted valid JSON from malformed content for %s", path)
+                            break
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+
+    resp = vm.write(path, content, start_line=start_line, end_line=end_line)
     return json.dumps(MessageToDict(resp), ensure_ascii=False)
 
 
@@ -220,6 +396,348 @@ def _handle_compact(
 
 
 # ---------------------------------------------------------------------------
+# Plan tool handlers (persistent-task-planner)
+# ---------------------------------------------------------------------------
+
+def _handle_plan_create(
+    vm,
+    args: dict[str, Any],
+    tracker: GroundingTracker,
+    protected_files: set[str],
+    skill_loader: Any | None,
+) -> str:
+    steps_input: list[str] = args.get("steps", [])
+    if not steps_input:
+        return json.dumps(
+            {"error": "plan_create requires at least one step"},
+            ensure_ascii=False,
+        )
+    steps: list[_PlanStep] = [
+        {"index": i, "description": desc, "status": "pending"}
+        for i, desc in enumerate(steps_input)
+    ]
+    plan: _PlanData = {
+        "steps": steps,
+        "total": len(steps),
+        "completed": 0,
+        "skipped": 0,
+    }
+    json_content = json.dumps(plan, indent=2, ensure_ascii=False)
+    plan_path = get_plan_file_path()
+    with open(plan_path, "w", encoding="utf-8") as f:
+        f.write(json_content)
+    log.info("plan_create: %d steps created", len(steps))
+    return _format_plan_response(plan)
+
+
+def _handle_plan_status(
+    vm,
+    args: dict[str, Any],
+    tracker: GroundingTracker,
+    protected_files: set[str],
+    skill_loader: Any | None,
+) -> str:
+    plan, error = _read_plan()
+    if plan is None:
+        return json.dumps(
+            {"message": "No plan has been created yet. Use plan_create to create one."},
+            ensure_ascii=False,
+        )
+    log.info("plan_status: %d/%d steps completed", plan["completed"], plan["total"])
+    return _format_plan_response(plan)
+
+
+def _handle_plan_step_done(
+    vm,
+    args: dict[str, Any],
+    tracker: GroundingTracker,
+    protected_files: set[str],
+    skill_loader: Any | None,
+) -> str:
+    raw = args.get("step_index", 0)
+    # Accept single int, string, stringified array, or actual array —
+    # weak models may pass "0", "[0]", "[0, 1, 2]", or 0
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if raw.startswith("[") or "," in raw:
+            try:
+                raw = json.loads(raw if raw.startswith("[") else f"[{raw}]")
+            except (json.JSONDecodeError, ValueError):
+                raw = [int(x.strip()) for x in raw.strip("[]").split(",") if x.strip()]
+    if isinstance(raw, list):
+        indices: list[int] = [int(i) for i in raw]
+    else:
+        indices = [int(raw)]
+    plan, error = _read_plan()
+    if plan is None:
+        return error  # type: ignore[return-value]
+    for idx in indices:
+        if idx < 0 or idx >= plan["total"]:
+            return json.dumps(
+                {"error": f"step_index {idx} is out of range. Valid range: 0 to {plan['total'] - 1}."},
+                ensure_ascii=False,
+            )
+    for idx in indices:
+        plan["steps"][idx]["status"] = "done"
+        plan["steps"][idx].pop("skip_reason", None)
+    # Recompute counts
+    plan["completed"] = sum(1 for s in plan["steps"] if s["status"] == "done")
+    plan["skipped"] = sum(1 for s in plan["steps"] if s["status"] == "skipped")
+    # Preserve notes if present
+    notes = plan.get("notes", [])  # type: ignore[assignment]
+    write_data: dict[str, Any] = {
+        "steps": plan["steps"], "total": plan["total"],
+        "completed": plan["completed"], "skipped": plan["skipped"],
+    }
+    if notes:
+        write_data["notes"] = notes
+    json_content = json.dumps(write_data, indent=2, ensure_ascii=False)
+    plan_path = get_plan_file_path()
+    with open(plan_path, "w", encoding="utf-8") as f:
+        f.write(json_content)
+    log.info("plan_step_done: marked %d steps done (%d/%d completed)", len(indices), plan["completed"], plan["total"])
+    return _format_plan_response(plan)
+
+
+def _handle_plan_step_skip(
+    vm,
+    args: dict[str, Any],
+    tracker: GroundingTracker,
+    protected_files: set[str],
+    skill_loader: Any | None,
+) -> str:
+    raw_idx = args.get("step_index", 0)
+    # Accept single int, string, or stringified array — weak models may pass "[5, 6]"
+    if isinstance(raw_idx, str):
+        raw_idx = raw_idx.strip()
+        if raw_idx.startswith("[") or "," in raw_idx:
+            try:
+                raw_idx = json.loads(raw_idx if raw_idx.startswith("[") else f"[{raw_idx}]")
+            except (json.JSONDecodeError, ValueError):
+                raw_idx = [int(x.strip()) for x in raw_idx.strip("[]").split(",") if x.strip()]
+    indices: list[int] = [int(i) for i in raw_idx] if isinstance(raw_idx, list) else [int(raw_idx)]
+    reason: str = args.get("reason", "")
+    plan, error = _read_plan()
+    if plan is None:
+        return error  # type: ignore[return-value]
+    for idx in indices:
+        if idx < 0 or idx >= plan["total"]:
+            return json.dumps(
+                {"error": f"step_index {idx} is out of range. Valid range: 0 to {plan['total'] - 1}."},
+                ensure_ascii=False,
+            )
+    for idx in indices:
+        plan["steps"][idx]["status"] = "skipped"
+        if reason:
+            plan["steps"][idx]["skip_reason"] = reason
+    # Recompute counts
+    plan["completed"] = sum(1 for s in plan["steps"] if s["status"] == "done")
+    plan["skipped"] = sum(1 for s in plan["steps"] if s["status"] == "skipped")
+    notes = plan.get("notes", [])  # type: ignore[assignment]
+    write_data: dict[str, Any] = {
+        "steps": plan["steps"], "total": plan["total"],
+        "completed": plan["completed"], "skipped": plan["skipped"],
+    }
+    if notes:
+        write_data["notes"] = notes
+    json_content = json.dumps(write_data, indent=2, ensure_ascii=False)
+    plan_path = get_plan_file_path()
+    with open(plan_path, "w", encoding="utf-8") as f:
+        f.write(json_content)
+    log.info("plan_step_skip: marked %d steps skipped (%d/%d completed, %d skipped)", len(indices), plan["completed"], plan["total"], plan["skipped"])
+    return _format_plan_response(plan)
+
+
+def _handle_plan_note(
+    vm,
+    args: dict[str, Any],
+    tracker: GroundingTracker,
+    protected_files: set[str],
+    skill_loader: Any | None,
+) -> str:
+    note: str = args.get("note", "").strip()
+    if not note:
+        return json.dumps({"error": "plan_note requires a non-empty note"}, ensure_ascii=False)
+    plan_path = get_plan_file_path()
+    if os.path.isfile(plan_path):
+        with open(plan_path, encoding="utf-8") as f:
+            plan: _PlanData = json.load(f)
+    else:
+        # Allow notes even without a plan — create a minimal plan structure
+        plan = {"steps": [], "total": 0, "completed": 0, "skipped": 0, "notes": []}
+    notes: list[str] = plan.get("notes", [])  # type: ignore[assignment]
+    notes.append(note)
+    plan["notes"] = notes  # type: ignore[typeddict-unknown-key]
+    json_content = json.dumps(plan, indent=2, ensure_ascii=False)
+    with open(plan_path, "w", encoding="utf-8") as f:
+        f.write(json_content)
+    log.info("plan_note: saved note (%d notes total)", len(notes))
+    return json.dumps({"saved": note, "total_notes": len(notes)}, ensure_ascii=False)
+
+
+def _handle_current_date(
+    vm,
+    args: dict[str, Any],
+    tracker: GroundingTracker,
+    protected_files: set[str],
+    skill_loader: Any | None,
+) -> str:
+    """Get the sandbox VM's current simulated date via the Context RPC."""
+    try:
+        resp = vm.get_context()
+        data = MessageToDict(resp)
+        time_str = data.get("time", "")
+        today = time_str[:10] if time_str else ""
+        return json.dumps({"today": today}, ensure_ascii=False)
+    except Exception as exc:
+        log.warning("current_date: Context RPC failed: %s", exc)
+        return json.dumps({"error": f"Could not get sandbox date: {exc}"}, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Guard functions (standalone, pure, testable -- called by dispatch_tool)
+# ---------------------------------------------------------------------------
+
+def _check_basename_guard(
+    dispatch_ctx: DispatchContext,
+    path: str,
+) -> str | None:
+    """Return error message if basename mismatch detected, else None.
+
+    Reads source_basename from dispatch_ctx. When no source_basename is
+    configured, the guard is inactive (returns None).
+    """
+    source_basename = dispatch_ctx.source_basename
+    if not source_basename:
+        log.debug("basename guard: ALLOW %s (no source_basename set)", path)
+        return None
+    if _is_basename_mismatch(source_basename, path):
+        expected = source_basename
+        actual = posixpath.basename(path)
+        log.warning(
+            "basename guard: BLOCK %s (mismatch: expected %s, got %s)",
+            path, expected, actual,
+        )
+        return (
+            f"Filename mismatch: expected basename '{expected}', got '{actual}'. "
+            f"Use the exact source filename."
+        )
+    log.debug("basename guard: ALLOW %s (matches source %s)", path, source_basename)
+    return None
+
+
+def _check_scope_guard(
+    dispatch_ctx: DispatchContext,
+    path: str,
+    tracker: GroundingTracker,
+) -> str | None:
+    """Return error message if scope-constrained write is blocked, else None.
+
+    Implements intent-aware five-step decision logic:
+    1. Not constrained -> allow
+    2. File not previously read -> allow (new file creation)
+    3. Target in allowed directories -> allow
+    4. Basename matches source_basename -> allow
+    5. Block
+    """
+    # Step 1: Not constrained -> allow
+    if not dispatch_ctx.scope_constrained:
+        log.debug("scope guard: ALLOW %s (scope not constrained)", path)
+        return None
+
+    # Step 2: File not previously read -> allow
+    if not tracker.contains(path):
+        log.debug("scope guard: ALLOW %s (file not previously read)", path)
+        return None
+
+    # Step 3: Target in allowed directories -> allow
+    normalized = _normalize_path(path)
+    for target_dir in dispatch_ctx.target_directories:
+        normalized_target = _normalize_path(target_dir)
+        if normalized.startswith(normalized_target):
+            log.debug(
+                "scope guard: ALLOW %s (target in allowed directory %s)",
+                path, target_dir,
+            )
+            return None
+
+    # Step 4: Basename matches source_basename -> allow
+    if dispatch_ctx.source_basename:
+        if posixpath.basename(path) == dispatch_ctx.source_basename:
+            log.debug(
+                "scope guard: ALLOW %s (basename matches source %s)",
+                path, dispatch_ctx.source_basename,
+            )
+            return None
+
+    # Step 5: Block
+    log.warning(
+        "scope guard: BLOCK %s (scope constrained, file was already read, "
+        "no target match, source_basename=%s, target_dirs=%s)",
+        path, dispatch_ctx.source_basename, dispatch_ctx.target_directories,
+    )
+    return (
+        f"Scope constraint: modifying '{path}' blocked. "
+        f"The file was read for context and is not in the task's allowed targets. "
+        f"Only create new files or modify files in target directories."
+    )
+
+
+def _check_template_guard(
+    dispatch_ctx: DispatchContext,
+    path: str,
+) -> str | None:
+    """Return error message if template deletion is blocked, else None.
+
+    Configurable directory-scoped behavior:
+    1. If basename does not start with '_': ALLOW
+    2. If protected_directories is empty: BLOCK (backward compat default)
+    3. If file path is inside any protected_directory: BLOCK
+    4. Otherwise: ALLOW (not in protected scope)
+    """
+    basename = posixpath.basename(path)
+
+    # Step 1: Non-prefixed file -> always allowed
+    if not basename.startswith("_"):
+        log.debug("template guard: ALLOW %s (no underscore prefix)", path)
+        return None
+
+    protected_dirs = dispatch_ctx.template_guard_config.protected_directories
+
+    # Step 2: Empty protected_directories -> block all _-prefixed (backward compat)
+    if not protected_dirs:
+        log.warning(
+            "template guard: BLOCK %s (underscore-prefixed, no protected_dirs configured)",
+            path,
+        )
+        return (
+            f"Cannot delete template file: {path}. "
+            f"Files prefixed with '_' are structural, not captured content."
+        )
+
+    # Step 3: Check if file is inside any protected directory
+    normalized = _normalize_path(path)
+    for pdir in protected_dirs:
+        normalized_pdir = _normalize_path(pdir)
+        if normalized.startswith(normalized_pdir):
+            log.warning(
+                "template guard: BLOCK %s (underscore-prefixed, inside protected dir %s)",
+                path, pdir,
+            )
+            return (
+                f"Cannot delete template file: {path}. "
+                f"Files prefixed with '_' inside '{pdir}' are structural."
+            )
+
+    # Step 4: Not in any protected directory -> allow
+    log.debug(
+        "template guard: ALLOW %s (underscore-prefixed but outside protected dirs %s)",
+        path, protected_dirs,
+    )
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Dispatch map: tool name -> handler (Req 12.2)
 # ---------------------------------------------------------------------------
 
@@ -236,6 +754,12 @@ DISPATCH_MAP: dict[str, Callable] = {
     "find": _handle_find,
     "mkdir": _handle_mkdir,
     "move": _handle_move,
+    "plan_create": _handle_plan_create,
+    "plan_step_done": _handle_plan_step_done,
+    "plan_step_skip": _handle_plan_step_skip,
+    "plan_status": _handle_plan_status,
+    "plan_note": _handle_plan_note,
+    "current_date": _handle_current_date,
 }
 
 
@@ -251,14 +775,29 @@ def dispatch_tool(
     protected_files: set[str],
     skill_loader: Any | None = None,
     context_config: ContextConfig | None = None,
+    dispatch_ctx: DispatchContext | None = None,
 ) -> str:
     """Dispatch a single tool call and return the result as a JSON string.
 
     When context_config is provided, tool results (except report_completion)
     are truncated if they exceed the configured limit.
 
+    When dispatch_ctx is provided, guard functions are executed as pre-dispatch
+    checks for write_file and delete_file operations. When None, guards that
+    depend on context data are disabled (backward-compatible default).
+
     Returns error JSON if the tool_name is not recognized.
     """
+    # Pre-dispatch guard checks (only when dispatch_ctx is provided)
+    # NOTE: Only safety-invariant guards are applied programmatically.
+    # Behavioral decisions (scope, filenames) are left to the LLM + skills.
+    if dispatch_ctx is not None:
+        if tool_name == "delete_file":
+            path = args.get("path", "")
+            error = _check_template_guard(dispatch_ctx, path)
+            if error:
+                return json.dumps({"error": error}, ensure_ascii=False)
+
     handler = DISPATCH_MAP.get(tool_name)
     if handler is None:
         log.warning("Unknown tool: %s", tool_name)
@@ -298,8 +837,12 @@ def dispatch_parallel(
     skill_loader: Any | None = None,
     max_workers: int = 4,
     context_config: ContextConfig | None = None,
+    dispatch_ctx: DispatchContext | None = None,
 ) -> list[tuple[str, str]]:
     """Execute multiple tool calls concurrently.
+
+    The frozen dispatch_ctx instance is shared across all concurrent
+    dispatch_tool invocations without mutation, ensuring thread safety.
 
     Returns a list of (tool_call_id, result_json) tuples.
     """
@@ -313,6 +856,7 @@ def dispatch_parallel(
             vm, tc.name, tc.arguments,
             tracker, protected_files, skill_loader,
             context_config=context_config,
+            dispatch_ctx=dispatch_ctx,
         )
         return (tc.id, result)
 
