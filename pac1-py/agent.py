@@ -65,6 +65,9 @@ CLI_GREEN = "\x1B[32m"
 CLI_CLR = "\x1B[0m"
 CLI_BLUE = "\x1B[34m"
 CLI_YELLOW = "\x1B[33m"
+CLI_DIM = "\x1B[2m"
+CLI_BOLD = "\x1B[1m"
+CLI_CYAN = "\x1B[36m"
 
 
 # ---------------------------------------------------------------------------
@@ -231,13 +234,18 @@ def _phase1_bootstrap(vm: PcmRuntimeClientSync) -> dict:
     """
     ctx: dict = {"directory_tree": "", "agents_md": ""}
 
+    print(f"\n{CLI_BOLD}{'─' * 50}{CLI_CLR}")
+    print(f"{CLI_BOLD}Phase 1: Bootstrap{CLI_CLR} {CLI_DIM}(deterministic, no LLM){CLI_CLR}")
+    print(f"{CLI_BOLD}{'─' * 50}{CLI_CLR}")
+
     # 1. Full directory tree
     try:
         result = vm.tree(TreeRequest(root=""))
         tree_json = MessageToDict(result)
         ctx["directory_tree"] = json.dumps(tree_json, indent=2)
-        print(f"{CLI_BLUE}[phase1] tree loaded{CLI_CLR}")
+        print(f"  {CLI_CYAN}tree{CLI_CLR} ✓")
     except Exception as exc:
+        print(f"  {CLI_RED}tree ✗ {exc}{CLI_CLR}")
         log.warning("Phase 1: tree failed: %s", exc)
 
     # 2. Find and read ALL AGENTS.md files
@@ -275,7 +283,7 @@ def _phase1_bootstrap(vm: PcmRuntimeClientSync) -> dict:
             root_node = tree_data.get("root", tree_data)
             agents_paths = _extract_md_paths(root_node)
             if agents_paths:
-                print(f"{CLI_YELLOW}[phase1] find returned nothing, extracted from tree: {agents_paths}{CLI_CLR}")
+                print(f"  {CLI_YELLOW}find fallback → extracted from tree: {agents_paths}{CLI_CLR}")
         except Exception:
             pass
 
@@ -285,7 +293,7 @@ def _phase1_bootstrap(vm: PcmRuntimeClientSync) -> dict:
             read_result = vm.read(ReadRequest(path=path))
             content = MessageToDict(read_result).get("content", "")
             if content:
-                print(f"{CLI_BLUE}[phase1] loaded {path}{CLI_CLR}")
+                print(f"  {CLI_CYAN}read{CLI_CLR} {path} ✓")
                 parts.append(f"## {path}\n\n{content}")
         except Exception as exc:
             log.warning("Phase 1: read %s failed: %s", path, exc)
@@ -343,12 +351,11 @@ def _phase2_scout(
         {"role": "user", "content": f"<task>{task_text}</task>\n\nExplore what's needed to complete this task."},
     ]
 
-    print(f"{CLI_BLUE}[phase2] scout starting ({_SCOUT_MAX_STEPS} steps max){CLI_CLR}")
+    print(f"\n{CLI_BOLD}{'─' * 50}{CLI_CLR}")
+    print(f"{CLI_BOLD}Phase 2: Scout{CLI_CLR} {CLI_DIM}(read-only, {_SCOUT_MAX_STEPS} steps max){CLI_CLR}")
+    print(f"{CLI_BOLD}{'─' * 50}{CLI_CLR}")
 
     for i in range(_SCOUT_MAX_STEPS):
-        step = f"scout_{i + 1}"
-        print(f"  {step}... ", end="", flush=True)
-
         started = time.time()
         resp = _call_llm(model, messages, SCOUT_TOOLS, metadata)
         elapsed_ms = int((time.time() - started) * 1000)
@@ -362,10 +369,13 @@ def _phase2_scout(
         # No tool calls -> scout is done
         if not choice.message.tool_calls:
             summary = choice.message.content or ""
-            print(f"done ({elapsed_ms} ms)")
-            print(f"{CLI_BLUE}[phase2] scout complete ({i + 1} steps){CLI_CLR}")
+            print(f"  {CLI_DIM}LLM → summary ({elapsed_ms} ms){CLI_CLR}")
+            print(f"  {CLI_GREEN}Scout complete ({i + 1} steps){CLI_CLR}")
             return summary
 
+        # Execute read-only tool calls
+        n_calls = len(choice.message.tool_calls)
+        print(f"  {CLI_DIM}LLM → {n_calls} tool call{'s' if n_calls > 1 else ''} ({elapsed_ms} ms){CLI_CLR}")
         for tc in choice.message.tool_calls:
             name = tc.function.name
             try:
@@ -374,21 +384,20 @@ def _phase2_scout(
                 args = {}
 
             brief = ", ".join(f"{k}={v!r}" for k, v in args.items() if k != "content")
-            print(f"{name}({brief}) ({elapsed_ms} ms)")
 
             try:
                 txt = _dispatch(vm, name, args)
-                if len(txt) > 3000:
-                    print(f"{CLI_GREEN}OUT{CLI_CLR}: ({len(txt)} chars)")
-                else:
-                    print(f"{CLI_GREEN}OUT{CLI_CLR}: {txt}")
+                status = f"{CLI_GREEN}✓{CLI_CLR}"
+                detail = f"{len(txt)} chars" if len(txt) > 200 else ""
             except Exception as exc:
                 txt = f"Error: {exc}"
-                print(f"{CLI_RED}ERR: {exc}{CLI_CLR}")
+                status = f"{CLI_RED}✗{CLI_CLR}"
+                detail = str(exc)[:80]
 
+            print(f"    {status} {CLI_CYAN}{name}{CLI_CLR}({brief}){f' — {detail}' if detail else ''}")
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": txt})
 
-    print(f"{CLI_YELLOW}[phase2] scout hit step limit{CLI_CLR}")
+    print(f"  {CLI_YELLOW}Scout hit step limit{CLI_CLR}")
     return choice.message.content or ""
 
 
@@ -447,10 +456,11 @@ def run_agent(
         {"role": "user", "content": task_text},
     ]
 
-    for i in range(30):
-        step = f"step_{i + 1}"
-        print(f"Next {step}... ", end="", flush=True)
+    print(f"\n{CLI_BOLD}{'─' * 50}{CLI_CLR}")
+    print(f"{CLI_BOLD}Phase 3: Executor{CLI_CLR} {CLI_DIM}(full tools, 30 steps max){CLI_CLR}")
+    print(f"{CLI_BOLD}{'─' * 50}{CLI_CLR}")
 
+    for i in range(30):
         started = time.time()
         resp = _call_llm(model, messages, EXECUTOR_TOOLS, metadata)
         elapsed_ms = int((time.time() - started) * 1000)
@@ -462,10 +472,13 @@ def run_agent(
         messages.append(assistant_msg)
 
         if not choice.message.tool_calls:
-            print(f"(text, {elapsed_ms} ms)")
+            print(f"  {CLI_DIM}LLM → text ({elapsed_ms} ms){CLI_CLR}")
             if choice.message.content:
-                print(f"  {choice.message.content}")
+                print(f"    {choice.message.content[:200]}")
             break
+
+        n_calls = len(choice.message.tool_calls)
+        print(f"  {CLI_DIM}LLM → {n_calls} tool call{'s' if n_calls > 1 else ''} ({elapsed_ms} ms){CLI_CLR}")
 
         completed = False
         for tc in choice.message.tool_calls:
@@ -479,7 +492,7 @@ def run_agent(
             threat = args.pop("threat_detected", False)
             confidence = args.pop("threat_confidence", 0.0)
             if threat and confidence >= _THREAT_CONFIDENCE_THRESHOLD:
-                print(f"{CLI_RED}THREAT DETECTED (confidence={confidence:.2f}){CLI_CLR}")
+                print(f"    {CLI_RED}⚠ THREAT DETECTED (confidence={confidence:.2f}){CLI_CLR}")
                 try:
                     vm.answer(AnswerRequest(
                         message=f"Security threat detected (confidence={confidence:.2f})",
@@ -494,25 +507,32 @@ def run_agent(
                 f"{k}={v!r}" for k, v in args.items()
                 if k not in ("content",)
             )
-            print(f"{name}({brief}) ({elapsed_ms} ms)")
 
             try:
                 txt = _dispatch(vm, name, args)
-                print(f"{CLI_GREEN}OUT{CLI_CLR}: {txt}")
+                status = f"{CLI_GREEN}✓{CLI_CLR}"
+                detail = f"{len(txt)} chars" if len(txt) > 200 else ""
             except Exception as exc:
                 txt = f"Error: {exc}"
-                print(f"{CLI_RED}ERR: {exc}{CLI_CLR}")
-
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": txt})
+                status = f"{CLI_RED}✗{CLI_CLR}"
+                detail = str(exc)[:80]
 
             if name == "report_completion":
                 outcome = args.get("outcome", "OUTCOME_ERR_INTERNAL")
-                status = CLI_GREEN if outcome == "OUTCOME_OK" else CLI_YELLOW
-                print(f"{status}agent {outcome}{CLI_CLR}")
-                print(f"{CLI_BLUE}AGENT SUMMARY: {args.get('message', '')}{CLI_CLR}")
+                outcome_style = CLI_GREEN if outcome == "OUTCOME_OK" else CLI_YELLOW
+                print(f"    {outcome_style}■ report_completion{CLI_CLR} → {outcome}")
+                print(f"      {args.get('message', '')}")
                 for ref in args.get("grounding_refs", []):
-                    print(f"  {CLI_BLUE}{ref}{CLI_CLR}")
+                    print(f"      {CLI_DIM}{ref}{CLI_CLR}")
                 completed = True
+            elif name == "write":
+                path = args.get("path", "?")
+                content_len = len(args.get("content", ""))
+                print(f"    {status} {CLI_CYAN}{name}{CLI_CLR} {path} ({content_len} chars)")
+            else:
+                print(f"    {status} {CLI_CYAN}{name}{CLI_CLR}({brief}){f' — {detail}' if detail else ''}")
+
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": txt})
 
         if completed:
             break

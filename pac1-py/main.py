@@ -1,5 +1,6 @@
 import os
 import textwrap
+import time
 import uuid
 
 from bitgn.harness_connect import HarnessServiceClientSync
@@ -24,7 +25,9 @@ def main() -> None:
 
     task_filter = os.sys.argv[1:]
 
-    scores = []
+    scores: list[tuple[str, float, float]] = []
+    run_start = time.time()
+    print(f"Model: {MODEL_ID}  benchmark: {BENCHMARK_ID}")
     try:
         client = HarnessServiceClientSync(BITGN_URL)
         print("Connecting to BitGN", client.status(StatusRequest()))
@@ -58,30 +61,36 @@ def main() -> None:
                 },
             }
 
+            task_start = time.time()
             try:
                 run_agent(MODEL_ID, trial.harness_url, trial.instruction, metadata=trace_metadata)
             except Exception as exc:
                 print(exc)
+            task_elapsed = time.time() - task_start
 
             result = client.end_trial(EndTrialRequest(trial_id=trial.trial_id))
             if result.score >= 0:
-                scores.append((task.task_id, result.score))
+                scores.append((task.task_id, result.score, task_elapsed))
                 style = CLI_GREEN if result.score == 1 else CLI_RED
                 explain = textwrap.indent("\n".join(result.score_detail), "  ")
-                print(f"\n{style}Score: {result.score:0.2f}\n{explain}\n{CLI_CLR}")
+                print(f"\n{style}Score: {result.score:0.2f}  ({task_elapsed:.1f}s)\n{explain}\n{CLI_CLR}")
 
     except ConnectError as exc:
         print(f"{exc.code}: {exc.message}")
     except KeyboardInterrupt:
         print(f"{CLI_RED}Interrupted{CLI_CLR}")
 
-    if scores:
-        for task_id, score in scores:
-            style = CLI_GREEN if score == 1 else CLI_RED
-            print(f"{task_id}: {style}{score:0.2f}{CLI_CLR}")
+    total_elapsed = time.time() - run_start
 
-        total = sum(score for _, score in scores) / len(scores) * 100.0
-        print(f"FINAL: {total:0.2f}%")
+    if scores:
+        print(f"\nModel: {MODEL_ID}")
+        print("-" * 40)
+        for task_id, score, elapsed in scores:
+            style = CLI_GREEN if score == 1 else CLI_RED
+            print(f"{task_id}: {style}{score:0.2f}{CLI_CLR}  ({elapsed:.1f}s)")
+        print("-" * 40)
+        avg = sum(s[1] for s in scores) / len(scores) * 100.0
+        print(f"FINAL: {avg:0.2f}%  |  Total: {total_elapsed:.1f}s  |  Tasks: {len(scores)}")
 
 
 if __name__ == "__main__":
