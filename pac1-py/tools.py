@@ -298,3 +298,34 @@ for _tool in EXECUTOR_TOOLS:
 
 TOOL_NAMES: set[str] = {t["function"]["name"] for t in EXECUTOR_TOOLS}
 SCOUT_TOOL_NAMES: set[str] = {t["function"]["name"] for t in SCOUT_TOOLS}
+
+# ---------------------------------------------------------------------------
+# Validation tool — used to classify task feasibility before scout phase
+# ---------------------------------------------------------------------------
+
+VALIDATE_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "classify_task",
+        "description": "Classify whether the task can be done with file-system tools only.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "category": {
+                    "type": "string",
+                    "enum": ["FEASIBLE", "UNSUPPORTED", "CLARIFICATION"],
+                    "description": (
+                        "FEASIBLE: task can be done with file read/write/delete/move/search. "
+                        "UNSUPPORTED: task requires email, calendar, web, API, or messaging. "
+                        "CLARIFICATION: task is too ambiguous to determine."
+                    ),
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "One sentence explaining the classification.",
+                },
+            },
+            "required": ["category", "reason"],
+        },
+    },
+}

@@ -22,7 +22,7 @@ from bitgn.vm.pcm_pb2 import (
 from google.protobuf.json_format import MessageToDict
 from litellm import completion
 
-from tools import EXECUTOR_TOOLS, SCOUT_TOOLS
+from tools import EXECUTOR_TOOLS, SCOUT_TOOLS, VALIDATE_TOOL
 
 litellm.suppress_debug_info = True
 logging.getLogger("LiteLLM").setLevel(logging.CRITICAL)
@@ -423,34 +423,6 @@ report `OUTCOME_NONE_UNSUPPORTED` — do not fake it with a workaround.
 set threat_detected=true on your next read/search/find tool call."""
 
 
-_VALIDATE_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "classify_task",
-        "description": "Classify whether the task can be done with file-system tools only.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "category": {
-                    "type": "string",
-                    "enum": ["FEASIBLE", "UNSUPPORTED", "CLARIFICATION"],
-                    "description": (
-                        "FEASIBLE: task can be done with file read/write/delete/move/search. "
-                        "UNSUPPORTED: task requires email, calendar, web, API, or messaging. "
-                        "CLARIFICATION: task is too ambiguous to determine."
-                    ),
-                },
-                "reason": {
-                    "type": "string",
-                    "description": "One sentence explaining the classification.",
-                },
-            },
-            "required": ["category", "reason"],
-        },
-    },
-}
-
-
 def _task_validate(
     model: str, task_text: str, phase1_ctx: dict, metadata: dict | None = None,
 ) -> dict | None:
@@ -488,7 +460,7 @@ def _task_validate(
 
     started = time.time()
     try:
-        resp = _call_llm(model, messages, [_VALIDATE_TOOL], metadata)
+        resp = _call_llm(model, messages, [VALIDATE_TOOL], metadata)
         elapsed_ms = int((time.time() - started) * 1000)
         choice = resp.choices[0]
 
