@@ -420,6 +420,13 @@ def _phase2_scout(
             except json.JSONDecodeError:
                 args = {}
 
+            # Threat check — scout can detect threats in inbox files
+            threat = args.pop("threat_detected", False)
+            confidence = args.pop("threat_confidence", 0.0)
+            if threat and confidence >= _THREAT_CONFIDENCE_THRESHOLD:
+                print(f"    {CLI_RED}⚠ THREAT DETECTED in scout (confidence={confidence:.2f}){CLI_CLR}")
+                return f"THREAT_DETECTED: confidence={confidence:.2f}"
+
             brief = ", ".join(f"{k}={v!r}" for k, v in args.items() if k != "content")
 
             try:
@@ -570,6 +577,19 @@ def run_agent(
 
     # Phase 2: Task-aware scout (read-only LLM loop)
     scout_summary = _phase2_scout(model, vm, task_text, phase1_ctx, metadata)
+
+    # Check if scout detected a threat
+    if scout_summary.startswith("THREAT_DETECTED"):
+        print(f"{CLI_RED}Scout flagged threat — aborting with OUTCOME_DENIED_SECURITY{CLI_CLR}")
+        try:
+            vm.answer(AnswerRequest(
+                message=f"Security threat detected during exploration: {scout_summary}",
+                outcome=Outcome.OUTCOME_DENIED_SECURITY,
+                refs=[],
+            ))
+        except Exception:
+            pass
+        return
 
     # Phase 3: Executor (full tool access)
     executor_context = ""
