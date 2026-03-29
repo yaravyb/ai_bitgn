@@ -1,15 +1,17 @@
 import os
 import textwrap
+import uuid
 
 from bitgn.harness_connect import HarnessServiceClientSync
 from bitgn.harness_pb2 import EndTrialRequest, EvalPolicy, GetBenchmarkRequest, StartPlaygroundRequest, StatusRequest
 from connectrpc.errors import ConnectError
 
 from agent import run_agent
+from observability import configure_observability
 
 BITGN_URL = os.getenv("BENCHMARK_HOST") or "https://api.bitgn.com"
 BENCHMARK_ID = os.getenv("BENCHMARK_ID") or "bitgn/pac1-dev"
-MODEL_ID = os.getenv("MODEL_ID") or "gpt-4.1-2025-04-14"
+MODEL_ID = os.getenv("MODEL_ID") or "openai/gpt-4.1-2025-04-14"
 
 CLI_RED = "\x1B[31m"
 CLI_GREEN = "\x1B[32m"
@@ -18,6 +20,8 @@ CLI_BLUE = "\x1B[34m"
 
 
 def main() -> None:
+    configure_observability()
+
     task_filter = os.sys.argv[1:]
 
     scores = []
@@ -44,8 +48,18 @@ def main() -> None:
 
             print(f"{CLI_BLUE}{trial.instruction}{CLI_CLR}\n{'-' * 80}")
 
+            trace_metadata = {
+                "trace_id": str(uuid.uuid4()),
+                "trace_name": "run_agent",
+                "session_id": os.environ.get("SESSION_ID", ""),
+                "trace_metadata": {
+                    "model": MODEL_ID,
+                    "task": trial.instruction[:200],
+                },
+            }
+
             try:
-                run_agent(MODEL_ID, trial.harness_url, trial.instruction)
+                run_agent(MODEL_ID, trial.harness_url, trial.instruction, metadata=trace_metadata)
             except Exception as exc:
                 print(exc)
 

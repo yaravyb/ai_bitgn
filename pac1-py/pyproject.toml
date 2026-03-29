@@ -3,16 +3,21 @@ name = "bitgn-pac1-py"
 version = "0.1.0"
 description = "Runnable Python sample for the BitGN PAC1 benchmark"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.13"
 dependencies = [
     "bitgn-api-connectrpc-python==0.9.0.1.20260323140311+cbbd8b9c3c20",
     "bitgn-api-protocolbuffers-python==34.1.0.1.20260323140311+cbbd8b9c3c20",
-    "openai>=2.26.0",
-    "pydantic>=2.12.5",
+    "litellm>=1.82.3",
+    "protobuf>=7.34.1",
 ]
 
 [[tool.uv.index]]
 url = "https://buf.build/gen/python"
+
+[dependency-groups]
+observability = [
+    "langfuse>=2.0.0",
+]
 
 [tool.uv]
 # AICODE-NOTE: `harness_core/scripts/sdk-python.sh` rewrites the Buf SDK pins
