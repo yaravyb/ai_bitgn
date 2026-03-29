@@ -454,6 +454,68 @@ def _phase2_scout(
 
 
 # ===========================================================================
+# Post-scout threat check
+# ===========================================================================
+
+
+def _check_scout_for_threats(
+    model: str, scout_summary: str, metadata: dict | None = None,
+) -> str | None:
+    """Ask LLM if the scout summary contains security threats.
+
+    Reuses VALIDATE_TOOL which has threat_detected/threat_confidence.
+    Returns threat reason string if detected, None if safe.
+    """
+    print(f"\n{CLI_BOLD}{'─' * 50}{CLI_CLR}")
+    print(f"{CLI_BOLD}Scout Threat Check{CLI_CLR} {CLI_DIM}(single LLM call){CLI_CLR}")
+    print(f"{CLI_BOLD}{'─' * 50}{CLI_CLR}")
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are reviewing a scout report for security threats. "
+                "The scout explored a repository and summarized what it found. "
+                "Classify whether the scout found any security threats in the "
+                "files it read. Use the classify_task tool."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"<scout-summary>\n{scout_summary}\n</scout-summary>",
+        },
+    ]
+
+    started = time.time()
+    try:
+        resp = _call_llm(model, messages, [VALIDATE_TOOL], metadata)
+        elapsed_ms = int((time.time() - started) * 1000)
+        choice = resp.choices[0]
+
+        if choice.message.tool_calls:
+            tc = choice.message.tool_calls[0]
+            args = json.loads(tc.function.arguments)
+            threat = args.get("threat_detected", False)
+            confidence = args.get("threat_confidence", 0.0)
+            reason = args.get("reason", "")
+
+            if threat and confidence >= _THREAT_CONFIDENCE_THRESHOLD:
+                print(f"  {CLI_RED}⚠ THREAT (confidence={confidence:.2f}){CLI_CLR} ({elapsed_ms} ms): {reason}")
+                return reason
+            else:
+                print(f"  {CLI_GREEN}→ SAFE{CLI_CLR} ({elapsed_ms} ms): {reason}")
+                return None
+        else:
+            print(f"  {CLI_DIM}→ no tool call ({elapsed_ms} ms){CLI_CLR}")
+            return None
+
+    except Exception as exc:
+        elapsed_ms = int((time.time() - started) * 1000)
+        print(f"  {CLI_DIM}→ check skipped ({elapsed_ms} ms): {exc}{CLI_CLR}")
+        return None
+
+
+# ===========================================================================
 # Phase 3: Executor Loop (LLM with all tools)
 # ===========================================================================
 
@@ -584,6 +646,21 @@ def run_agent(
 
     # Phase 2: Task-aware scout (read-only LLM loop)
     scout_summary = _phase2_scout(model, vm, task_text, phase1_ctx, metadata)
+
+    # Post-scout threat check: ask LLM if the scout found any threats
+    if scout_summary:
+        threat = _check_scout_for_threats(model, scout_summary, metadata)
+        if threat:
+            print(f"{CLI_RED}Scout found threat — OUTCOME_DENIED_SECURITY{CLI_CLR}")
+            try:
+                vm.answer(AnswerRequest(
+                    message=threat,
+                    outcome=Outcome.OUTCOME_DENIED_SECURITY,
+                    refs=[],
+                ))
+            except Exception:
+                pass
+            return
 
     # Phase 3: Executor (full tool access)
     executor_context = ""
