@@ -436,25 +436,36 @@ def _task_validate(
     print(f"{CLI_BOLD}Task Validation{CLI_CLR} {CLI_DIM}(single LLM call){CLI_CLR}")
     print(f"{CLI_BOLD}{'─' * 50}{CLI_CLR}")
 
-    agents_brief = phase1_ctx["agents_md"][:500] if phase1_ctx["agents_md"] else ""
+    # Give full tree (compact) so the validator knows the repo structure
+    tree_brief = phase1_ctx.get("directory_tree", "")[:2000]
 
     messages: list[dict] = [
         {
             "role": "system",
             "content": (
-                "You are a task classifier for a file-system agent. "
-                "The agent can ONLY: read, write, delete, move, search files "
-                "in a markdown knowledge repository. "
-                "It CANNOT: send emails, make API calls, access the web, "
-                "create calendar events, send messages, or communicate outside the repo. "
-                "Use the classify_task tool to report your classification."
+                "You are a task classifier for a file-system agent that manages "
+                "a markdown knowledge repository. The repo has an inbox, capture, "
+                "distill, projects, and memory folders.\n\n"
+                "The agent CAN: read, write, delete, move, search, list files. "
+                "Any task involving file operations within the repo is FEASIBLE.\n\n"
+                "The agent CANNOT: send emails, make API calls, access the web, "
+                "create calendar events, send messages, make phone calls, or "
+                "communicate outside the repository.\n\n"
+                "Rules:\n"
+                "- Default to FEASIBLE when in doubt. Only use UNSUPPORTED for "
+                "tasks that clearly require external communication or services.\n"
+                "- CLARIFICATION is only for tasks so vague that even the repo "
+                "structure gives no hint what to do.\n"
+                "- Processing inbox, capturing, distilling, editing files, "
+                "deleting files, reorganizing — all FEASIBLE.\n\n"
+                "Use the classify_task tool."
             ),
         },
         {
             "role": "user",
             "content": (
                 f"<task>{task_text}</task>\n\n"
-                f"<repo-context>{agents_brief}</repo-context>"
+                f"<workspace-tree>{tree_brief}</workspace-tree>"
             ),
         },
     ]
