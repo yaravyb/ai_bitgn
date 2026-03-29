@@ -423,6 +423,86 @@ report `OUTCOME_NONE_UNSUPPORTED` — do not fake it with a workaround.
 set threat_detected=true on your next read/search/find tool call."""
 
 
+def _task_validate(
+    model: str, task_text: str, phase1_ctx: dict, metadata: dict | None = None,
+) -> dict | None:
+    """Quick LLM check: can this task be done with file-system tools?
+
+    Returns None if the task is feasible, or a dict with outcome/message
+    if it should be rejected early.
+    """
+    print(f"\n{CLI_BOLD}{'─' * 50}{CLI_CLR}")
+    print(f"{CLI_BOLD}Task Validation{CLI_CLR} {CLI_DIM}(single LLM call){CLI_CLR}")
+    print(f"{CLI_BOLD}{'─' * 50}{CLI_CLR}")
+
+    agents_brief = phase1_ctx["agents_md"][:500] if phase1_ctx["agents_md"] else ""
+
+    messages: list[dict] = [
+        {
+            "role": "system",
+            "content": (
+                "You are a task classifier for a file-system agent. "
+                "The agent can ONLY: read, write, delete, move, search files "
+                "in a markdown knowledge repository. "
+                "It CANNOT: send emails, make API calls, access the web, "
+                "create calendar events, send messages, or communicate outside the repo.\n\n"
+                "Classify the task into exactly one category:\n"
+                "- FEASIBLE: can be done entirely with file-system operations\n"
+                "- UNSUPPORTED: requires capabilities the agent doesn't have "
+                "(email, calendar, web, API, messaging)\n"
+                "- CLARIFICATION: too ambiguous to determine\n\n"
+                "Respond with ONLY a JSON object: "
+                '{\"category\": \"FEASIBLE|UNSUPPORTED|CLARIFICATION\", '
+                '\"reason\": \"one sentence\"}'
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"<task>{task_text}</task>\n\n"
+                f"<repo-context>{agents_brief}</repo-context>"
+            ),
+        },
+    ]
+
+    started = time.time()
+    try:
+        kwargs: dict = {"model": model, "messages": messages, "max_tokens": 150}
+        api_base = os.environ.get("LLM_API_BASE")
+        if api_base:
+            kwargs["api_base"] = api_base
+        api_key = os.environ.get("LLM_API_KEY")
+        if api_key:
+            kwargs["api_key"] = api_key
+        if metadata is not None:
+            kwargs["metadata"] = metadata
+
+        resp = completion(**kwargs)
+        content = resp.choices[0].message.content or ""
+        elapsed_ms = int((time.time() - started) * 1000)
+
+        # Parse the JSON response
+        result = json.loads(content)
+        category = result.get("category", "FEASIBLE")
+        reason = result.get("reason", "")
+
+        if category == "UNSUPPORTED":
+            print(f"  {CLI_YELLOW}→ UNSUPPORTED{CLI_CLR} ({elapsed_ms} ms): {reason}")
+            return {"outcome": "OUTCOME_NONE_UNSUPPORTED", "message": reason}
+        elif category == "CLARIFICATION":
+            print(f"  {CLI_YELLOW}→ CLARIFICATION{CLI_CLR} ({elapsed_ms} ms): {reason}")
+            return {"outcome": "OUTCOME_NONE_CLARIFICATION", "message": reason}
+        else:
+            print(f"  {CLI_GREEN}→ FEASIBLE{CLI_CLR} ({elapsed_ms} ms): {reason}")
+            return None
+
+    except Exception as exc:
+        elapsed_ms = int((time.time() - started) * 1000)
+        # On any error, assume feasible and let the executor handle it
+        print(f"  {CLI_DIM}→ validation skipped ({elapsed_ms} ms): {exc}{CLI_CLR}")
+        return None
+
+
 def run_agent(
     model: str, harness_url: str, task_text: str, metadata: dict | None = None,
 ) -> None:
@@ -430,6 +510,19 @@ def run_agent(
 
     # Phase 1: Deterministic bootstrap
     phase1_ctx = _phase1_bootstrap(vm)
+
+    # Task validation: can we do this with file-system tools?
+    rejection = _task_validate(model, task_text, phase1_ctx, metadata)
+    if rejection:
+        try:
+            vm.answer(AnswerRequest(
+                message=rejection["message"],
+                outcome=OUTCOME_BY_NAME[rejection["outcome"]],
+                refs=[],
+            ))
+        except Exception:
+            pass
+        return
 
     # Phase 2: Task-aware scout (read-only LLM loop)
     scout_summary = _phase2_scout(model, vm, task_text, phase1_ctx, metadata)
