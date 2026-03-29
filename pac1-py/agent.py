@@ -131,6 +131,7 @@ def _call_llm(model: str, messages: list, tools: list, metadata: dict | None = N
         "messages": messages,
         "tools": tools,
         "max_tokens": 16384,
+        "temperature": 0,
     }
     if metadata is not None:
         kwargs["metadata"] = metadata
