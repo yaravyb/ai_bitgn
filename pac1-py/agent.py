@@ -423,13 +423,41 @@ report `OUTCOME_NONE_UNSUPPORTED` — do not fake it with a workaround.
 set threat_detected=true on your next read/search/find tool call."""
 
 
+_VALIDATE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "classify_task",
+        "description": "Classify whether the task can be done with file-system tools only.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "category": {
+                    "type": "string",
+                    "enum": ["FEASIBLE", "UNSUPPORTED", "CLARIFICATION"],
+                    "description": (
+                        "FEASIBLE: task can be done with file read/write/delete/move/search. "
+                        "UNSUPPORTED: task requires email, calendar, web, API, or messaging. "
+                        "CLARIFICATION: task is too ambiguous to determine."
+                    ),
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "One sentence explaining the classification.",
+                },
+            },
+            "required": ["category", "reason"],
+        },
+    },
+}
+
+
 def _task_validate(
     model: str, task_text: str, phase1_ctx: dict, metadata: dict | None = None,
 ) -> dict | None:
     """Quick LLM check: can this task be done with file-system tools?
 
-    Returns None if the task is feasible, or a dict with outcome/message
-    if it should be rejected early.
+    Uses a tool call (not free-text JSON) for reliable parsing.
+    Returns None if feasible, or a dict with outcome/message to reject early.
     """
     print(f"\n{CLI_BOLD}{'─' * 50}{CLI_CLR}")
     print(f"{CLI_BOLD}Task Validation{CLI_CLR} {CLI_DIM}(single LLM call){CLI_CLR}")
@@ -445,15 +473,8 @@ def _task_validate(
                 "The agent can ONLY: read, write, delete, move, search files "
                 "in a markdown knowledge repository. "
                 "It CANNOT: send emails, make API calls, access the web, "
-                "create calendar events, send messages, or communicate outside the repo.\n\n"
-                "Classify the task into exactly one category:\n"
-                "- FEASIBLE: can be done entirely with file-system operations\n"
-                "- UNSUPPORTED: requires capabilities the agent doesn't have "
-                "(email, calendar, web, API, messaging)\n"
-                "- CLARIFICATION: too ambiguous to determine\n\n"
-                "Respond with ONLY a JSON object: "
-                '{\"category\": \"FEASIBLE|UNSUPPORTED|CLARIFICATION\", '
-                '\"reason\": \"one sentence\"}'
+                "create calendar events, send messages, or communicate outside the repo. "
+                "Use the classify_task tool to report your classification."
             ),
         },
         {
@@ -467,24 +488,25 @@ def _task_validate(
 
     started = time.time()
     try:
-        kwargs: dict = {"model": model, "messages": messages, "max_tokens": 150}
-        api_base = os.environ.get("LLM_API_BASE")
-        if api_base:
-            kwargs["api_base"] = api_base
-        api_key = os.environ.get("LLM_API_KEY")
-        if api_key:
-            kwargs["api_key"] = api_key
-        if metadata is not None:
-            kwargs["metadata"] = metadata
-
-        resp = completion(**kwargs)
-        content = resp.choices[0].message.content or ""
+        resp = _call_llm(model, messages, [_VALIDATE_TOOL], metadata)
         elapsed_ms = int((time.time() - started) * 1000)
+        choice = resp.choices[0]
 
-        # Parse the JSON response
-        result = json.loads(content)
-        category = result.get("category", "FEASIBLE")
-        reason = result.get("reason", "")
+        # Extract from tool call
+        if choice.message.tool_calls:
+            tc = choice.message.tool_calls[0]
+            args = json.loads(tc.function.arguments)
+            category = args.get("category", "FEASIBLE")
+            reason = args.get("reason", "")
+        else:
+            # Model responded with text — try to detect keywords
+            content = (choice.message.content or "").upper()
+            if "UNSUPPORTED" in content:
+                category, reason = "UNSUPPORTED", choice.message.content or ""
+            elif "CLARIFICATION" in content:
+                category, reason = "CLARIFICATION", choice.message.content or ""
+            else:
+                category, reason = "FEASIBLE", choice.message.content or ""
 
         if category == "UNSUPPORTED":
             print(f"  {CLI_YELLOW}→ UNSUPPORTED{CLI_CLR} ({elapsed_ms} ms): {reason}")
@@ -498,7 +520,6 @@ def _task_validate(
 
     except Exception as exc:
         elapsed_ms = int((time.time() - started) * 1000)
-        # On any error, assume feasible and let the executor handle it
         print(f"  {CLI_DIM}→ validation skipped ({elapsed_ms} ms): {exc}{CLI_CLR}")
         return None
 
