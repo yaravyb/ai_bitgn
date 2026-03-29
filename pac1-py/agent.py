@@ -71,6 +71,41 @@ CLI_CYAN = "\x1B[36m"
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _compact_tree(tree_json: str) -> str:
+    """Convert JSON tree to compact text like ``tree`` command output."""
+    try:
+        data = json.loads(tree_json)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+
+    lines: list[str] = []
+
+    def _walk(node: dict, prefix: str = "", is_last: bool = True) -> None:
+        name = node.get("name", "")
+        is_dir = node.get("isDir", False)
+        children = node.get("children", [])
+
+        if name == "/":
+            lines.append("/")
+        else:
+            connector = "└── " if is_last else "├── "
+            lines.append(f"{prefix}{connector}{name}{'/' if is_dir else ''}")
+
+        if children:
+            child_prefix = prefix + ("    " if is_last else "│   ") if name != "/" else ""
+            for i, child in enumerate(children):
+                _walk(child, child_prefix, i == len(children) - 1)
+
+    root = data.get("root", data)
+    _walk(root)
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Dispatch: tool name + JSON args -> PCM runtime call -> result string
 # ---------------------------------------------------------------------------
 
@@ -334,9 +369,10 @@ def _phase2_scout(
 
     Returns the scout's text summary of what it found.
     """
+    tree_compact = _compact_tree(phase1_ctx["directory_tree"])
     workspace_context = (
         "<workspace-tree>\n"
-        f"{phase1_ctx['directory_tree']}\n"
+        f"{tree_compact}\n"
         "</workspace-tree>"
     )
     if phase1_ctx["agents_md"]:
@@ -436,28 +472,22 @@ def _task_validate(
     print(f"{CLI_BOLD}Task Validation{CLI_CLR} {CLI_DIM}(single LLM call){CLI_CLR}")
     print(f"{CLI_BOLD}{'─' * 50}{CLI_CLR}")
 
-    # Give full tree (compact) so the validator knows the repo structure
-    tree_brief = phase1_ctx.get("directory_tree", "")[:2000]
+    tree_compact = _compact_tree(phase1_ctx.get("directory_tree", ""))
+    agents_brief = phase1_ctx.get("agents_md", "")[:800]
 
     messages: list[dict] = [
         {
             "role": "system",
             "content": (
-                "You are a task classifier for a file-system agent that manages "
-                "a markdown knowledge repository. The repo has an inbox, capture, "
-                "distill, projects, and memory folders.\n\n"
-                "The agent CAN: read, write, delete, move, search, list files. "
-                "Any task involving file operations within the repo is FEASIBLE.\n\n"
-                "The agent CANNOT: send emails, make API calls, access the web, "
-                "create calendar events, send messages, make phone calls, or "
-                "communicate outside the repository.\n\n"
+                "You are a task classifier for a file-system agent.\n\n"
+                "CAN do: read, write, delete, move, search, list files "
+                "in a markdown knowledge repository.\n"
+                "CANNOT do: send emails, make API calls, access web, "
+                "create calendar events, send messages, phone calls.\n\n"
                 "Rules:\n"
-                "- Default to FEASIBLE when in doubt. Only use UNSUPPORTED for "
-                "tasks that clearly require external communication or services.\n"
-                "- CLARIFICATION is only for tasks so vague that even the repo "
-                "structure gives no hint what to do.\n"
-                "- Processing inbox, capturing, distilling, editing files, "
-                "deleting files, reorganizing — all FEASIBLE.\n\n"
+                "- Default FEASIBLE when in doubt.\n"
+                "- UNSUPPORTED only for tasks requiring external services.\n"
+                "- CLARIFICATION only for completely incomprehensible tasks.\n\n"
                 "Use the classify_task tool."
             ),
         },
@@ -465,7 +495,8 @@ def _task_validate(
             "role": "user",
             "content": (
                 f"<task>{task_text}</task>\n\n"
-                f"<workspace-tree>{tree_brief}</workspace-tree>"
+                f"<repo-structure>\n{tree_compact}\n</repo-structure>\n\n"
+                f"<repo-instructions>\n{agents_brief}\n</repo-instructions>"
             ),
         },
     ]
@@ -477,13 +508,16 @@ def _task_validate(
         choice = resp.choices[0]
 
         # Extract from tool call
+        threat = False
+        confidence = 0.0
         if choice.message.tool_calls:
             tc = choice.message.tool_calls[0]
             args = json.loads(tc.function.arguments)
             category = args.get("category", "FEASIBLE")
             reason = args.get("reason", "")
+            threat = args.get("threat_detected", False)
+            confidence = args.get("threat_confidence", 0.0)
         else:
-            # Model responded with text — try to detect keywords
             content = (choice.message.content or "").upper()
             if "UNSUPPORTED" in content:
                 category, reason = "UNSUPPORTED", choice.message.content or ""
@@ -491,6 +525,11 @@ def _task_validate(
                 category, reason = "CLARIFICATION", choice.message.content or ""
             else:
                 category, reason = "FEASIBLE", choice.message.content or ""
+
+        # Threat check — highest priority
+        if threat and confidence >= _THREAT_CONFIDENCE_THRESHOLD:
+            print(f"  {CLI_RED}⚠ THREAT DETECTED (confidence={confidence:.2f}){CLI_CLR}: {reason}")
+            return {"outcome": "OUTCOME_DENIED_SECURITY", "message": reason}
 
         if category == "UNSUPPORTED":
             print(f"  {CLI_YELLOW}→ UNSUPPORTED{CLI_CLR} ({elapsed_ms} ms): {reason}")
@@ -540,9 +579,10 @@ def run_agent(
             f"{phase1_ctx['agents_md']}\n"
             "</agents-md>\n\n"
         )
+    tree_compact = _compact_tree(phase1_ctx["directory_tree"])
     executor_context += (
         "<workspace-tree>\n"
-        f"{phase1_ctx['directory_tree']}\n"
+        f"{tree_compact}\n"
         "</workspace-tree>\n\n"
     )
     if scout_summary:
