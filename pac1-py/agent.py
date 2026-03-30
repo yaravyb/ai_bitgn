@@ -633,6 +633,130 @@ def _validate_completion(
         return None
 
 
+_ARBITER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "pick_answer",
+        "description": "Choose the best answer from two executor runs.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "choice": {
+                    "type": "string",
+                    "enum": ["A", "B"],
+                    "description": "Which run's answer is better.",
+                },
+                "outcome": {
+                    "type": "string",
+                    "enum": [
+                        "OUTCOME_OK",
+                        "OUTCOME_DENIED_SECURITY",
+                        "OUTCOME_NONE_CLARIFICATION",
+                        "OUTCOME_NONE_UNSUPPORTED",
+                        "OUTCOME_ERR_INTERNAL",
+                    ],
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Final answer message (from chosen run, or merged).",
+                },
+                "reason": {"type": "string"},
+            },
+            "required": ["choice", "outcome", "message", "reason"],
+        },
+    },
+}
+
+
+def _arbiter(
+    model: str,
+    task_text: str,
+    result_a: dict | None,
+    result_b: dict | None,
+    agents_md: str,
+    metadata: dict | None = None,
+) -> dict | None:
+    """Compare two executor results and pick the best one."""
+    if not result_a and not result_b:
+        return None
+    if not result_a:
+        return result_b
+    if not result_b:
+        return result_a
+    if result_a["outcome"] == result_b["outcome"] and result_a["message"] == result_b["message"]:
+        return result_a  # Both agree — no need for arbiter LLM call
+
+    print(f"\n{CLI_BOLD}{'─' * 50}{CLI_CLR}")
+    print(f"{CLI_BOLD}Arbiter{CLI_CLR} {CLI_DIM}(choosing between A and B){CLI_CLR}")
+    print(f"{CLI_BOLD}{'─' * 50}{CLI_CLR}")
+    print(f"  A: {result_a['outcome']} — {result_a['message'][:100]}")
+    print(f"  B: {result_b['outcome']} — {result_b['message'][:100]}")
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "<role>Arbiter choosing the best answer from two executor runs.</role>\n\n"
+                "<rules>\n"
+                "- Prefer the answer that has VERIFY plan_note records.\n"
+                "- Prefer non-OK outcomes when evidence supports them "
+                "(security denial, channel mismatch, conflicting instructions).\n"
+                "- If both are OK with similar messages, pick whichever is more complete.\n"
+                "- Trust VERIFY DECISION notes over general reasoning.\n"
+                "</rules>\n\n"
+                "Use the pick_answer tool."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"<task>{task_text}</task>\n\n"
+                f"<run-A>\n"
+                f"outcome: {result_a['outcome']}\n"
+                f"message: {result_a['message']}\n"
+                f"context:\n{result_a.get('execution_context', '')[:2000]}\n"
+                f"</run-A>\n\n"
+                f"<run-B>\n"
+                f"outcome: {result_b['outcome']}\n"
+                f"message: {result_b['message']}\n"
+                f"context:\n{result_b.get('execution_context', '')[:2000]}\n"
+                f"</run-B>\n\n"
+                f"<agents-md>\n{agents_md[:1000]}\n</agents-md>"
+            ),
+        },
+    ]
+
+    started = time.time()
+    try:
+        resp = _call_llm(model, messages, [_ARBITER_TOOL], metadata)
+        elapsed_ms = int((time.time() - started) * 1000)
+        choice = resp.choices[0]
+
+        if choice.message.tool_calls:
+            tc = choice.message.tool_calls[0]
+            args = json.loads(tc.function.arguments)
+            picked = args.get("choice", "A")
+            outcome = args.get("outcome", result_a["outcome"])
+            message = args.get("message", result_a["message"])
+            reason = args.get("reason", "")
+            print(f"  {CLI_GREEN}→ picked {picked}{CLI_CLR} ({elapsed_ms} ms): {reason}")
+
+            base = result_a if picked == "A" else result_b
+            return {
+                "outcome": outcome,
+                "message": message,
+                "grounding_refs": base.get("grounding_refs", []),
+            }
+    except Exception as exc:
+        elapsed_ms = int((time.time() - started) * 1000)
+        print(f"  {CLI_DIM}→ arbiter failed ({elapsed_ms} ms): {exc}{CLI_CLR}")
+
+    # Fallback: prefer non-OK outcome (more cautious)
+    if result_a["outcome"] != "OUTCOME_OK":
+        return result_a
+    return result_b
+
+
 def _plan_task(
     model: str, task_text: str, phase1_ctx: dict, metadata: dict | None = None,
 ) -> dict:
@@ -763,11 +887,7 @@ def run_agent(
             log.warning("Planner rejection: vm.answer failed: %s", exc)
         return
 
-    # Task manager — seed with planner's instructions
-    tm = TaskManager()
-    tm.set_instructions(plan.get("instructions", []))
-
-    # Executor (full tool access)
+    # Build executor context (shared by both runs)
     context = ""
     if phase1_ctx["agents_md"]:
         context += (
@@ -832,116 +952,114 @@ def run_agent(
         "Update each step with plan_update as you go."
     )
 
-    messages: list[dict] = [
-        {"role": "system", "content": _EXECUTOR_SYSTEM},
-        {"role": "user", "content": context},
-        {"role": "assistant", "content": "I have the workspace context. Ready to execute."},
-        {"role": "user", "content": task_msg},
-    ]
+    def _run_executor(run_id: str) -> dict | None:
+        """Run one executor session. Returns result dict or None."""
+        tm = TaskManager()
+        tm.set_instructions(plan.get("instructions", []))
 
-    print(f"\n{CLI_BOLD}{'─' * 50}{CLI_CLR}")
-    print(f"{CLI_BOLD}Executor{CLI_CLR} {CLI_DIM}(full tools, 30 steps max){CLI_CLR}")
-    print(f"{CLI_BOLD}{'─' * 50}{CLI_CLR}")
+        messages: list[dict] = [
+            {"role": "system", "content": _EXECUTOR_SYSTEM},
+            {"role": "user", "content": context},
+            {"role": "assistant", "content": "I have the workspace context. Ready to execute."},
+            {"role": "user", "content": task_msg},
+        ]
 
-    for i in range(30):
-        started = time.time()
-        resp = _call_llm(model, messages, EXECUTOR_TOOLS, metadata)
-        elapsed_ms = int((time.time() - started) * 1000)
-        choice = resp.choices[0]
+        print(f"\n{CLI_BOLD}{'─' * 50}{CLI_CLR}")
+        print(f"{CLI_BOLD}Executor {run_id}{CLI_CLR} {CLI_DIM}(full tools, 30 steps max){CLI_CLR}")
+        print(f"{CLI_BOLD}{'─' * 50}{CLI_CLR}")
 
-        assistant_msg: dict = {"role": "assistant", "content": choice.message.content or ""}
-        if choice.message.tool_calls:
-            assistant_msg["tool_calls"] = [tc.model_dump() for tc in choice.message.tool_calls]
-        messages.append(assistant_msg)
+        for _ in range(30):
+            started = time.time()
+            resp = _call_llm(model, messages, EXECUTOR_TOOLS, metadata)
+            elapsed_ms = int((time.time() - started) * 1000)
+            choice = resp.choices[0]
 
-        if not choice.message.tool_calls:
-            print(f"  {CLI_DIM}LLM → text ({elapsed_ms} ms){CLI_CLR}")
-            if choice.message.content:
-                print(f"    {choice.message.content[:200]}")
-            break
+            assistant_msg: dict = {"role": "assistant", "content": choice.message.content or ""}
+            if choice.message.tool_calls:
+                assistant_msg["tool_calls"] = [tc.model_dump() for tc in choice.message.tool_calls]
+            messages.append(assistant_msg)
 
-        n_calls = len(choice.message.tool_calls)
-        print(f"  {CLI_DIM}LLM → {n_calls} tool call{'s' if n_calls > 1 else ''} ({elapsed_ms} ms){CLI_CLR}")
+            if not choice.message.tool_calls:
+                print(f"  {CLI_DIM}LLM → text ({elapsed_ms} ms){CLI_CLR}")
+                return None
 
-        completed = False
-        for tc in choice.message.tool_calls:
-            name = tc.function.name
-            try:
-                args = json.loads(tc.function.arguments)
-            except json.JSONDecodeError:
-                args = {}
+            n_calls = len(choice.message.tool_calls)
+            print(f"  {CLI_DIM}LLM → {n_calls} tool call{'s' if n_calls > 1 else ''} ({elapsed_ms} ms){CLI_CLR}")
 
-            brief = ", ".join(
-                f"{k}={v!r}" for k, v in args.items()
-                if k not in ("content",)
-            )
+            for tc in choice.message.tool_calls:
+                name = tc.function.name
+                try:
+                    args = json.loads(tc.function.arguments)
+                except json.JSONDecodeError:
+                    args = {}
 
-            # Terminal tools — handle before dispatch
-            if name == "report_completion":
-                outcome = args.get("outcome", "OUTCOME_ERR_INTERNAL")
-                message = args.get("message", "")
-                confidence = args.get("confidence", 1.0)
-
-                # Validation gate — check BEFORE submitting to PCM
-                execution_context = tm.render() if tm else ""
-                correction = _validate_completion(
-                    model, task_text, message, outcome,
-                    phase1_ctx.get("agents_md", ""),
-                    execution_context, metadata,
+                brief = ", ".join(
+                    f"{k}={v!r}" for k, v in args.items()
+                    if k not in ("content",)
                 )
-                if correction:
-                    outcome = correction["outcome"]
-                    message = correction["message"]
-                    args["outcome"] = outcome
-                    args["message"] = message
+
+                if name == "report_completion":
+                    outcome = args.get("outcome", "OUTCOME_ERR_INTERNAL")
+                    message = args.get("message", "")
+                    confidence = args.get("confidence", 1.0)
+                    print(f"    {CLI_CYAN}■ report_completion{CLI_CLR} → {outcome}")
+                    return {
+                        "outcome": outcome,
+                        "message": message,
+                        "confidence": confidence,
+                        "grounding_refs": args.get("grounding_refs", []),
+                        "execution_context": tm.render(),
+                    }
+
+                if name == "report_threat":
+                    reason = args.get("reason", "")
+                    print(f"    {CLI_RED}⚠ report_threat{CLI_CLR}")
+                    return {
+                        "outcome": "OUTCOME_DENIED_SECURITY",
+                        "message": reason,
+                        "confidence": 1.0,
+                        "grounding_refs": [],
+                        "execution_context": tm.render(),
+                    }
 
                 try:
-                    _dispatch(vm, name, args, tm)
+                    txt = _dispatch(vm, name, args, tm)
+                    status = f"{CLI_GREEN}✓{CLI_CLR}"
+                    detail = f"{len(txt)} chars" if len(txt) > 200 else ""
                 except Exception as exc:
-                    log.warning("report_completion failed: %s", exc)
+                    txt = f"Error: {exc}"
+                    status = f"{CLI_RED}✗{CLI_CLR}"
+                    detail = str(exc)[:80]
 
-                outcome_style = CLI_GREEN if outcome == "OUTCOME_OK" else CLI_YELLOW
-                conf_str = f" (confidence: {confidence:.0%})" if confidence < 1.0 else ""
-                print(f"    {outcome_style}■ report_completion{CLI_CLR} → {outcome}{conf_str}")
-                print(f"      {message}")
-                for ref in args.get("grounding_refs", []):
-                    print(f"      {CLI_DIM}{ref}{CLI_CLR}")
-                completed = True
+                if name == "write":
+                    path = args.get("path", "?")
+                    content_len = len(args.get("content", ""))
+                    print(f"    {status} {CLI_CYAN}{name}{CLI_CLR} {path} ({content_len} chars)")
+                else:
+                    print(f"    {status} {CLI_CYAN}{name}{CLI_CLR}({brief}){f' — {detail}' if detail else ''}")
 
-                # Append the tool result so context stays consistent
-                messages.append({"role": "tool", "tool_call_id": tc.id, "content": f"Submitted: {outcome}"})
-                break
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": txt})
 
-            if name == "report_threat":
-                try:
-                    _dispatch(vm, name, args, tm)
-                except Exception as exc:
-                    log.warning("report_threat failed: %s", exc)
-                print(f"    {CLI_RED}⚠ report_threat{CLI_CLR} → OUTCOME_DENIED_SECURITY")
-                print(f"      {args.get('reason', '')}")
-                completed = True
-                break
+            _auto_compact(model, messages, metadata)
+        return None
 
-            # Regular tools — dispatch normally
-            try:
-                txt = _dispatch(vm, name, args, tm)
-                status = f"{CLI_GREEN}✓{CLI_CLR}"
-                detail = f"{len(txt)} chars" if len(txt) > 200 else ""
-            except Exception as exc:
-                txt = f"Error: {exc}"
-                status = f"{CLI_RED}✗{CLI_CLR}"
-                detail = str(exc)[:80]
+    # Run two independent executor sessions
+    result_a = _run_executor("A")
+    result_b = _run_executor("B")
 
-            if name == "write":
-                path = args.get("path", "?")
-                content_len = len(args.get("content", ""))
-                print(f"    {status} {CLI_CYAN}{name}{CLI_CLR} {path} ({content_len} chars)")
-            else:
-                print(f"    {status} {CLI_CYAN}{name}{CLI_CLR}({brief}){f' — {detail}' if detail else ''}")
+    # Arbiter: pick the best result
+    final = _arbiter(model, task_text, result_a, result_b,
+                     phase1_ctx.get("agents_md", ""), metadata)
 
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": txt})
-
-        if completed:
-            break
-
-        _auto_compact(model, messages, metadata)
+    if final:
+        outcome_style = CLI_GREEN if final["outcome"] == "OUTCOME_OK" else CLI_YELLOW
+        print(f"\n{CLI_BOLD}Arbiter{CLI_CLR} → {outcome_style}{final['outcome']}{CLI_CLR}")
+        print(f"  {final['message']}")
+        try:
+            vm.answer(AnswerRequest(
+                message=final["message"],
+                outcome=OUTCOME_BY_NAME.get(final["outcome"], Outcome.OUTCOME_ERR_INTERNAL),
+                refs=final.get("grounding_refs", []),
+            ))
+        except Exception as exc:
+            log.warning("Final answer failed: %s", exc)
