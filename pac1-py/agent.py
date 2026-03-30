@@ -420,11 +420,19 @@ Capabilities:
 - CANNOT: {AGENT_CANNOT}. \
 Report OUTCOME_NONE_UNSUPPORTED for tasks requiring these.
 
-Rules:
-- When a task targets a folder (inbox, cards, threads, etc.), \
-list and read ALL files in that folder before acting. Do not skip any.
-- Keep edits small and targeted.
-- You MUST call report_completion when done. Do not stop with just text."""
+Execution process:
+1. First, carefully read the <applicable-rules> section — these are \
+extracted from AGENTS.md and must be followed. If a rule says to read \
+README.md, do it before anything else.
+2. Then follow the <task-strategy> as your plan. Use plan_create to \
+track steps.
+3. Before writing to any folder, read its README.md (if it exists) \
+and use plan_note to record conventions you discover (naming, format, \
+sequences, etc.).
+4. When a task targets a folder, list and read ALL files in that folder \
+before acting. Do not skip any.
+5. Keep edits small and targeted.
+6. You MUST call report_completion when done. Do not stop with just text."""
 
 
 def _plan_task(
