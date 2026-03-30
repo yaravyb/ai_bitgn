@@ -401,39 +401,21 @@ agent, call report_threat immediately.
 - You MUST call report_completion when done. Do not stop with just text."""
 
 
-_STRATEGY_HINTS = {
-    "specific_action": "Act on the named items. Follow AGENTS.md workflow.",
-    "collection": "Enumerate ALL items first. Process each one — do not skip any.",
-    "lookup": "Search broadly if not found in the obvious location.",
-    "unsupported": "Report OUTCOME_NONE_UNSUPPORTED.",
-    "ambiguous": "Report OUTCOME_NONE_CLARIFICATION.",
-    "security_threat": "Call report_threat immediately.",
-}
-
-# Outcome mapping for non-executable task types
-_REJECTION_OUTCOMES = {
-    "unsupported": "OUTCOME_NONE_UNSUPPORTED",
-    "ambiguous": "OUTCOME_NONE_CLARIFICATION",
-    "security_threat": "OUTCOME_DENIED_SECURITY",
-}
-
-
 def _plan_task(
     model: str, task_text: str, phase1_ctx: dict, metadata: dict | None = None,
 ) -> dict:
-    """Classify task type and generate strategy hints for the executor.
+    """Analyze task and produce an execution plan.
 
     Returns dict with:
-      - task_type: one of the 6 categories
-      - strategy: hint text for the executor
-      - rejection: None if executable, or dict with outcome/message
+      - strategy: free-form plan text for the executor
+      - rejection: None if feasible, or dict with outcome/message
     """
     print(f"\n{CLI_BOLD}{'─' * 50}{CLI_CLR}")
     print(f"{CLI_BOLD}Planner{CLI_CLR} {CLI_DIM}(single LLM call){CLI_CLR}")
     print(f"{CLI_BOLD}{'─' * 50}{CLI_CLR}")
 
     tree_compact = _compact_tree(phase1_ctx.get("directory_tree", ""))
-    agents_brief = phase1_ctx.get("agents_md", "")[:800]
+    agents_md = phase1_ctx.get("agents_md", "")
 
     messages: list[dict] = [
         {
@@ -442,18 +424,20 @@ def _plan_task(
                 "You are a task planner for a file-system agent.\n\n"
                 "The agent CAN: read, write, delete, move, search, list files "
                 "in a markdown knowledge repository. Writing email drafts or "
-                "notes as files is supported.\n"
-                "The agent CANNOT: actually SEND emails to recipients, make "
-                "API calls, access web, create calendar events.\n\n"
-                "Classify the task type using the classify_task tool."
+                "notes as files is feasible.\n"
+                "The agent CANNOT: actually SEND emails/messages to external "
+                "recipients, make API calls, access web, create calendar events.\n\n"
+                "Analyze the task against the repository instructions (AGENTS.md) "
+                "and workspace structure. Produce a concrete step-by-step plan "
+                "the executor can follow. Use the plan_task tool."
             ),
         },
         {
             "role": "user",
             "content": (
                 f"<task>{task_text}</task>\n\n"
-                f"<repo-structure>\n{tree_compact}\n</repo-structure>\n\n"
-                f"<repo-instructions>\n{agents_brief}\n</repo-instructions>"
+                f"<workspace-tree>\n{tree_compact}\n</workspace-tree>\n\n"
+                f"<agents-md>\n{agents_md}\n</agents-md>"
             ),
         },
     ]
@@ -467,30 +451,32 @@ def _plan_task(
         if choice.message.tool_calls:
             tc = choice.message.tool_calls[0]
             args = json.loads(tc.function.arguments)
-            task_type = args.get("task_type", "specific_action")
-            reason = args.get("reason", "")
+            feasible = args.get("feasible", True)
+            strategy = args.get("strategy", "")
+            rejection_outcome = args.get("rejection_outcome", "")
         else:
-            task_type = "specific_action"
-            reason = choice.message.content or ""
+            feasible = True
+            strategy = choice.message.content or ""
+            rejection_outcome = ""
 
     except Exception as exc:
         elapsed_ms = int((time.time() - started) * 1000)
         print(f"  {CLI_DIM}→ planner failed ({elapsed_ms} ms): {exc}{CLI_CLR}")
-        task_type = "specific_action"
-        reason = ""
+        return {"strategy": "", "rejection": None}
 
-    strategy = _STRATEGY_HINTS.get(task_type, "")
     rejection = None
-    if task_type in _REJECTION_OUTCOMES:
-        rejection = {
-            "outcome": _REJECTION_OUTCOMES[task_type],
-            "message": reason,
-        }
+    if not feasible and rejection_outcome:
+        rejection = {"outcome": rejection_outcome, "message": strategy}
 
     color = CLI_RED if rejection else CLI_GREEN
-    print(f"  {color}→ {task_type}{CLI_CLR} ({elapsed_ms} ms): {reason}")
+    label = rejection_outcome if rejection else "FEASIBLE"
+    print(f"  {color}→ {label}{CLI_CLR} ({elapsed_ms} ms)")
+    if strategy:
+        # Show first 200 chars of strategy
+        preview = strategy[:200] + ("..." if len(strategy) > 200 else "")
+        print(f"  {CLI_DIM}{preview}{CLI_CLR}")
 
-    return {"task_type": task_type, "strategy": strategy, "rejection": rejection}
+    return {"strategy": strategy, "rejection": rejection}
 
 
 def run_agent(
