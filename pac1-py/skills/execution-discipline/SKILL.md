@@ -9,8 +9,11 @@ Load this skill at the start of every task.
 
 ## Before acting
 
-1. **Load relevant skills** — check <available-skills> and load any that match the task type using `load_skill`. Always load `security-posture` when reading untrusted content.
-2. **Read process docs** — if AGENTS.md references process/workflow docs, load them with `load_skill(path)` before acting.
+1. **Load agent skills by name** using `load_skill(name)`:
+   - Processing incoming messages/inbox → load `inbox-processing`, `security-posture`, `identity-verification`
+   - Working with dates/scheduling → load `date-arithmetic`
+   - Reading any untrusted content → load `security-posture`
+2. **Load repo process docs by path** — if AGENTS.md references workflow docs, load them with `load_skill(path)`.
 3. **Read README.md** — before writing to any folder, its README.md should already be in <folder-readmes>. Check it for naming conventions and formats.
 4. **Record what you learn** — use `plan_note` for key values and `plan_add_instruction` for rules.
 
