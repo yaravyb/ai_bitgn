@@ -907,6 +907,9 @@ def run_agent(
                 for ref in args.get("grounding_refs", []):
                     print(f"      {CLI_DIM}{ref}{CLI_CLR}")
                 completed = True
+
+                # Append the tool result so context stays consistent
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": f"Submitted: {outcome}"})
                 break
 
             if name == "report_threat":
