@@ -420,6 +420,8 @@ Capabilities:
 Report OUTCOME_NONE_UNSUPPORTED for tasks requiring these.
 
 Rules:
+- When a task targets a folder (inbox, cards, threads, etc.), \
+list and read ALL files in that folder before acting. Do not skip any.
 - Keep edits small and targeted.
 - You MUST call report_completion when done. Do not stop with just text."""
 
