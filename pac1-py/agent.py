@@ -417,9 +417,15 @@ def _plan_task(
                 "notes as files is feasible.\n"
                 "The agent CANNOT: actually SEND emails/messages to external "
                 "recipients, make API calls, access web, create calendar events.\n\n"
-                "Analyze the task against the repository instructions (AGENTS.md) "
-                "and workspace structure. Produce a concrete step-by-step plan "
-                "the executor can follow. Use the plan_task tool."
+                "Before planning, check the task text carefully:\n"
+                "- If the task text is truncated (words cut off mid-word), "
+                "garbled, or too incomplete to understand — set feasible=false "
+                "with OUTCOME_NONE_CLARIFICATION.\n"
+                "- If the task requires external services — set feasible=false "
+                "with OUTCOME_NONE_UNSUPPORTED.\n\n"
+                "If the task is clear, analyze it against AGENTS.md and the "
+                "workspace structure. Produce a concrete step-by-step plan. "
+                "Use the plan_task tool."
             ),
         },
         {
