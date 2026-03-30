@@ -161,8 +161,12 @@ def _load_skill(vm: PcmRuntimeClientSync, name_or_path: str) -> str:
         return f"Error: skill '{name_or_path}' not found locally or in runtime: {exc}"
 
 
-def _dispatch(vm: PcmRuntimeClientSync, name: str, args: dict, tm: TaskManager | None = None) -> str:
-    """Execute a tool call against the PCM runtime. Returns result string."""
+def _dispatch(vm: PcmRuntimeClientSync, name: str, args: dict, tm: TaskManager | None = None, defer_writes: bool = False) -> str:
+    """Execute a tool call against the PCM runtime. Returns result string.
+
+    If defer_writes=True, write/delete/move/mkdir operations are stored
+    in the TaskManager instead of being executed immediately.
+    """
     handlers = {
         "tree": lambda: vm.tree(TreeRequest(root=args.get("root", ""))),
         "find": lambda: vm.find(
@@ -216,6 +220,21 @@ def _dispatch(vm: PcmRuntimeClientSync, name: str, args: dict, tm: TaskManager |
     handler = handlers.get(name)
     if not handler:
         return f"Unknown tool: {name}"
+
+    # Defer write operations if requested (for dual-executor mode)
+    _WRITE_OPS = {"write", "delete", "mkdir", "move"}
+    if defer_writes and name in _WRITE_OPS and tm is not None:
+        tm.defer_write(name, dict(args))
+        # Return a simulated success so the executor continues planning
+        if name == "write":
+            return f"(deferred) Will write {args.get('path', '?')}"
+        elif name == "delete":
+            return f"(deferred) Will delete {args.get('path', '?')}"
+        elif name == "move":
+            return f"(deferred) Will move {args.get('from_name', '?')} → {args.get('to_name', '?')}"
+        else:
+            return f"(deferred) Will mkdir {args.get('path', '?')}"
+
     result = handler()
 
     # Track file operations
@@ -952,8 +971,8 @@ def run_agent(
         "Update each step with plan_update as you go."
     )
 
-    def _run_executor(run_id: str) -> dict | None:
-        """Run one executor session. Returns result dict or None."""
+    def _run_executor(run_id: str) -> tuple[dict | None, TaskManager]:
+        """Run one executor session. Returns (result dict, task manager)."""
         tm = TaskManager()
         tm.set_instructions(plan.get("instructions", []))
 
@@ -981,7 +1000,7 @@ def run_agent(
 
             if not choice.message.tool_calls:
                 print(f"  {CLI_DIM}LLM → text ({elapsed_ms} ms){CLI_CLR}")
-                return None
+                return None, tm
 
             n_calls = len(choice.message.tool_calls)
             print(f"  {CLI_DIM}LLM → {n_calls} tool call{'s' if n_calls > 1 else ''} ({elapsed_ms} ms){CLI_CLR}")
@@ -1009,7 +1028,7 @@ def run_agent(
                         "confidence": confidence,
                         "grounding_refs": args.get("grounding_refs", []),
                         "execution_context": tm.render(),
-                    }
+                    }, tm
 
                 if name == "report_threat":
                     reason = args.get("reason", "")
@@ -1020,10 +1039,10 @@ def run_agent(
                         "confidence": 1.0,
                         "grounding_refs": [],
                         "execution_context": tm.render(),
-                    }
+                    }, tm
 
                 try:
-                    txt = _dispatch(vm, name, args, tm)
+                    txt = _dispatch(vm, name, args, tm, defer_writes=True)
                     status = f"{CLI_GREEN}✓{CLI_CLR}"
                     detail = f"{len(txt)} chars" if len(txt) > 200 else ""
                 except Exception as exc:
@@ -1041,19 +1060,32 @@ def run_agent(
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": txt})
 
             _auto_compact(model, messages, metadata)
-        return None
+        return None, tm
 
-    # Run two independent executor sessions
-    result_a = _run_executor("A")
-    result_b = _run_executor("B")
+    # Run two independent executor sessions (writes are deferred)
+    result_a, tm_a = _run_executor("A")
+    result_b, tm_b = _run_executor("B")
 
     # Arbiter: pick the best result
     final = _arbiter(model, task_text, result_a, result_b,
                      phase1_ctx.get("agents_md", ""), metadata)
 
     if final:
+        # Apply the winning plan's deferred writes
+        winner_tm = tm_a if (result_a and final.get("outcome") == result_a.get("outcome")) else tm_b
+        pending = winner_tm.get_pending_writes()
+        if pending:
+            print(f"\n{CLI_BOLD}Applying {len(pending)} deferred writes{CLI_CLR}")
+            for op in pending:
+                try:
+                    _dispatch(vm, op["op"], op["args"])
+                    print(f"  {CLI_GREEN}✓{CLI_CLR} {op['op']}({op['args'].get('path', op['args'].get('to_name', '?'))})")
+                except Exception as exc:
+                    print(f"  {CLI_RED}✗{CLI_CLR} {op['op']}: {exc}")
+
+        # Submit the final answer
         outcome_style = CLI_GREEN if final["outcome"] == "OUTCOME_OK" else CLI_YELLOW
-        print(f"\n{CLI_BOLD}Arbiter{CLI_CLR} → {outcome_style}{final['outcome']}{CLI_CLR}")
+        print(f"\n{CLI_BOLD}Final{CLI_CLR} → {outcome_style}{final['outcome']}{CLI_CLR}")
         print(f"  {final['message']}")
         try:
             vm.answer(AnswerRequest(

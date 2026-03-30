@@ -15,6 +15,7 @@ class TaskManager:
         self._files_written: list[str] = []
         self._files_deleted: list[str] = []
         self._files_read: list[str] = []
+        self._pending_writes: list[dict] = []  # deferred write operations
 
     # -- Instructions (rules from AGENTS.md + discovered during execution) --
 
@@ -83,6 +84,14 @@ class TaskManager:
         """Track a file that was deleted (for validation context)."""
         if path not in self._files_deleted:
             self._files_deleted.append(path)
+
+    def defer_write(self, operation: str, args: dict) -> None:
+        """Store a write operation for later execution."""
+        self._pending_writes.append({"op": operation, "args": args})
+
+    def get_pending_writes(self) -> list[dict]:
+        """Return all deferred write operations."""
+        return self._pending_writes
 
     def add_note(self, note: str) -> str:
         """Save a persistent note (key values, conventions, findings)."""
