@@ -228,15 +228,19 @@ _WRITE_SCHEMAS: list[dict] = [
         "function": {
             "name": "report_completion",
             "description": (
-                "Report task completion with the answer, grounding references, "
-                "and a status code. Use when the task is done or blocked."
+                "Report task completion with the answer and grounding references. "
+                "Use when the task is done or blocked."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "message": {
                         "type": "string",
-                        "description": "Summary of what was done.",
+                        "description": (
+                            "The answer to the task. If the task asks for specific "
+                            "data (email, name, value), include that data here. "
+                            "If the task asks for an action, summarize what was done."
+                        ),
                     },
                     "outcome": {
                         "type": "string",
