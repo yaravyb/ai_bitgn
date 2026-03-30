@@ -399,6 +399,16 @@ PLANNER_TOOL: dict = {
                     ],
                     "description": "Only set when feasible=false. The outcome code to report.",
                 },
+                "instructions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Rules extracted from AGENTS.md that apply to this task. "
+                        "Include: authority level (root vs nested), the exact rule "
+                        "text, and which files/folders it governs. "
+                        "Order by priority (root rules first, then nested)."
+                    ),
+                },
                 "strategy": {
                     "type": "string",
                     "description": (

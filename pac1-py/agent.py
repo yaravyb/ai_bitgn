@@ -493,16 +493,18 @@ def _plan_task(
             args = json.loads(tc.function.arguments)
             feasible = args.get("feasible", True)
             strategy = args.get("strategy", "")
+            instructions = args.get("instructions", [])
             rejection_outcome = args.get("rejection_outcome", "")
         else:
             feasible = True
             strategy = choice.message.content or ""
+            instructions = []
             rejection_outcome = ""
 
     except Exception as exc:
         elapsed_ms = int((time.time() - started) * 1000)
         print(f"  {CLI_DIM}→ planner failed ({elapsed_ms} ms): {exc}{CLI_CLR}")
-        return {"strategy": "", "rejection": None}
+        return {"strategy": "", "instructions": [], "rejection": None}
 
     rejection = None
     if not feasible and rejection_outcome:
@@ -511,12 +513,14 @@ def _plan_task(
     color = CLI_RED if rejection else CLI_GREEN
     label = rejection_outcome if rejection else "FEASIBLE"
     print(f"  {color}→ {label}{CLI_CLR} ({elapsed_ms} ms)")
+    if instructions:
+        for inst in instructions:
+            print(f"  {CLI_DIM}📋 {inst}{CLI_CLR}")
     if strategy:
-        # Show first 200 chars of strategy
         preview = strategy[:200] + ("..." if len(strategy) > 200 else "")
         print(f"  {CLI_DIM}{preview}{CLI_CLR}")
 
-    return {"strategy": strategy, "rejection": rejection}
+    return {"strategy": strategy, "instructions": instructions, "rejection": rejection}
 
 
 def run_agent(
@@ -558,11 +562,25 @@ def run_agent(
         "</workspace-tree>"
     )
 
-    # Build task message with strategy from planner
+    # Build task message with instructions and strategy from planner
+    instructions = plan.get("instructions", [])
     strategy = plan["strategy"]
+
+    instructions_section = ""
+    if instructions:
+        rules_text = "\n".join(f"- {inst}" for inst in instructions)
+        instructions_section = (
+            f"\n\n<applicable-rules>\n"
+            f"These rules from AGENTS.md apply to this task (ordered by priority):\n"
+            f"{rules_text}\n"
+            f"</applicable-rules>"
+        )
+
     strategy_section = f"\n\n<task-strategy>\n{strategy}\n</task-strategy>" if strategy else ""
     task_msg = (
-        f"<task>\n{task_text}\n</task>{strategy_section}\n\n"
+        f"<task>\n{task_text}\n</task>"
+        f"{instructions_section}"
+        f"{strategy_section}\n\n"
         "Use plan_create to set up your execution steps, then work through them. "
         "Update each step with plan_update as you go."
     )
