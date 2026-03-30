@@ -12,6 +12,8 @@ class TaskManager:
         self._next_id: int = 1
         self._notes: list[str] = []
         self._instructions: list[str] = []
+        self._files_written: list[str] = []
+        self._files_read: list[str] = []
 
     # -- Instructions (rules from AGENTS.md + discovered during execution) --
 
@@ -66,6 +68,16 @@ class TaskManager:
 
     # -- Notes --
 
+    def track_read(self, path: str) -> None:
+        """Track a file that was read (for validation context)."""
+        if path not in self._files_read:
+            self._files_read.append(path)
+
+    def track_write(self, path: str) -> None:
+        """Track a file that was written (for validation context)."""
+        if path not in self._files_written:
+            self._files_written.append(path)
+
     def add_note(self, note: str) -> str:
         """Save a persistent note (key values, conventions, findings)."""
         self._notes.append(note.strip())
@@ -103,6 +115,10 @@ class TaskManager:
             done = sum(1 for t in self._tasks if t["status"] in ("completed", "skipped"))
             total = len(self._tasks)
             lines.append(f"\n({done}/{total} done)")
+        if self._files_written:
+            lines.append("\nFiles written:")
+            for f in self._files_written:
+                lines.append(f"  📝 {f}")
         return "\n".join(lines) if lines else "No plan."
 
     def _find(self, task_id: int) -> dict | None:
