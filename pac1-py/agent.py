@@ -661,8 +661,10 @@ def run_agent(
                 break  # stop processing remaining tool calls
             elif name == "report_completion":
                 outcome = args.get("outcome", "OUTCOME_ERR_INTERNAL")
+                confidence = args.get("confidence", 1.0)
                 outcome_style = CLI_GREEN if outcome == "OUTCOME_OK" else CLI_YELLOW
-                print(f"    {outcome_style}■ report_completion{CLI_CLR} → {outcome}")
+                conf_str = f" (confidence: {confidence:.0%})" if confidence < 1.0 else ""
+                print(f"    {outcome_style}■ report_completion{CLI_CLR} → {outcome}{conf_str}")
                 print(f"      {args.get('message', '')}")
                 for ref in args.get("grounding_refs", []):
                     print(f"      {CLI_DIM}{ref}{CLI_CLR}")

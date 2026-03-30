@@ -259,6 +259,15 @@ _WRITE_SCHEMAS: list[dict] = [
                         "items": {"type": "string"},
                         "description": "List of file paths that contributed to the answer.",
                     },
+                    "confidence": {
+                        "type": "number",
+                        "description": (
+                            "How confident you are in this answer, 0.0 to 1.0. "
+                            "1.0 = certain (verified against file data). "
+                            "0.5 = unsure (inferred, not directly confirmed). "
+                            "Below 0.5 = guessing (consider reporting CLARIFICATION instead)."
+                        ),
+                    },
                 },
                 "required": ["message", "outcome"],
             },
