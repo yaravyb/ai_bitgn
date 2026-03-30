@@ -237,9 +237,10 @@ _WRITE_SCHEMAS: list[dict] = [
                     "message": {
                         "type": "string",
                         "description": (
-                            "The answer to the task. If the task asks for specific "
-                            "data (email, name, value), include that data here. "
-                            "If the task asks for an action, summarize what was done."
+                            "The answer to the task — return exactly what the user "
+                            "asked for, nothing more. If they ask for an email, "
+                            "return only the email. If they ask for a name, return "
+                            "only the name. For action tasks, summarize what was done."
                         ),
                     },
                     "outcome": {
