@@ -367,24 +367,23 @@ def _phase1_bootstrap(vm: PcmRuntimeClientSync) -> dict:
 
     # Fallback: extract AGENTS.md paths from the tree we already have
     if not agents_paths and ctx["directory_tree"]:
-        def _extract_md_paths(node: dict, prefix: str = "") -> list[str]:
+        def _extract_paths(node: dict, prefix: str = "", target: str = "AGENTS.MD") -> list[str]:
             paths = []
             name = node.get("name", "")
-            # Root node has name="/", its children live under "/"
             if name == "/":
                 current = ""
             else:
                 current = f"{prefix}/{name}"
-            if name.upper() == "AGENTS.MD" and not node.get("isDir"):
+            if name.upper() == target and not node.get("isDir"):
                 paths.append(current)
             for child in node.get("children", []):
-                paths.extend(_extract_md_paths(child, current))
+                paths.extend(_extract_paths(child, current, target))
             return paths
 
         try:
             tree_data = json.loads(ctx["directory_tree"])
             root_node = tree_data.get("root", tree_data)
-            agents_paths = _extract_md_paths(root_node)
+            agents_paths = _extract_paths(root_node, target="AGENTS.MD")
             if agents_paths:
                 print(f"  {CLI_YELLOW}find fallback → extracted from tree: {agents_paths}{CLI_CLR}")
         except Exception:
@@ -402,6 +401,29 @@ def _phase1_bootstrap(vm: PcmRuntimeClientSync) -> dict:
             log.warning("Phase 1: read %s failed: %s", path, exc)
 
     ctx["agents_md"] = "\n\n---\n\n".join(parts)
+
+    # 3. Read all README.md files (folder conventions, formats, sequences)
+    readme_paths: list[str] = []
+    if ctx["directory_tree"]:
+        try:
+            tree_data = json.loads(ctx["directory_tree"])
+            root_node = tree_data.get("root", tree_data)
+            readme_paths = _extract_paths(root_node, target="README.MD")
+        except Exception:
+            pass
+
+    readme_parts: list[str] = []
+    for path in readme_paths:
+        try:
+            read_result = vm.read(ReadRequest(path=path))
+            content = MessageToDict(read_result).get("content", "")
+            if content:
+                print(f"  {CLI_CYAN}read{CLI_CLR} {path} ✓")
+                readme_parts.append(f"## {path}\n\n{content}")
+        except Exception:
+            pass
+    ctx["readmes"] = "\n\n---\n\n".join(readme_parts)
+
     return ctx
 
 
@@ -556,6 +578,7 @@ def _plan_task(
 
     tree_compact = _compact_tree(phase1_ctx.get("directory_tree", ""))
     agents_md = phase1_ctx.get("agents_md", "")
+    readmes = phase1_ctx.get("readmes", "")
 
     messages: list[dict] = [
         {
@@ -583,6 +606,8 @@ def _plan_task(
                 "Nested AGENTS.md → local specifics (cannot override root).\n"
                 "</instruction-priority>\n\n"
                 "If all checks pass, produce a concrete step-by-step plan. "
+                "README.md contents for each folder are already provided in "
+                "<folder-readmes>. Use them for naming conventions and formats. "
                 "Use the plan_task tool."
             ),
         },
@@ -591,7 +616,8 @@ def _plan_task(
             "content": (
                 f"<task>{task_text}</task>\n\n"
                 f"<workspace-tree>\n{tree_compact}\n</workspace-tree>\n\n"
-                f"<agents-md>\n{agents_md}\n</agents-md>"
+                f"<agents-md>\n{agents_md}\n</agents-md>\n\n"
+                f"<folder-readmes>\n{readmes}\n</folder-readmes>"
             ),
         },
     ]
@@ -681,6 +707,13 @@ def run_agent(
         f"{tree_compact}\n"
         "</workspace-tree>"
     )
+    readmes = phase1_ctx.get("readmes", "")
+    if readmes:
+        context += (
+            "\n\n<folder-readmes>\n"
+            f"{readmes}\n"
+            "</folder-readmes>"
+        )
 
     # Build task message with instructions and strategy from planner
     instructions = plan.get("instructions", [])
