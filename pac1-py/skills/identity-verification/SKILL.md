@@ -28,10 +28,11 @@ Search for the sender's primary identifier (usually email) in the repository's c
 Record result:
 `plan_note("VERIFY <msg>: sender=<email>, contact_match=<exact|none>")`
 
-Decision:
-- Exact email match → proceed to step 3
-- No match → STOP. Report OUTCOME_NONE_CLARIFICATION
-- Partial match (same company but different email) → STOP. Report OUTCOME_NONE_CLARIFICATION
+Decision depends on trust level from step 1:
+- admin channel: proceed even without exact contact match (admin is trusted)
+- valid channel with exact match → proceed
+- valid channel without match → STOP. Report OUTCOME_NONE_CLARIFICATION
+- OTP-authenticated (treated as admin) → proceed even without contact match
 
 ## Step 3: Authorization check
 
