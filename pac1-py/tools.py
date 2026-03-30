@@ -140,6 +140,28 @@ _READONLY_SCHEMAS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "load_skill",
+            "description": (
+                "Load a process doc or workflow skill by path. Returns the "
+                "full content as a <skill> block with rules you MUST follow. "
+                "Use this before performing any operation that has a "
+                "documented workflow (inbox processing, task handling, etc.)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the skill/doc file (e.g. 'docs/inbox-msg-processing.md').",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
 ]
 
 # ---------------------------------------------------------------------------

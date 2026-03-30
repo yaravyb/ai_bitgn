@@ -128,6 +128,23 @@ def _compact_tree(tree_json: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _load_skill(vm: PcmRuntimeClientSync, path: str) -> str:
+    """Load a process doc as a skill block. The model MUST follow these rules."""
+    try:
+        result = vm.read(ReadRequest(path=path))
+        content = MessageToDict(result).get("content", "")
+        if content:
+            return (
+                f"<skill path=\"{path}\">\n"
+                f"IMPORTANT: Follow these rules strictly.\n\n"
+                f"{content}\n"
+                f"</skill>"
+            )
+        return f"Error: empty file {path}"
+    except Exception as exc:
+        return f"Error reading skill {path}: {exc}"
+
+
 def _dispatch(vm: PcmRuntimeClientSync, name: str, args: dict, tm: TaskManager | None = None) -> str:
     """Execute a tool call against the PCM runtime. Returns result string."""
     handlers = {
@@ -150,6 +167,7 @@ def _dispatch(vm: PcmRuntimeClientSync, name: str, args: dict, tm: TaskManager |
         "list": lambda: vm.list(ListRequest(name=args.get("path", "/"))),
         "read": lambda: vm.read(ReadRequest(path=args["path"])),
         "current_date": lambda: vm.context(ContextRequest()),
+        "load_skill": lambda: _load_skill(vm, args.get("path", "")),
         "write": lambda: vm.write(WriteRequest(path=args["path"], content=args["content"])),
         "delete": lambda: vm.delete(DeleteRequest(path=args["path"])),
         "mkdir": lambda: vm.mk_dir(MkDirRequest(path=args["path"])),
@@ -424,6 +442,37 @@ def _phase1_bootstrap(vm: PcmRuntimeClientSync) -> dict:
             pass
     ctx["readmes"] = "\n\n---\n\n".join(readme_parts)
 
+    # 4. Discover available skills (process docs, workflow docs)
+    #    Layer 1: just file paths for the system prompt
+    def _extract_doc_paths(node: dict, prefix: str = "") -> list[str]:
+        """Extract .md file paths from docs/ and 99_process/ folders."""
+        paths = []
+        name = node.get("name", "")
+        if name == "/":
+            current = ""
+        else:
+            current = f"{prefix}/{name}"
+        is_dir = node.get("isDir", False)
+        # Only look inside docs/ and 99_process/
+        if not is_dir and name.endswith(".md") and name.upper() not in ("AGENTS.MD", "README.MD"):
+            if any(p in current.lower() for p in ("/docs/", "/99_process/")):
+                paths.append(current)
+        for child in node.get("children", []):
+            paths.extend(_extract_doc_paths(child, current))
+        return paths
+
+    skill_paths: list[str] = []
+    if ctx["directory_tree"]:
+        try:
+            tree_data = json.loads(ctx["directory_tree"])
+            root_node = tree_data.get("root", tree_data)
+            skill_paths = _extract_doc_paths(root_node)
+        except Exception:
+            pass
+    ctx["skill_paths"] = skill_paths
+    if skill_paths:
+        print(f"  {CLI_CYAN}skills{CLI_CLR} {len(skill_paths)} docs found")
+
     return ctx
 
 
@@ -617,7 +666,8 @@ def _plan_task(
                 f"<task>{task_text}</task>\n\n"
                 f"<workspace-tree>\n{tree_compact}\n</workspace-tree>\n\n"
                 f"<agents-md>\n{agents_md}\n</agents-md>\n\n"
-                f"<folder-readmes>\n{readmes}\n</folder-readmes>"
+                f"<folder-readmes>\n{readmes}\n</folder-readmes>\n\n"
+                f"<available-skills>{', '.join(phase1_ctx.get('skill_paths', []))}</available-skills>"
             ),
         },
     ]
@@ -713,6 +763,16 @@ def run_agent(
             "\n\n<folder-readmes>\n"
             f"{readmes}\n"
             "</folder-readmes>"
+        )
+    skill_paths = phase1_ctx.get("skill_paths", [])
+    if skill_paths:
+        skills_list = "\n".join(f"  - {p}" for p in skill_paths)
+        context += (
+            "\n\n<available-skills>\n"
+            "Use load_skill(path) to load these process docs BEFORE "
+            "performing the related action:\n"
+            f"{skills_list}\n"
+            "</available-skills>"
         )
 
     # Build task message with instructions and strategy from planner
