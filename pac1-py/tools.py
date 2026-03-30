@@ -145,20 +145,20 @@ _READONLY_SCHEMAS: list[dict] = [
         "function": {
             "name": "load_skill",
             "description": (
-                "Load a process doc or workflow skill by path. Returns the "
-                "full content as a <skill> block with rules you MUST follow. "
-                "Use this before performing any operation that has a "
-                "documented workflow (inbox processing, task handling, etc.)."
+                "Load specialized knowledge before performing an action. "
+                "Pass a skill name (e.g. 'security-posture', 'inbox-processing') "
+                "or a file path (e.g. 'docs/inbox-msg-processing.md'). "
+                "Returns a <skill> block with rules you MUST follow."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {
+                    "name": {
                         "type": "string",
-                        "description": "Path to the skill/doc file (e.g. 'docs/inbox-msg-processing.md').",
+                        "description": "Skill name or file path to load.",
                     },
                 },
-                "required": ["path"],
+                "required": ["name"],
             },
         },
     },

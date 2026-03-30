@@ -3,6 +3,9 @@ import textwrap
 import time
 import uuid
 
+from dotenv import load_dotenv
+load_dotenv(override=True)
+
 from bitgn.harness_connect import HarnessServiceClientSync
 from bitgn.harness_pb2 import EndTrialRequest, EvalPolicy, GetBenchmarkRequest, StartPlaygroundRequest, StatusRequest
 from connectrpc.errors import ConnectError

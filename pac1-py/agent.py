@@ -22,8 +22,14 @@ from bitgn.vm.pcm_pb2 import (
 from google.protobuf.json_format import MessageToDict
 from litellm import completion
 
+from pathlib import Path
+
+from skills import SkillLoader
 from tasks import TaskManager
 from tools import EXECUTOR_TOOLS, PLANNER_TOOL, VALIDATION_TOOL
+
+# Load local skills (generic patterns, not task-specific)
+_SKILLS = SkillLoader(Path(__file__).parent / "skills")
 
 litellm.suppress_debug_info = True
 logging.getLogger("LiteLLM").setLevel(logging.CRITICAL)
@@ -128,21 +134,31 @@ def _compact_tree(tree_json: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _load_skill(vm: PcmRuntimeClientSync, path: str) -> str:
-    """Load a process doc as a skill block. The model MUST follow these rules."""
+def _load_skill(vm: PcmRuntimeClientSync, name_or_path: str) -> str:
+    """Load a skill by name (local) or path (PCM runtime).
+
+    First checks local skills (skills/ directory), then falls back
+    to reading a file from the PCM runtime.
+    """
+    # Try local skill first (by name)
+    local = _SKILLS.get_content(name_or_path)
+    if not local.startswith("Error:"):
+        return local
+
+    # Fall back to PCM runtime file (by path)
     try:
-        result = vm.read(ReadRequest(path=path))
+        result = vm.read(ReadRequest(path=name_or_path))
         content = MessageToDict(result).get("content", "")
         if content:
             return (
-                f"<skill path=\"{path}\">\n"
+                f"<skill path=\"{name_or_path}\">\n"
                 f"IMPORTANT: Follow these rules strictly.\n\n"
                 f"{content}\n"
                 f"</skill>"
             )
-        return f"Error: empty file {path}"
+        return f"Error: empty file {name_or_path}"
     except Exception as exc:
-        return f"Error reading skill {path}: {exc}"
+        return f"Error: skill '{name_or_path}' not found locally or in runtime: {exc}"
 
 
 def _dispatch(vm: PcmRuntimeClientSync, name: str, args: dict, tm: TaskManager | None = None) -> str:
@@ -167,7 +183,7 @@ def _dispatch(vm: PcmRuntimeClientSync, name: str, args: dict, tm: TaskManager |
         "list": lambda: vm.list(ListRequest(name=args.get("path", "/"))),
         "read": lambda: vm.read(ReadRequest(path=args["path"])),
         "current_date": lambda: vm.context(ContextRequest()),
-        "load_skill": lambda: _load_skill(vm, args.get("path", "")),
+        "load_skill": lambda: _load_skill(vm, args.get("name", args.get("path", ""))),
         "write": lambda: vm.write(WriteRequest(path=args["path"], content=args["content"])),
         "delete": lambda: vm.delete(DeleteRequest(path=args["path"])),
         "mkdir": lambda: vm.mk_dir(MkDirRequest(path=args["path"])),
@@ -667,7 +683,10 @@ def _plan_task(
                 f"<workspace-tree>\n{tree_compact}\n</workspace-tree>\n\n"
                 f"<agents-md>\n{agents_md}\n</agents-md>\n\n"
                 f"<folder-readmes>\n{readmes}\n</folder-readmes>\n\n"
-                f"<available-skills>{', '.join(phase1_ctx.get('skill_paths', []))}</available-skills>"
+                f"<available-skills>\n"
+                f"Agent skills: {', '.join(_SKILLS.get_names())}\n"
+                f"Repo docs: {', '.join(phase1_ctx.get('skill_paths', []))}\n"
+                f"</available-skills>"
             ),
         },
     ]
@@ -764,14 +783,20 @@ def run_agent(
             f"{readmes}\n"
             "</folder-readmes>"
         )
-    skill_paths = phase1_ctx.get("skill_paths", [])
-    if skill_paths:
-        skills_list = "\n".join(f"  - {p}" for p in skill_paths)
+    # Available skills: local (generic patterns) + runtime (repo-specific docs)
+    local_skills = _SKILLS.get_descriptions()
+    runtime_skills = phase1_ctx.get("skill_paths", [])
+    runtime_list = "\n".join(f"  - {p}" for p in runtime_skills) if runtime_skills else ""
+    skills_section = ""
+    if local_skills:
+        skills_section += f"Agent skills (load by name):\n{local_skills}\n"
+    if runtime_list:
+        skills_section += f"\nRepo process docs (load by path):\n{runtime_list}\n"
+    if skills_section:
         context += (
             "\n\n<available-skills>\n"
-            "Use load_skill(path) to load these process docs BEFORE "
-            "performing the related action:\n"
-            f"{skills_list}\n"
+            "Use load_skill(name_or_path) BEFORE performing related actions.\n\n"
+            f"{skills_section}"
             "</available-skills>"
         )
 
