@@ -503,8 +503,13 @@ def _plan_task(
             args = json.loads(tc.function.arguments)
             feasible = args.get("feasible", True)
             strategy = args.get("strategy", "")
-            instructions = args.get("instructions", [])
+            raw_instructions = args.get("instructions", [])
             rejection_outcome = args.get("rejection_outcome", "")
+            # Fix: weak models sometimes serialize a string as char array
+            if raw_instructions and all(len(s) <= 1 for s in raw_instructions):
+                instructions = ["".join(raw_instructions)]
+            else:
+                instructions = raw_instructions
         else:
             feasible = True
             strategy = choice.message.content or ""
