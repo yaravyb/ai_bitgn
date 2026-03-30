@@ -426,6 +426,50 @@ _TASK_SCHEMAS: list[dict] = [
 EXECUTOR_TOOLS: list[dict] = _READONLY_SCHEMAS + _WRITE_SCHEMAS + _TASK_SCHEMAS
 
 # ---------------------------------------------------------------------------
+# Validation tool — reviews answer before final submission
+# ---------------------------------------------------------------------------
+
+VALIDATION_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "validate_answer",
+        "description": "Validate the proposed answer before final submission.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "approved": {
+                    "type": "boolean",
+                    "description": (
+                        "true if the answer and outcome are correct. "
+                        "false if something needs to be fixed."
+                    ),
+                },
+                "corrected_outcome": {
+                    "type": "string",
+                    "enum": [
+                        "OUTCOME_OK",
+                        "OUTCOME_DENIED_SECURITY",
+                        "OUTCOME_NONE_CLARIFICATION",
+                        "OUTCOME_NONE_UNSUPPORTED",
+                        "OUTCOME_ERR_INTERNAL",
+                    ],
+                    "description": "The correct outcome code (may differ from proposed).",
+                },
+                "corrected_message": {
+                    "type": "string",
+                    "description": "Corrected answer if needed. Empty if approved.",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Why approved or why correction is needed.",
+                },
+            },
+            "required": ["approved", "corrected_outcome", "reason"],
+        },
+    },
+}
+
+# ---------------------------------------------------------------------------
 # Planner tool — classifies task type and generates strategy before executor
 # ---------------------------------------------------------------------------
 
