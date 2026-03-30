@@ -1,7 +1,7 @@
 """In-memory task manager for the PAC1 agent.
 
-Tracks execution plan as a list of steps with status.
-The model can create, update, replan, and query tasks via tool calls.
+Tracks execution plan, instructions, and notes.
+The model can create, update, replan, and query via tool calls.
 State lives in memory — no file I/O, no persistence across runs.
 """
 
@@ -11,12 +11,28 @@ class TaskManager:
         self._tasks: list[dict] = []
         self._next_id: int = 1
         self._notes: list[str] = []
+        self._instructions: list[str] = []
+
+    # -- Instructions (rules from AGENTS.md + discovered during execution) --
+
+    def set_instructions(self, instructions: list[str]) -> None:
+        """Set initial instructions from planner. Called once at start."""
+        self._instructions = [i.strip() for i in instructions if i.strip()]
+
+    def add_instruction(self, instruction: str) -> str:
+        """Add a rule discovered during execution (from README.md, docs, etc.)."""
+        self._instructions.append(instruction.strip())
+        return self.render()
+
+    def replace_instructions(self, instructions: list[str]) -> str:
+        """Replace all instructions. Use when replanning after major discovery."""
+        self._instructions = [i.strip() for i in instructions if i.strip()]
+        return self.render()
+
+    # -- Plan steps --
 
     def create(self, steps: list[str]) -> str:
-        """Create a new plan from a list of step descriptions.
-
-        Replaces any existing plan.
-        """
+        """Create a new plan. Replaces existing steps (keeps instructions/notes)."""
         self._tasks = []
         self._next_id = 1
         for text in steps:
@@ -48,26 +64,34 @@ class TaskManager:
         self._next_id += 1
         return self.render()
 
-    def list_all(self) -> str:
-        """Return current plan status."""
-        return self.render()
+    # -- Notes --
 
     def add_note(self, note: str) -> str:
-        """Save a persistent note. Survives auto-compact."""
+        """Save a persistent note (key values, conventions, findings)."""
         self._notes.append(note.strip())
         return self.render()
 
+    # -- Query --
+
+    def list_all(self) -> str:
+        """Return full state: instructions + notes + tasks."""
+        return self.render()
+
     def render(self) -> str:
-        """Render tasks and notes as readable text."""
-        if not self._tasks and not self._notes:
-            return "No plan."
+        """Render full state as readable text."""
         lines = []
+        if self._instructions:
+            lines.append("Instructions:")
+            for i in self._instructions:
+                lines.append(f"  ⚡ {i}")
+            lines.append("")
         if self._notes:
             lines.append("Notes:")
             for n in self._notes:
                 lines.append(f"  • {n}")
             lines.append("")
         if self._tasks:
+            lines.append("Plan:")
             for t in self._tasks:
                 marker = {
                     "pending": "[ ]",
@@ -75,11 +99,11 @@ class TaskManager:
                     "completed": "[x]",
                     "skipped": "[-]",
                 }.get(t["status"], "[?]")
-                lines.append(f"{marker} #{t['id']}: {t['text']}")
+                lines.append(f"  {marker} #{t['id']}: {t['text']}")
             done = sum(1 for t in self._tasks if t["status"] in ("completed", "skipped"))
             total = len(self._tasks)
             lines.append(f"\n({done}/{total} done)")
-        return "\n".join(lines)
+        return "\n".join(lines) if lines else "No plan."
 
     def _find(self, task_id: int) -> dict | None:
         for t in self._tasks:

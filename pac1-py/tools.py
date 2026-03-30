@@ -373,8 +373,30 @@ _TASK_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "plan_add_instruction",
+            "description": (
+                "Add a rule discovered during execution. Use when you read "
+                "a README.md, process doc, or nested AGENTS.md that contains "
+                "rules relevant to the current task. Instructions persist "
+                "and are shown on every plan_status call."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "instruction": {
+                        "type": "string",
+                        "description": "The rule to add (e.g. 'seq.json id is the next filename to use').",
+                    },
+                },
+                "required": ["instruction"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "plan_status",
-            "description": "Show current plan with step statuses and notes.",
+            "description": "Show current plan: instructions, notes, and step statuses.",
             "parameters": {
                 "type": "object",
                 "properties": {},

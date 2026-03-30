@@ -176,6 +176,7 @@ def _dispatch(vm: PcmRuntimeClientSync, name: str, args: dict, tm: TaskManager |
             "plan_update": lambda: tm.update(args["task_id"], args["status"]),
             "plan_add": lambda: tm.add(args["text"]),
             "plan_note": lambda: tm.add_note(args["note"]),
+            "plan_add_instruction": lambda: tm.add_instruction(args["instruction"]),
             "plan_status": lambda: tm.list_all(),
         })
     handler = handlers.get(name)
@@ -553,8 +554,9 @@ def run_agent(
             log.warning("Planner rejection: vm.answer failed: %s", exc)
         return
 
-    # Task manager for plan tracking
+    # Task manager — seed with planner's instructions
     tm = TaskManager()
+    tm.set_instructions(plan.get("instructions", []))
 
     # Executor (full tool access)
     context = ""
