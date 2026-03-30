@@ -22,6 +22,7 @@ from bitgn.vm.pcm_pb2 import (
 from google.protobuf.json_format import MessageToDict
 from litellm import completion
 
+from tasks import TaskManager
 from tools import EXECUTOR_TOOLS, PLANNER_TOOL
 
 litellm.suppress_debug_info = True
@@ -109,7 +110,7 @@ def _compact_tree(tree_json: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _dispatch(vm: PcmRuntimeClientSync, name: str, args: dict) -> str:
+def _dispatch(vm: PcmRuntimeClientSync, name: str, args: dict, tm: TaskManager | None = None) -> str:
     """Execute a tool call against the PCM runtime. Returns result string."""
     handlers = {
         "tree": lambda: vm.tree(TreeRequest(root=args.get("root", ""))),
@@ -150,12 +151,24 @@ def _dispatch(vm: PcmRuntimeClientSync, name: str, args: dict) -> str:
             )
         ),
     }
+    # Task management tools (in-memory, no PCM call)
+    if tm is not None:
+        handlers.update({
+            "plan_create": lambda: tm.create(args["steps"]),
+            "plan_update": lambda: tm.update(args["task_id"], args["status"]),
+            "plan_add": lambda: tm.add(args["text"]),
+            "plan_status": lambda: tm.list_all(),
+        })
     handler = handlers.get(name)
     if not handler:
         return f"Unknown tool: {name}"
     result = handler()
-    result_dict = MessageToDict(result) if result else {}
-    txt = json.dumps(result_dict, indent=2)
+    # Task tools return strings; PCM tools return protobuf
+    if isinstance(result, str):
+        txt = result
+    else:
+        result_dict = MessageToDict(result) if result else {}
+        txt = json.dumps(result_dict, indent=2)
     if len(txt) > _OUTPUT_CAP:
         txt = txt[:_OUTPUT_CAP] + "\n... [truncated]"
 
@@ -500,6 +513,9 @@ def run_agent(
             pass
         return
 
+    # Task manager for plan tracking
+    tm = TaskManager()
+
     # Executor (full tool access)
     context = ""
     if phase1_ctx["agents_md"]:
@@ -515,10 +531,14 @@ def run_agent(
         "</workspace-tree>"
     )
 
-    # Build task message with strategy hint from planner
+    # Build task message with strategy from planner
     strategy = plan["strategy"]
     strategy_section = f"\n\n<task-strategy>\n{strategy}\n</task-strategy>" if strategy else ""
-    task_msg = f"<task>\n{task_text}\n</task>{strategy_section}"
+    task_msg = (
+        f"<task>\n{task_text}\n</task>{strategy_section}\n\n"
+        "Use plan_create to set up your execution steps, then work through them. "
+        "Update each step with plan_update as you go."
+    )
 
     messages: list[dict] = [
         {"role": "system", "content": _EXECUTOR_SYSTEM},
@@ -565,7 +585,7 @@ def run_agent(
             )
 
             try:
-                txt = _dispatch(vm, name, args)
+                txt = _dispatch(vm, name, args, tm)
                 status = f"{CLI_GREEN}✓{CLI_CLR}"
                 detail = f"{len(txt)} chars" if len(txt) > 200 else ""
             except Exception as exc:

@@ -284,10 +284,88 @@ _WRITE_SCHEMAS: list[dict] = [
 ]
 
 # ---------------------------------------------------------------------------
+# Task management tools — in-memory plan tracking
+# ---------------------------------------------------------------------------
+
+_TASK_SCHEMAS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "plan_create",
+            "description": (
+                "Create an execution plan from a list of steps. "
+                "Replaces any existing plan. Use at the start of a task "
+                "or when replanning."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of step descriptions in execution order.",
+                    },
+                },
+                "required": ["steps"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "plan_update",
+            "description": "Update a plan step's status.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "integer",
+                        "description": "Step number to update.",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["pending", "in_progress", "completed", "skipped"],
+                    },
+                },
+                "required": ["task_id", "status"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "plan_add",
+            "description": "Add a new step to the current plan.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Step description.",
+                    },
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "plan_status",
+            "description": "Show current plan with step statuses.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+]
+
+# ---------------------------------------------------------------------------
 # Public exports
 # ---------------------------------------------------------------------------
 
-EXECUTOR_TOOLS: list[dict] = _READONLY_SCHEMAS + _WRITE_SCHEMAS
+EXECUTOR_TOOLS: list[dict] = _READONLY_SCHEMAS + _WRITE_SCHEMAS + _TASK_SCHEMAS
 TOOL_NAMES: set[str] = {t["function"]["name"] for t in EXECUTOR_TOOLS}
 
 # ---------------------------------------------------------------------------
