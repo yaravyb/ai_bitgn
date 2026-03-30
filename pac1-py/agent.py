@@ -814,8 +814,12 @@ def run_agent(
             f"</applicable-rules>"
         )
 
+    # Always inject execution-discipline skill (the universal default)
+    discipline_skill = _SKILLS.get_content("execution-discipline")
+
     strategy_section = f"\n\n<task-strategy>\n{strategy}\n</task-strategy>" if strategy else ""
     task_msg = (
+        f"{discipline_skill}\n\n"
         f"<task>\n{task_text}\n</task>"
         f"{instructions_section}"
         f"{strategy_section}\n\n"
