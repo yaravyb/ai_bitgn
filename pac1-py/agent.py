@@ -1062,9 +1062,13 @@ def run_agent(
             _auto_compact(model, messages, metadata)
         return None, tm
 
-    # Run two independent executor sessions (writes are deferred)
-    result_a, tm_a = _run_executor("A")
-    result_b, tm_b = _run_executor("B")
+    # Run two independent executor sessions in parallel (writes are deferred)
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        future_a = pool.submit(_run_executor, "A")
+        future_b = pool.submit(_run_executor, "B")
+        result_a, tm_a = future_a.result()
+        result_b, tm_b = future_b.result()
 
     # Arbiter: pick the best result
     final = _arbiter(model, task_text, result_a, result_b,
