@@ -188,8 +188,13 @@ def _dispatch(vm: PcmRuntimeClientSync, name: str, args: dict, tm: TaskManager |
     if tm is not None:
         if name == "read":
             tm.track_read(args.get("path", ""))
-        elif name in ("write", "delete", "move", "mkdir"):
-            tm.track_write(args.get("path", args.get("to_name", "")))
+        elif name == "delete":
+            tm.track_delete(args.get("path", ""))
+        elif name in ("write", "mkdir"):
+            tm.track_write(args.get("path", ""))
+        elif name == "move":
+            tm.track_delete(args.get("from_name", ""))
+            tm.track_write(args.get("to_name", ""))
 
     # Task tools return strings; PCM tools return protobuf
     result_dict: dict = {}
