@@ -47,7 +47,6 @@ _MAX_RETRIES = 3
 _RETRY_BASE_DELAY = 1.0
 _OUTPUT_CAP = int(os.environ.get("CTX_TRUNCATION_LIMIT", "10000"))
 _AUTO_COMPACT_THRESHOLD = int(os.environ.get("CTX_AUTO_COMPACT_THRESHOLD", "80000"))
-_THREAT_CONFIDENCE_THRESHOLD = 0.7
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -164,6 +163,7 @@ def _dispatch(vm: PcmRuntimeClientSync, name: str, args: dict, tm: TaskManager |
         return f"Unknown tool: {name}"
     result = handler()
     # Task tools return strings; PCM tools return protobuf
+    result_dict: dict = {}
     if isinstance(result, str):
         txt = result
     else:
@@ -368,29 +368,6 @@ def _phase1_bootstrap(vm: PcmRuntimeClientSync) -> dict:
             log.warning("Phase 1: read %s failed: %s", path, exc)
 
     ctx["agents_md"] = "\n\n---\n\n".join(parts)
-
-    # 3. Read all inbox files (untrusted — needed for threat assessment)
-    inbox_files: list[dict] = []
-    try:
-        inbox_result = vm.list(ListRequest(name="00_inbox"))
-        entries = MessageToDict(inbox_result).get("entries", [])
-        for entry in entries:
-            name = entry.get("name", "")
-            if not name or entry.get("isDir"):
-                continue
-            path = f"00_inbox/{name}"
-            try:
-                read_result = vm.read(ReadRequest(path=path))
-                content = MessageToDict(read_result).get("content", "")
-                if content:
-                    inbox_files.append({"path": path, "content": content})
-                    print(f"  {CLI_CYAN}read{CLI_CLR} {path} ✓")
-            except Exception:
-                pass
-    except Exception:
-        pass
-    ctx["inbox_files"] = inbox_files
-
     return ctx
 
 
@@ -509,8 +486,8 @@ def run_agent(
                 outcome=OUTCOME_BY_NAME[plan["rejection"]["outcome"]],
                 refs=[],
             ))
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("Planner rejection: vm.answer failed: %s", exc)
         return
 
     # Task manager for plan tracking
@@ -597,6 +574,7 @@ def run_agent(
                 print(f"    {CLI_RED}⚠ report_threat{CLI_CLR} → OUTCOME_DENIED_SECURITY")
                 print(f"      {args.get('reason', '')}")
                 completed = True
+                break  # stop processing remaining tool calls
             elif name == "report_completion":
                 outcome = args.get("outcome", "OUTCOME_ERR_INTERNAL")
                 outcome_style = CLI_GREEN if outcome == "OUTCOME_OK" else CLI_YELLOW
@@ -605,6 +583,7 @@ def run_agent(
                 for ref in args.get("grounding_refs", []):
                     print(f"      {CLI_DIM}{ref}{CLI_CLR}")
                 completed = True
+                break  # stop processing remaining tool calls
             elif name == "write":
                 path = args.get("path", "?")
                 content_len = len(args.get("content", ""))

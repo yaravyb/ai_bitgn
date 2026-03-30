@@ -366,7 +366,6 @@ _TASK_SCHEMAS: list[dict] = [
 # ---------------------------------------------------------------------------
 
 EXECUTOR_TOOLS: list[dict] = _READONLY_SCHEMAS + _WRITE_SCHEMAS + _TASK_SCHEMAS
-TOOL_NAMES: set[str] = {t["function"]["name"] for t in EXECUTOR_TOOLS}
 
 # ---------------------------------------------------------------------------
 # Planner tool — classifies task type and generates strategy before executor
