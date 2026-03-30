@@ -10,6 +10,7 @@ class TaskManager:
     def __init__(self):
         self._tasks: list[dict] = []
         self._next_id: int = 1
+        self._notes: list[str] = []
 
     def create(self, steps: list[str]) -> str:
         """Create a new plan from a list of step descriptions.
@@ -51,22 +52,33 @@ class TaskManager:
         """Return current plan status."""
         return self.render()
 
+    def add_note(self, note: str) -> str:
+        """Save a persistent note. Survives auto-compact."""
+        self._notes.append(note.strip())
+        return self.render()
+
     def render(self) -> str:
-        """Render tasks as readable text."""
-        if not self._tasks:
+        """Render tasks and notes as readable text."""
+        if not self._tasks and not self._notes:
             return "No plan."
         lines = []
-        for t in self._tasks:
-            marker = {
-                "pending": "[ ]",
-                "in_progress": "[>]",
-                "completed": "[x]",
-                "skipped": "[-]",
-            }.get(t["status"], "[?]")
-            lines.append(f"{marker} #{t['id']}: {t['text']}")
-        done = sum(1 for t in self._tasks if t["status"] in ("completed", "skipped"))
-        total = len(self._tasks)
-        lines.append(f"\n({done}/{total} done)")
+        if self._notes:
+            lines.append("Notes:")
+            for n in self._notes:
+                lines.append(f"  • {n}")
+            lines.append("")
+        if self._tasks:
+            for t in self._tasks:
+                marker = {
+                    "pending": "[ ]",
+                    "in_progress": "[>]",
+                    "completed": "[x]",
+                    "skipped": "[-]",
+                }.get(t["status"], "[?]")
+                lines.append(f"{marker} #{t['id']}: {t['text']}")
+            done = sum(1 for t in self._tasks if t["status"] in ("completed", "skipped"))
+            total = len(self._tasks)
+            lines.append(f"\n({done}/{total} done)")
         return "\n".join(lines)
 
     def _find(self, task_id: int) -> dict | None:

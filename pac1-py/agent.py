@@ -175,6 +175,7 @@ def _dispatch(vm: PcmRuntimeClientSync, name: str, args: dict, tm: TaskManager |
             "plan_create": lambda: tm.create(args["steps"]),
             "plan_update": lambda: tm.update(args["task_id"], args["status"]),
             "plan_add": lambda: tm.add(args["text"]),
+            "plan_note": lambda: tm.add_note(args["note"]),
             "plan_status": lambda: tm.list_all(),
         })
     handler = handlers.get(name)

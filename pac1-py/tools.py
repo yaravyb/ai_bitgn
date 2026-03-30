@@ -351,8 +351,30 @@ _TASK_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "plan_note",
+            "description": (
+                "Save a persistent note to the plan. Notes survive context "
+                "compression. Use to record: rules discovered in README.md "
+                "or process docs, file format conventions, key values "
+                "(IDs, paths, sequences), or any finding you'll need later."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note": {
+                        "type": "string",
+                        "description": "Short note (1-2 sentences). Record key facts, not full file contents.",
+                    },
+                },
+                "required": ["note"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "plan_status",
-            "description": "Show current plan with step statuses.",
+            "description": "Show current plan with step statuses and notes.",
             "parameters": {
                 "type": "object",
                 "properties": {},
