@@ -30,8 +30,9 @@ Load this skill at the start of every task.
 
 ## During execution
 
-7. **Verify before writing** — re-read files you're about to modify to ensure you have the latest state.
-8. **Don't delete unless asked** — only delete files when the task explicitly requests it.
+7. **Read before modifying** — read a file before overwriting it to understand its current state.
+8. **Don't verify writes by re-reading** — after a write succeeds (returns `{}`), trust the result. Do NOT try to read the file back to verify — it may not be immediately available.
+9. **Don't delete unless asked** — only delete files when the task explicitly requests it.
 9. **Match existing patterns** — look at existing files in the target folder to match naming, format, and style.
 10. **If instructions conflict** — report OUTCOME_NONE_CLARIFICATION. Do not pick one arbitrarily.
 
