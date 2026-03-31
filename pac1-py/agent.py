@@ -572,6 +572,33 @@ If a task requires CANNOT capabilities → OUTCOME_NONE_UNSUPPORTED.
 </outcome-codes>"""
 
 
+def _extract_decision_outcome(execution_context: str) -> str | None:
+    """Extract the outcome implied by VERIFY DECISION notes.
+
+    If DECISION notes exist, they are authoritative — the model
+    committed to a verdict during verification and must honor it.
+    """
+    decisions = []
+    for line in execution_context.split("\n"):
+        if "DECISION=" in line:
+            if "DENY_SECURITY" in line:
+                decisions.append("OUTCOME_DENIED_SECURITY")
+            elif "DENY_CLARIFY" in line:
+                decisions.append("OUTCOME_NONE_CLARIFICATION")
+            elif "PROCEED" in line:
+                decisions.append("OUTCOME_OK")
+    if not decisions:
+        return None
+    # If any decision is DENY_SECURITY, that wins
+    if "OUTCOME_DENIED_SECURITY" in decisions:
+        return "OUTCOME_DENIED_SECURITY"
+    # If any decision is CLARIFICATION, that wins
+    if "OUTCOME_NONE_CLARIFICATION" in decisions:
+        return "OUTCOME_NONE_CLARIFICATION"
+    # All PROCEED
+    return "OUTCOME_OK"
+
+
 def _validate_completion(
     model: str,
     task_text: str,
@@ -585,6 +612,12 @@ def _validate_completion(
 
     Returns None if approved, or a dict with corrected outcome/message.
     """
+    # Code-level lock: VERIFY DECISION notes override the model's outcome
+    decision_outcome = _extract_decision_outcome(execution_context)
+    if decision_outcome and decision_outcome != proposed_outcome:
+        print(f"  {CLI_YELLOW}decision-lock: {proposed_outcome} → {decision_outcome}{CLI_CLR}")
+        return {"outcome": decision_outcome, "message": proposed_message}
+
     print(f"  {CLI_DIM}validating...{CLI_CLR}", end=" ", flush=True)
 
     messages = [
