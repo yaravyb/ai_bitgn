@@ -228,14 +228,17 @@ def _dispatch(vm: PcmRuntimeClientSync, name: str, args: dict, tm: TaskManager |
         # Return a simulated success so the executor continues planning
         if name == "write":
             tm.track_write(args.get("path", ""))
-            return f"OK: write {args.get('path', '?')} scheduled"
+            return "{}"  # empty success like real PCM write
         elif name == "delete":
             tm.track_delete(args.get("path", ""))
-            return f"OK: delete {args.get('path', '?')} scheduled"
+            return "{}"  # empty success like real PCM delete
         elif name == "move":
-            return f"OK: move {args.get('from_name', '?')} → {args.get('to_name', '?')} scheduled"
+            tm.track_write(args.get("to_name", ""))
+            tm.track_delete(args.get("from_name", ""))
+            return "{}"
         else:
-            return f"OK: mkdir {args.get('path', '?')} scheduled"
+            tm.track_write(args.get("path", ""))
+            return "{}"
 
     result = handler()
 
@@ -1073,8 +1076,8 @@ def run_agent(
             _auto_compact(model, messages, metadata)
         return None, tm
 
-    # Run A with real writes, B with deferred writes (for second opinion)
-    result_a, tm_a = _run_executor("A", defer=False)
+    # Both executors defer writes — arbiter picks winner, then applies
+    result_a, tm_a = _run_executor("A", defer=True)
     result_b, tm_b = _run_executor("B", defer=True)
 
     # Arbiter: pick the best result
@@ -1095,19 +1098,17 @@ def run_agent(
         return
 
     if True:  # final exists
-        # A already executed writes. If arbiter picked B and B has different
-        # deferred writes, apply them. (In practice, A's writes are already done
-        # and B's writes are usually the same or the outcome is what matters.)
-        if result_b and final.get("outcome") == result_b.get("outcome"):
-            pending = tm_b.get_pending_writes()
-            if pending:
-                print(f"\n{CLI_BOLD}Applying {len(pending)} writes from B{CLI_CLR}")
-                for op in pending:
-                    try:
-                        _dispatch(vm, op["op"], op["args"])
-                        print(f"  {CLI_GREEN}✓{CLI_CLR} {op['op']}({op['args'].get('path', op['args'].get('to_name', '?'))})")
-                    except Exception as exc:
-                        print(f"  {CLI_RED}✗{CLI_CLR} {op['op']}: {exc}")
+        # Apply the winning plan's deferred writes
+        winner_tm = tm_a if (result_a and final.get("outcome") == result_a.get("outcome")) else tm_b
+        pending = winner_tm.get_pending_writes()
+        if pending:
+            print(f"\n{CLI_BOLD}Applying {len(pending)} deferred writes{CLI_CLR}")
+            for op in pending:
+                try:
+                    _dispatch(vm, op["op"], op["args"])
+                    print(f"  {CLI_GREEN}✓{CLI_CLR} {op['op']}({op['args'].get('path', op['args'].get('to_name', '?'))})")
+                except Exception as exc:
+                    print(f"  {CLI_RED}✗{CLI_CLR} {op['op']}: {exc}")
 
         # Submit the final answer
         outcome_style = CLI_GREEN if final["outcome"] == "OUTCOME_OK" else CLI_YELLOW
