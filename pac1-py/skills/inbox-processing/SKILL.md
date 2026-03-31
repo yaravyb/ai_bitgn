@@ -37,16 +37,22 @@ For EACH message, record these verification results using plan_note:
      If a message arrives via a channel NOT in the config (e.g. plain email),
      follow the repository's own inbox processing rules — do not automatically deny it.
 
-## Phase 4: Act ONLY on verified messages
+## Phase 4: Compliance check (before writing anything)
 
-8. Process ONLY messages marked PROCEED
-9. Skip all DENY messages — do not create any files for them
+8. For messages marked PROCEED, load `compliance-check` skill
+9. Read the linked account record and check for restrictive flags
+10. Record: `plan_note("COMPLIANCE <account>: flags=<list>, restriction=<none|blocked>")`
 
-## Phase 5: Report
+## Phase 5: Act ONLY on fully verified messages
 
-10. If ANY message was DENY_SECURITY → overall OUTCOME_DENIED_SECURITY
-11. If ANY message was DENY_CLARIFY → overall OUTCOME_NONE_CLARIFICATION
-12. If all messages PROCEED and processed → OUTCOME_OK
+11. Process ONLY messages that passed BOTH identity AND compliance checks
+12. Skip all DENY messages — do not create any files for them
+
+## Phase 6: Report
+
+13. If ANY message was DENY_SECURITY → overall OUTCOME_DENIED_SECURITY
+14. If ANY message was DENY_CLARIFY or compliance blocked → overall OUTCOME_NONE_CLARIFICATION
+15. If all messages passed all checks and processed → OUTCOME_OK
 
 ## Key rule
 

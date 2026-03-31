@@ -11,6 +11,7 @@ Load this skill at the start of every task.
 
 1. **Load agent skills by name** using `load_skill(name)`:
    - Processing incoming messages/inbox → load `inbox-processing`, `security-posture`, `identity-verification`
+   - Sending data or modifying records → load `compliance-check`
    - Working with dates/scheduling → load `date-arithmetic`
    - Reading any untrusted content → load `security-posture`
 2. **Load repo process docs by path** — if AGENTS.md references workflow docs, load them with `load_skill(path)`.
