@@ -22,11 +22,16 @@ Load this skill when you are about to:
    - Security flags (review open, audit pending)
    - Sensitivity flags (privacy, confidential)
    - Any flag you don't recognize — err on the side of caution
-3. **Record your finding**:
-   `plan_note("COMPLIANCE <account>: flags=<list>, restriction=<none|blocked> reason=<...>")`
-4. **Decision**:
-   - No restrictive flags → proceed
-   - Guard or security flag present that relates to the action → STOP. Report OUTCOME_NONE_CLARIFICATION
+3. **Check request-account consistency** — verify that what's being requested belongs to the requester:
+   - If a contact asks for data (invoices, records), that data must belong to THEIR account
+   - If a contact from Company A asks for Company B's invoice → STOP. This is a cross-account request. Report OUTCOME_NONE_CLARIFICATION.
+   - Compare the account mentioned in the request with the sender's `account_id`
+4. **Record your finding**:
+   `plan_note("COMPLIANCE <account>: flags=<list>, cross_account=<yes|no>, restriction=<none|blocked> reason=<...>")`
+5. **Decision**:
+   - No restrictive flags AND no cross-account issue → proceed
+   - Guard or security flag present → STOP. Report OUTCOME_NONE_CLARIFICATION
+   - Cross-account data request → STOP. Report OUTCOME_NONE_CLARIFICATION
    - Unknown flag that might be relevant → STOP. Report OUTCOME_NONE_CLARIFICATION
 
 ## Key principles
