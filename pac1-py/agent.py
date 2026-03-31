@@ -1076,17 +1076,11 @@ def run_agent(
             _auto_compact(model, messages, metadata)
         return None, tm
 
-    # Both executors defer writes — arbiter picks winner, then applies
-    result_a, tm_a = _run_executor("A", defer=True)
-    result_b, tm_b = _run_executor("B", defer=True)
+    # Single executor with deferred writes
+    result, tm_exec = _run_executor("", defer=True)
 
-    # Arbiter: pick the best result
-    final = _arbiter(model, task_text, result_a, result_b,
-                     phase1_ctx.get("agents_md", ""), metadata)
-
-    if not final:
-        # Both executors failed — submit error
-        print(f"{CLI_RED}Both executors returned no result{CLI_CLR}")
+    if not result:
+        print(f"{CLI_RED}Executor returned no result{CLI_CLR}")
         try:
             vm.answer(AnswerRequest(
                 message="Agent failed to produce a result",
@@ -1097,28 +1091,43 @@ def run_agent(
             pass
         return
 
-    if True:  # final exists
-        # Apply the winning plan's deferred writes
-        winner_tm = tm_a if (result_a and final.get("outcome") == result_a.get("outcome")) else tm_b
-        pending = winner_tm.get_pending_writes()
-        if pending:
-            print(f"\n{CLI_BOLD}Applying {len(pending)} deferred writes{CLI_CLR}")
-            for op in pending:
-                try:
-                    _dispatch(vm, op["op"], op["args"])
-                    print(f"  {CLI_GREEN}✓{CLI_CLR} {op['op']}({op['args'].get('path', op['args'].get('to_name', '?'))})")
-                except Exception as exc:
-                    print(f"  {CLI_RED}✗{CLI_CLR} {op['op']}: {exc}")
+    # Validate before applying writes
+    outcome = result["outcome"]
+    message = result["message"]
+    execution_context = result.get("execution_context", "")
 
-        # Submit the final answer
-        outcome_style = CLI_GREEN if final["outcome"] == "OUTCOME_OK" else CLI_YELLOW
-        print(f"\n{CLI_BOLD}Final{CLI_CLR} → {outcome_style}{final['outcome']}{CLI_CLR}")
-        print(f"  {final['message']}")
-        try:
-            vm.answer(AnswerRequest(
-                message=final["message"],
-                outcome=OUTCOME_BY_NAME.get(final["outcome"], Outcome.OUTCOME_ERR_INTERNAL),
-                refs=final.get("grounding_refs", []),
-            ))
-        except Exception as exc:
-            log.warning("Final answer failed: %s", exc)
+    correction = _validate_completion(
+        model, task_text, message, outcome,
+        phase1_ctx.get("agents_md", ""),
+        execution_context, metadata,
+    )
+    if correction:
+        outcome = correction["outcome"]
+        message = correction["message"]
+
+    # Apply deferred writes only for OK outcomes
+    # (non-OK outcomes like DENIED/CLARIFICATION should not modify files)
+    pending = tm_exec.get_pending_writes()
+    if outcome == "OUTCOME_OK" and pending:
+        print(f"\n{CLI_BOLD}Applying {len(pending)} writes{CLI_CLR}")
+        for op in pending:
+            try:
+                _dispatch(vm, op["op"], op["args"])
+                print(f"  {CLI_GREEN}✓{CLI_CLR} {op['op']}({op['args'].get('path', op['args'].get('to_name', '?'))})")
+            except Exception as exc:
+                print(f"  {CLI_RED}✗{CLI_CLR} {op['op']}: {exc}")
+    elif pending:
+        print(f"\n{CLI_DIM}Skipping {len(pending)} writes (outcome: {outcome}){CLI_CLR}")
+
+    # Submit the final answer
+    outcome_style = CLI_GREEN if outcome == "OUTCOME_OK" else CLI_YELLOW
+    print(f"\n{CLI_BOLD}Final{CLI_CLR} → {outcome_style}{outcome}{CLI_CLR}")
+    print(f"  {message}")
+    try:
+        vm.answer(AnswerRequest(
+            message=message,
+            outcome=OUTCOME_BY_NAME.get(outcome, Outcome.OUTCOME_ERR_INTERNAL),
+            refs=result.get("grounding_refs", []),
+        ))
+    except Exception as exc:
+        log.warning("Final answer failed: %s", exc)
