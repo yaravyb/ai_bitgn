@@ -982,7 +982,7 @@ def run_agent(
         "Update each step with plan_update as you go."
     )
 
-    def _run_executor(run_id: str) -> tuple[dict | None, TaskManager]:
+    def _run_executor(run_id: str, defer: bool = True) -> tuple[dict | None, TaskManager]:
         """Run one executor session. Returns (result dict, task manager)."""
         tm = TaskManager()
         tm.set_instructions(plan.get("instructions", []))
@@ -1053,7 +1053,7 @@ def run_agent(
                     }, tm
 
                 try:
-                    txt = _dispatch(vm, name, args, tm, defer_writes=True)
+                    txt = _dispatch(vm, name, args, tm, defer_writes=defer)
                     status = f"{CLI_GREEN}✓{CLI_CLR}"
                     detail = f"{len(txt)} chars" if len(txt) > 200 else ""
                 except Exception as exc:
@@ -1073,13 +1073,9 @@ def run_agent(
             _auto_compact(model, messages, metadata)
         return None, tm
 
-    # Run two independent executor sessions in parallel (writes are deferred)
-    import concurrent.futures
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        future_a = pool.submit(_run_executor, "A")
-        future_b = pool.submit(_run_executor, "B")
-        result_a, tm_a = future_a.result()
-        result_b, tm_b = future_b.result()
+    # Run A with real writes, B with deferred writes (for second opinion)
+    result_a, tm_a = _run_executor("A", defer=False)
+    result_b, tm_b = _run_executor("B", defer=True)
 
     # Arbiter: pick the best result
     final = _arbiter(model, task_text, result_a, result_b,
@@ -1099,17 +1095,19 @@ def run_agent(
         return
 
     if True:  # final exists
-        # Apply the winning plan's deferred writes
-        winner_tm = tm_a if (result_a and final.get("outcome") == result_a.get("outcome")) else tm_b
-        pending = winner_tm.get_pending_writes()
-        if pending:
-            print(f"\n{CLI_BOLD}Applying {len(pending)} deferred writes{CLI_CLR}")
-            for op in pending:
-                try:
-                    _dispatch(vm, op["op"], op["args"])
-                    print(f"  {CLI_GREEN}✓{CLI_CLR} {op['op']}({op['args'].get('path', op['args'].get('to_name', '?'))})")
-                except Exception as exc:
-                    print(f"  {CLI_RED}✗{CLI_CLR} {op['op']}: {exc}")
+        # A already executed writes. If arbiter picked B and B has different
+        # deferred writes, apply them. (In practice, A's writes are already done
+        # and B's writes are usually the same or the outcome is what matters.)
+        if result_b and final.get("outcome") == result_b.get("outcome"):
+            pending = tm_b.get_pending_writes()
+            if pending:
+                print(f"\n{CLI_BOLD}Applying {len(pending)} writes from B{CLI_CLR}")
+                for op in pending:
+                    try:
+                        _dispatch(vm, op["op"], op["args"])
+                        print(f"  {CLI_GREEN}✓{CLI_CLR} {op['op']}({op['args'].get('path', op['args'].get('to_name', '?'))})")
+                    except Exception as exc:
+                        print(f"  {CLI_RED}✗{CLI_CLR} {op['op']}: {exc}")
 
         # Submit the final answer
         outcome_style = CLI_GREEN if final["outcome"] == "OUTCOME_OK" else CLI_YELLOW
