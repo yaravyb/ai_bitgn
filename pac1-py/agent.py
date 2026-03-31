@@ -227,13 +227,15 @@ def _dispatch(vm: PcmRuntimeClientSync, name: str, args: dict, tm: TaskManager |
         tm.defer_write(name, dict(args))
         # Return a simulated success so the executor continues planning
         if name == "write":
-            return f"(deferred) Will write {args.get('path', '?')}"
+            tm.track_write(args.get("path", ""))
+            return f"OK: write {args.get('path', '?')} scheduled"
         elif name == "delete":
-            return f"(deferred) Will delete {args.get('path', '?')}"
+            tm.track_delete(args.get("path", ""))
+            return f"OK: delete {args.get('path', '?')} scheduled"
         elif name == "move":
-            return f"(deferred) Will move {args.get('from_name', '?')} → {args.get('to_name', '?')}"
+            return f"OK: move {args.get('from_name', '?')} → {args.get('to_name', '?')} scheduled"
         else:
-            return f"(deferred) Will mkdir {args.get('path', '?')}"
+            return f"OK: mkdir {args.get('path', '?')} scheduled"
 
     result = handler()
 
@@ -770,8 +772,17 @@ def _arbiter(
         elapsed_ms = int((time.time() - started) * 1000)
         print(f"  {CLI_DIM}→ arbiter failed ({elapsed_ms} ms): {exc}{CLI_CLR}")
 
-    # Fallback: prefer non-OK outcome (more cautious)
-    if result_a["outcome"] != "OUTCOME_OK":
+    # Fallback: if one has VERIFY notes and the other doesn't, prefer the one with notes
+    ctx_a = result_a.get("execution_context", "")
+    ctx_b = result_b.get("execution_context", "")
+    a_has_verify = "VERIFY" in ctx_a and "DECISION" in ctx_a
+    b_has_verify = "VERIFY" in ctx_b and "DECISION" in ctx_b
+    if a_has_verify and not b_has_verify:
+        return result_a
+    if b_has_verify and not a_has_verify:
+        return result_b
+    # Both have or neither has verify — prefer the one with higher confidence
+    if result_a.get("confidence", 0) >= result_b.get("confidence", 0):
         return result_a
     return result_b
 
