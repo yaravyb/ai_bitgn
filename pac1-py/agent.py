@@ -573,10 +573,10 @@ If a task requires CANNOT capabilities → OUTCOME_NONE_UNSUPPORTED.
 
 
 def _extract_decision_outcome(execution_context: str) -> str | None:
-    """Extract the outcome implied by VERIFY DECISION notes.
+    """Extract the outcome implied by VERIFY DECISION and COMPLIANCE notes.
 
-    If DECISION notes exist, they are authoritative — the model
-    committed to a verdict during verification and must honor it.
+    Both VERIFY DECISION and COMPLIANCE findings are authoritative.
+    Any blocking finding overrides PROCEED decisions.
     """
     decisions = []
     for line in execution_context.split("\n"):
@@ -587,15 +587,20 @@ def _extract_decision_outcome(execution_context: str) -> str | None:
                 decisions.append("OUTCOME_NONE_CLARIFICATION")
             elif "PROCEED" in line:
                 decisions.append("OUTCOME_OK")
+        # COMPLIANCE findings can also block
+        if "COMPLIANCE" in line and "restriction=blocked" in line:
+            decisions.append("OUTCOME_NONE_CLARIFICATION")
+        if "CROSS-ACCOUNT" in line.upper() or "cross_account=yes" in line:
+            decisions.append("OUTCOME_NONE_CLARIFICATION")
     if not decisions:
         return None
     # If any decision is DENY_SECURITY, that wins
     if "OUTCOME_DENIED_SECURITY" in decisions:
         return "OUTCOME_DENIED_SECURITY"
-    # If any decision is CLARIFICATION, that wins
+    # If any decision is CLARIFICATION (from VERIFY or COMPLIANCE), that wins
     if "OUTCOME_NONE_CLARIFICATION" in decisions:
         return "OUTCOME_NONE_CLARIFICATION"
-    # All PROCEED
+    # All PROCEED with no compliance blocks
     return "OUTCOME_OK"
 
 
