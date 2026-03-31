@@ -999,10 +999,10 @@ def run_agent(
         ]
 
         print(f"\n{CLI_BOLD}{'─' * 50}{CLI_CLR}")
-        print(f"{CLI_BOLD}Executor {run_id}{CLI_CLR} {CLI_DIM}(full tools, 30 steps max){CLI_CLR}")
+        print(f"{CLI_BOLD}Executor {run_id}{CLI_CLR} {CLI_DIM}(full tools, 50 steps max){CLI_CLR}")
         print(f"{CLI_BOLD}{'─' * 50}{CLI_CLR}")
 
-        for _ in range(30):
+        for _ in range(50):
             started = time.time()
             resp = _call_llm(model, messages, EXECUTOR_TOOLS, metadata)
             elapsed_ms = int((time.time() - started) * 1000)

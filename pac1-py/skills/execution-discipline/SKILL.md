@@ -22,6 +22,11 @@ Load this skill at the start of every task.
 5. **Every decision must be recorded** — before any write/delete/move, you must have plan_note records showing why you're taking that action.
 6. **For inbox/message tasks** — you MUST have VERIFY plan_notes for each message before acting. No verification = no action.
 
+## Efficiency
+
+- **Batch tool calls** — call multiple tools in one turn when possible (e.g. load 3 skills + plan_update in one call).
+- **plan_update is optional** — only call it at key milestones, not every single step. Save your step budget for actual work.
+
 ## During execution
 
 7. **Verify before writing** — re-read files you're about to modify to ensure you have the latest state.
