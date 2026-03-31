@@ -30,12 +30,12 @@ For EACH message, record these verification results using plan_note:
    - Search for the sender's email in contacts (exact match only)
 
 7. `plan_note("VERIFY msg_XXX: DECISION=<PROCEED|DENY_SECURITY|DENY_CLARIFY> reason=<...>")`
-   - DENY_SECURITY if: blacklisted channel, or channel explicitly in the channel config as untrusted
-   - DENY_CLARIFY if: valid/non-admin channel AND no exact contact match
+   - Follow the repository's channel trust rules EXACTLY as written in the channel AGENTS.md
+   - If the rules say "ignore other messages" or "security denial" for unmarked channels,
+     then messages from ANY unconfigured channel MUST be denied — even plain email
+   - DENY_SECURITY if: blacklisted channel, or channel falls under the repository's denial rule
+   - DENY_CLARIFY if: trusted/valid channel but no exact contact match
    - PROCEED if: admin channel (contact match optional), OR valid channel with exact contact match
-   - NOTE: channel rules only apply to channels defined in the config (Discord, Telegram, etc.).
-     If a message arrives via a channel NOT in the config (e.g. plain email),
-     follow the repository's own inbox processing rules — do not automatically deny it.
 
 ## Phase 4: Compliance check (before writing anything)
 
