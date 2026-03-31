@@ -1085,7 +1085,20 @@ def run_agent(
     final = _arbiter(model, task_text, result_a, result_b,
                      phase1_ctx.get("agents_md", ""), metadata)
 
-    if final:
+    if not final:
+        # Both executors failed — submit error
+        print(f"{CLI_RED}Both executors returned no result{CLI_CLR}")
+        try:
+            vm.answer(AnswerRequest(
+                message="Agent failed to produce a result",
+                outcome=Outcome.OUTCOME_ERR_INTERNAL,
+                refs=[],
+            ))
+        except Exception:
+            pass
+        return
+
+    if True:  # final exists
         # Apply the winning plan's deferred writes
         winner_tm = tm_a if (result_a and final.get("outcome") == result_a.get("outcome")) else tm_b
         pending = winner_tm.get_pending_writes()
