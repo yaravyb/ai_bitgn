@@ -212,7 +212,8 @@ def _dispatch(vm: PcmRuntimeClientSync, name: str, args: dict, tm: TaskManager |
         handlers.update({
             "plan_create": lambda: tm.create(args["steps"]),
             "plan_update": lambda: tm.update(args["task_id"], args["status"]),
-            "plan_add": lambda: tm.add(args["text"]),
+            "plan_add": lambda: tm.add(args["text"], args.get("blocked_by")),
+            "plan_add_dependency": lambda: tm.add_dependency(args["task_id"], args["blocked_by"]),
             "plan_note": lambda: tm.add_note(args["note"]),
             "plan_add_instruction": lambda: tm.add_instruction(args["instruction"]),
             "plan_status": lambda: tm.list_all(),

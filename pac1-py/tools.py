@@ -350,7 +350,10 @@ _TASK_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "plan_update",
-            "description": "Update a plan step's status.",
+            "description": (
+                "Update a plan step's status. Completing a step auto-unblocks "
+                "any steps that depend on it."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -371,7 +374,7 @@ _TASK_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "plan_add",
-            "description": "Add a new step to the current plan.",
+            "description": "Add a new step to the current plan, optionally blocked by other steps.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -379,8 +382,34 @@ _TASK_SCHEMAS: list[dict] = [
                         "type": "string",
                         "description": "Step description.",
                     },
+                    "blocked_by": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "List of step IDs that must complete before this step can start.",
+                    },
                 },
                 "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "plan_add_dependency",
+            "description": "Add a dependency between existing steps.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "integer",
+                        "description": "Step that is blocked.",
+                    },
+                    "blocked_by": {
+                        "type": "integer",
+                        "description": "Step that must complete first.",
+                    },
+                },
+                "required": ["task_id", "blocked_by"],
             },
         },
     },
