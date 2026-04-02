@@ -87,11 +87,26 @@ def main() -> None:
 
     if scores:
         print(f"\nModel: {MODEL_ID}")
-        print("-" * 40)
-        for task_id, score, elapsed in scores:
-            style = CLI_GREEN if score == 1 else CLI_RED
-            print(f"{task_id}: {style}{score:0.2f}{CLI_CLR}  ({elapsed:.1f}s)")
-        print("-" * 40)
+        rows_per_col = 10
+        cols = [scores[i:i + rows_per_col] for i in range(0, len(scores), rows_per_col)]
+        col_width = 28
+        # header separator
+        print("─" * (col_width * len(cols)))
+        for row_idx in range(rows_per_col):
+            parts = []
+            for col in cols:
+                if row_idx < len(col):
+                    task_id, score, elapsed = col[row_idx]
+                    style = CLI_GREEN if score == 1 else CLI_RED
+                    # visible text length: "t01: 1.00  (123.4s)" — pad to col_width
+                    cell = f"{task_id}: {style}{score:0.2f}{CLI_CLR}  ({elapsed:.1f}s)"
+                    visible_len = len(f"{task_id}: {score:0.2f}  ({elapsed:.1f}s)")
+                    cell += " " * max(0, col_width - visible_len)
+                    parts.append(cell)
+                else:
+                    parts.append(" " * col_width)
+            print("".join(parts))
+        print("─" * (col_width * len(cols)))
         avg = sum(s[1] for s in scores) / len(scores) * 100.0
         print(f"FINAL: {avg:0.2f}%  |  Total: {total_elapsed:.1f}s  |  Tasks: {len(scores)}")
 

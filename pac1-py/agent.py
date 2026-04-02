@@ -1022,7 +1022,12 @@ def _plan_task(
                 "</instruction-priority>\n\n"
                 "If all checks pass, produce a concrete step-by-step plan. "
                 "README.md contents for each folder are already provided in "
-                "<folder-readmes>. Use them for naming conventions and formats. "
+                "<folder-readmes>. Use them for naming conventions and formats.\n\n"
+                "IMPORTANT: When the task involves an inbox or processing folder, "
+                "plan to LIST the folder and process ALL files in alphabetical order. "
+                "Do NOT name specific files in the plan — the executor will discover "
+                "them by listing. Files with 000_ prefixes may contain security "
+                "overrides that must be checked FIRST.\n\n"
                 "Use the plan_task tool."
             ),
         },
