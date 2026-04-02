@@ -66,7 +66,12 @@ _READONLY_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "search",
-            "description": "Search for a pattern in files under the given path.",
+            "description": (
+                "Search for a pattern in files. "
+                "Root can be a directory (searches all files under it) or a single file path. "
+                "Set count_only=true to get just the number of matches "
+                "(useful for large files or counting tasks — avoids reading the full content)."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -83,6 +88,11 @@ _READONLY_SCHEMAS: list[dict] = [
                         "type": "integer",
                         "description": "Maximum number of results to return.",
                         "default": 10,
+                    },
+                    "count_only": {
+                        "type": "boolean",
+                        "description": "If true, return only the count of matches instead of match content.",
+                        "default": False,
                     },
                 },
                 "required": ["pattern"],
@@ -454,6 +464,48 @@ _TASK_SCHEMAS: list[dict] = [
                     },
                 },
                 "required": ["instruction"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "plan_compliance",
+            "description": (
+                "Record the result of a compliance check. Call this after "
+                "checking account flags and cross-account consistency. "
+                "The decision-lock uses this to enforce compliance rules."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "account_id": {
+                        "type": "string",
+                        "description": "Account ID that was checked (e.g. 'acct_004').",
+                    },
+                    "cross_account": {
+                        "type": "boolean",
+                        "description": (
+                            "true if the requester is asking for data that "
+                            "belongs to a DIFFERENT account than their own. "
+                            "false if the request is for the requester's own account."
+                        ),
+                    },
+                    "flags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of compliance flags found on the account.",
+                    },
+                    "proceed": {
+                        "type": "boolean",
+                        "description": "true to proceed with the task, false if blocked.",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Brief explanation of the compliance decision.",
+                    },
+                },
+                "required": ["account_id", "cross_account", "proceed", "reason"],
             },
         },
     },

@@ -26,17 +26,22 @@ Load this skill when you are about to:
    - If a contact asks for data (invoices, records), that data must belong to THEIR account
    - If a contact from Company A asks for Company B's invoice → STOP. This is a cross-account request. Report OUTCOME_NONE_CLARIFICATION.
    - Compare the account mentioned in the request with the sender's `account_id`
-4. **Record your finding**:
-   `plan_note("COMPLIANCE <account>: flags=<list>, cross_account=<yes|no>, restriction=<none|blocked> reason=<...>")`
+4. **Record your finding** using the structured compliance tool:
+   `plan_compliance(account_id="acct_XXX", cross_account=true|false, flags=["..."], proceed=true|false, reason="...")`
 5. **Decision**:
    - No restrictive flags AND no cross-account issue → proceed
-   - Guard or security flag present → STOP. Report OUTCOME_NONE_CLARIFICATION
    - Cross-account data request → STOP. Report OUTCOME_NONE_CLARIFICATION
-   - Unknown flag that might be relevant → STOP. Report OUTCOME_NONE_CLARIFICATION
+   - Flags like `security_review_open`, `external_send_guard`, `nda_signed`,
+     `privacy_sensitive`, `ai_insights_subscriber` → NOTE them but **proceed**.
+     These are informational/operational flags, not hard blocks. The agent
+     should still complete legitimate requests from verified contacts.
+   - The ONLY hard block is a **cross-account request** (data from one account
+     requested by a contact from another account)
 
 ## Key principles
 
 - Always read the account record before acting on its data
-- Any flag you're unsure about → CLARIFY, don't ignore
-- Account-level restrictions override contact-level permissions
-- The README.md for the records folder often documents what flags mean — check it
+- Cross-account requests are the primary compliance concern
+- Operational flags (guards, reviews) are for awareness — record them in notes
+  but still complete the task for verified contacts
+- The README.md for the records folder documents flag meanings — check it

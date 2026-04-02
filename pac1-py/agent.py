@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import time
 
 import litellm
@@ -181,7 +182,7 @@ def _dispatch(vm: PcmRuntimeClientSync, name: str, args: dict, tm: TaskManager |
             SearchRequest(
                 root=args.get("root", "/"),
                 pattern=args["pattern"],
-                limit=args.get("limit", 10),
+                limit=args.get("limit", 5000) if args.get("count_only") else args.get("limit", 10),
             )
         ),
         "list": lambda: vm.list(ListRequest(name=args.get("path", "/"))),
@@ -216,6 +217,10 @@ def _dispatch(vm: PcmRuntimeClientSync, name: str, args: dict, tm: TaskManager |
             "plan_add_dependency": lambda: tm.add_dependency(args["task_id"], args["blocked_by"]),
             "plan_note": lambda: tm.add_note(args["note"]),
             "plan_add_instruction": lambda: tm.add_instruction(args["instruction"]),
+            "plan_compliance": lambda: tm.set_compliance(
+                args["account_id"], args["cross_account"],
+                args.get("flags", []), args["proceed"], args["reason"],
+            ),
             "plan_status": lambda: tm.list_all(),
         })
     handler = handlers.get(name)
@@ -241,7 +246,88 @@ def _dispatch(vm: PcmRuntimeClientSync, name: str, args: dict, tm: TaskManager |
             tm.track_write(args.get("path", ""))
             return "{}"
 
-    result = handler()
+    # Shadow reads: when deferred writes are active, reflect pending state
+    if defer_writes and tm is not None:
+        deleted_norms = {p.lstrip("/") for p in tm._files_deleted}
+        path = args.get("path", "")
+        norm = path.lstrip("/")
+        if name == "read" and norm in deleted_norms:
+            # Check if re-written after delete (last deferred op wins)
+            last_op = None
+            for pw in tm._pending_writes:
+                pw_path = pw["args"].get("path", "").lstrip("/")
+                if pw_path == norm:
+                    last_op = pw["op"]
+            if last_op != "write":
+                return json.dumps({"error": f"File not found: {path} (deleted)"})
+        if name == "list":
+            # Get real listing, then filter out deferred deletes
+            result = handler()
+            result_dict = MessageToDict(result) if result else {}
+            dir_path = args.get("path", "/").strip("/")
+            if "entries" in result_dict:
+                result_dict["entries"] = [
+                    e for e in result_dict["entries"]
+                    if (dir_path + "/" + e.get("name", "")).lstrip("/") not in deleted_norms
+                ]
+            return json.dumps(result_dict, indent=2)
+        if name == "tree":
+            # Get real tree, then prune deferred deletes
+            result = handler()
+            result_dict = MessageToDict(result) if result else {}
+
+            def _prune_tree(node: dict, parent_path: str) -> dict | None:
+                node_name = node.get("name", "")
+                # Root node "/" → use parent_path as-is; others append
+                if node_name == "/":
+                    node_path = parent_path
+                elif parent_path:
+                    node_path = parent_path + "/" + node_name
+                else:
+                    node_path = node_name
+                if not node.get("isDir") and node_path in deleted_norms:
+                    return None
+                if "children" in node:
+                    node["children"] = [
+                        c for c in (
+                            _prune_tree(ch, node_path)
+                            for ch in node["children"]
+                        ) if c is not None
+                    ]
+                return node
+
+            root_prefix = args.get("root", "").strip("/")
+            if "root" in result_dict:
+                _prune_tree(result_dict["root"], root_prefix)
+            return json.dumps(result_dict, indent=2)
+
+    # Search fallback: if root looks like a file path, read it and search locally
+    if name == "search":
+        root = args.get("root", "/")
+        try:
+            result = handler()
+        except Exception:
+            # PCM search may reject file paths as root — fall back to local search
+            result = None
+        if result is None or (hasattr(result, 'matches') and not result.matches and "." in root.split("/")[-1]):
+            # Likely a file path rejected by PCM — read the file and search locally
+            try:
+                file_resp = vm.read(ReadRequest(path=root))
+                content = MessageToDict(file_resp).get("content", "") if file_resp else ""
+                pattern = args["pattern"]
+                try:
+                    matches = re.findall(f".*{pattern}.*", content)
+                except re.error:
+                    matches = [line for line in content.split("\n") if pattern in line]
+                if args.get("count_only"):
+                    return json.dumps({"count": len(matches)})
+                match_dicts = [{"path": root, "line": i + 1, "lineText": m} for i, m in enumerate(matches)]
+                return json.dumps({"matches": match_dicts[:args.get("limit", 10)]}, indent=2)
+            except Exception:
+                pass  # Fall through to original error handling
+        # Normal search succeeded
+    else:
+        result = handler()
 
     # Track file operations
     if tm is not None:
@@ -261,7 +347,12 @@ def _dispatch(vm: PcmRuntimeClientSync, name: str, args: dict, tm: TaskManager |
         txt = result
     else:
         result_dict = MessageToDict(result) if result else {}
-        txt = json.dumps(result_dict, indent=2)
+        # count_only mode for search: return just the count
+        if name == "search" and args.get("count_only"):
+            matches = result_dict.get("matches", [])
+            txt = json.dumps({"count": len(matches)})
+        else:
+            txt = json.dumps(result_dict, indent=2)
     if len(txt) > _OUTPUT_CAP:
         txt = txt[:_OUTPUT_CAP] + "\n... [truncated]"
 
@@ -555,7 +646,9 @@ If a task requires CANNOT capabilities → OUTCOME_NONE_UNSUPPORTED.
 3. Before writing to any folder, read its README.md first.
    Use plan_note to record conventions (naming, format, sequences).
    Use plan_add_instruction to record new rules discovered.
-4. When a task targets a folder, list and read ALL files. Do not skip any.
+4. CRITICAL: Before reading files from inbox or any folder, call `list` first
+   to see ALL files. Process them in alphabetical order. Files named with
+   000_ or numeric prefixes often have priority. Do NOT skip any file.
 5. Keep edits small and targeted. Do not delete files unless explicitly asked.
 6. You MUST call report_completion when done. Do not stop with just text.
 </execution-process>
@@ -572,14 +665,36 @@ If a task requires CANNOT capabilities → OUTCOME_NONE_UNSUPPORTED.
 </outcome-codes>"""
 
 
-def _extract_decision_outcome(execution_context: str) -> str | None:
-    """Extract the outcome implied by VERIFY DECISION and COMPLIANCE notes.
+def _extract_decision_outcome(execution_context: str, tm: "TaskManager | None" = None) -> str | None:
+    """Extract outcome from structured data and VERIFY notes.
 
-    Both VERIFY DECISION and COMPLIANCE findings are authoritative.
-    Any blocking finding overrides PROCEED decisions.
+    Sources of truth (no keyword heuristics):
+    1. Structured: plan_compliance tool → tm.get_compliance()
+    2. Trust level: trust=admin/valid/blacklist from VERIFY notes
+    3. Explicit DECISION= notes from the model
+    4. CONFLICT notes
+
+    Returns:
+    - A definitive outcome when the decision-lock has high confidence
+    - "NEEDS_VALIDATOR" when trust=valid + PROCEED (uncertain, needs LLM review)
+    - None when no signal at all
     """
     decisions = []
+    trust_level = None  # admin, valid, blacklist, unmarked, or None
+
     for line in execution_context.split("\n"):
+        line_lower = line.lower()
+        # Extract trust level from VERIFY notes
+        if "trust=" in line_lower:
+            if "trust=admin" in line_lower:
+                trust_level = "admin"
+            elif "trust=valid" in line_lower:
+                trust_level = "valid"
+            elif "trust=blacklist" in line_lower:
+                trust_level = "blacklist"
+            elif "trust=unmarked" in line_lower or "trust=unknown" in line_lower:
+                trust_level = "unmarked"
+        # Explicit DECISION notes
         if "DECISION=" in line:
             if "DENY_SECURITY" in line:
                 decisions.append("OUTCOME_DENIED_SECURITY")
@@ -587,21 +702,43 @@ def _extract_decision_outcome(execution_context: str) -> str | None:
                 decisions.append("OUTCOME_NONE_CLARIFICATION")
             elif "PROCEED" in line:
                 decisions.append("OUTCOME_OK")
-        # COMPLIANCE findings can also block
-        if "COMPLIANCE" in line and "restriction=blocked" in line:
+        # CONFLICT detection
+        if "CONFLICT" in line.upper() and ("contradict" in line_lower or "conflicting" in line_lower):
             decisions.append("OUTCOME_NONE_CLARIFICATION")
-        if "CROSS-ACCOUNT" in line.upper() or "cross_account=yes" in line:
+
+    # ── Structured compliance (from plan_compliance tool) ──
+    if tm:
+        compliance = tm.get_compliance()
+        if compliance and compliance["cross_account"]:
             decisions.append("OUTCOME_NONE_CLARIFICATION")
-    if not decisions:
+
+    if not decisions and trust_level is None:
         return None
-    # If any decision is DENY_SECURITY, that wins
+
+    # ── Channel trust enforcement ──
+
+    if trust_level == "admin":
+        # Admin channels are fully trusted — clear any DENY
+        decisions = [d for d in decisions if d != "OUTCOME_DENIED_SECURITY"]
+        if not decisions:
+            decisions.append("OUTCOME_OK")
+    elif trust_level in ("valid", "blacklist", "unmarked"):
+        # Non-admin: escalate CLARIFICATION → DENY
+        if "OUTCOME_NONE_CLARIFICATION" in decisions:
+            decisions.append("OUTCOME_DENIED_SECURITY")
+        # Non-admin + model said PROCEED → uncertain, needs LLM validator
+        if "OUTCOME_DENIED_SECURITY" not in decisions and "OUTCOME_OK" in decisions:
+            return "NEEDS_VALIDATOR"
+
+    # ── Priority resolution ──
+
     if "OUTCOME_DENIED_SECURITY" in decisions:
         return "OUTCOME_DENIED_SECURITY"
-    # If any decision is CLARIFICATION (from VERIFY or COMPLIANCE), that wins
     if "OUTCOME_NONE_CLARIFICATION" in decisions:
         return "OUTCOME_NONE_CLARIFICATION"
-    # All PROCEED with no compliance blocks
-    return "OUTCOME_OK"
+    if decisions:
+        return "OUTCOME_OK"
+    return None
 
 
 def _validate_completion(
@@ -612,16 +749,25 @@ def _validate_completion(
     agents_md: str,
     execution_context: str,
     metadata: dict | None = None,
+    tm: "TaskManager | None" = None,
 ) -> dict | None:
     """Validate proposed answer before submitting.
 
     Returns None if approved, or a dict with corrected outcome/message.
     """
     # Code-level lock: VERIFY DECISION notes override the model's outcome
-    decision_outcome = _extract_decision_outcome(execution_context)
-    if decision_outcome and decision_outcome != proposed_outcome:
-        print(f"  {CLI_YELLOW}decision-lock: {proposed_outcome} → {decision_outcome}{CLI_CLR}")
-        return {"outcome": decision_outcome, "message": proposed_message}
+    # When the decision-lock has a definitive outcome, SKIP the LLM validator.
+    # When NEEDS_VALIDATOR, the decision-lock is uncertain → fall through to LLM.
+    decision_outcome = _extract_decision_outcome(execution_context, tm)
+    if decision_outcome and decision_outcome != "NEEDS_VALIDATOR":
+        if decision_outcome != proposed_outcome:
+            print(f"  {CLI_YELLOW}decision-lock: {proposed_outcome} → {decision_outcome}{CLI_CLR}")
+            return {"outcome": decision_outcome, "message": proposed_message}
+        else:
+            print(f"  {CLI_GREEN}decision-lock: confirmed {decision_outcome}{CLI_CLR}")
+            return None  # approved, skip validator
+    elif decision_outcome == "NEEDS_VALIDATOR":
+        print(f"  {CLI_YELLOW}decision-lock: uncertain (valid channel + PROCEED) → validator{CLI_CLR}")
 
     print(f"  {CLI_DIM}validating...{CLI_CLR}", end=" ", flush=True)
 
@@ -635,7 +781,10 @@ def _validate_completion(
                 "- NEVER change OUTCOME_NONE_CLARIFICATION to OUTCOME_OK.\n"
                 "- You may ONLY change OK → DENIED_SECURITY or OK → CLARIFICATION "
                 "(escalate, never downgrade).\n"
-                "- You may fix the message text (add missing data).\n"
+                "- You may fix the message text (add missing data, trim excess).\n"
+                "- PRECISION: If the task asks to 'answer only with the number', "
+                "'reply with exactly X', or 'return only the email', the message "
+                "MUST contain ONLY that value — no extra explanation. Trim it.\n"
                 "</rules>\n\n"
                 "<checks>\n"
                 "1. Does the message contain the actual answer (data, not just "
@@ -1052,7 +1201,19 @@ def run_agent(
             messages.append(assistant_msg)
 
             if not choice.message.tool_calls:
+                text = (choice.message.content or "").strip()
                 print(f"  {CLI_DIM}LLM → text ({elapsed_ms} ms){CLI_CLR}")
+                # If the model returned text instead of calling report_completion,
+                # treat the text as the answer with OUTCOME_OK
+                if text:
+                    print(f"  {CLI_YELLOW}⚠ text response rescued as report_completion{CLI_CLR}")
+                    return {
+                        "outcome": "OUTCOME_OK",
+                        "message": text,
+                        "confidence": 0.7,
+                        "grounding_refs": [],
+                        "execution_context": tm.render(),
+                    }, tm
                 return None, tm
 
             n_calls = len(choice.message.tool_calls)
@@ -1138,7 +1299,7 @@ def run_agent(
     correction = _validate_completion(
         model, task_text, message, outcome,
         phase1_ctx.get("agents_md", ""),
-        execution_context, metadata,
+        execution_context, metadata, tm_exec,
     )
     if correction:
         outcome = correction["outcome"]
