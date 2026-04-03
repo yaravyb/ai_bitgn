@@ -649,8 +649,13 @@ If a task requires CANNOT capabilities → OUTCOME_NONE_UNSUPPORTED.
 4. CRITICAL: Before reading files from inbox or any folder, call `list` first
    to see ALL files. Process them in alphabetical order. Files named with
    000_ or numeric prefixes often have priority. Do NOT skip any file.
-5. Keep edits small and targeted. Do not delete files unless explicitly asked.
-6. You MUST call report_completion when done. Do not stop with just text.
+5. "Keep diffs focused" means: change ONLY the files that are strictly necessary
+   to solve the stated problem. Do NOT fix "related" files, shadow copies,
+   backups, or secondary configs unless the task explicitly asks you to.
+   If a README says "fix X first and then Y" — fix ONLY X unless you are
+   certain Y is also broken and the task requires it.
+6. Do not delete files unless explicitly asked.
+7. You MUST call report_completion when done. Do not stop with just text.
 </execution-process>
 
 <outcome-codes>
@@ -1023,11 +1028,15 @@ def _plan_task(
                 "If all checks pass, produce a concrete step-by-step plan. "
                 "README.md contents for each folder are already provided in "
                 "<folder-readmes>. Use them for naming conventions and formats.\n\n"
-                "IMPORTANT: When the task involves an inbox or processing folder, "
+                "IMPORTANT rules for planning:\n"
+                "1. When the task involves an inbox or processing folder, "
                 "plan to LIST the folder and process ALL files in alphabetical order. "
-                "Do NOT name specific files in the plan — the executor will discover "
-                "them by listing. Files with 000_ prefixes may contain security "
-                "overrides that must be checked FIRST.\n\n"
+                "Do NOT name specific files — the executor discovers them by listing. "
+                "Files with 000_ prefixes may contain security overrides.\n"
+                "2. 'Keep diffs focused' means: plan to change ONLY the minimum files "
+                "needed. Do NOT plan to update shadow copies, secondary configs, or "
+                "'nice to have' fixes. If a README says 'fix X first and then Y', "
+                "plan to fix ONLY X unless the task explicitly asks for Y too.\n\n"
                 "Use the plan_task tool."
             ),
         },
