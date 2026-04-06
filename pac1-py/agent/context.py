@@ -75,8 +75,10 @@ def build_task_message(task_text: str, plan: dict, skill_loader: SkillLoader) ->
         f"<task>\n{task_text}\n</task>"
         f"{instructions_section}"
         f"{strategy_section}\n\n"
-        "Use plan_create to set up your execution steps, then work through them. "
-        "Update each step with plan_update as you go."
+        "Your plan is already set up from the strategy. "
+        "Start executing step 1 immediately — do NOT call plan_create. "
+        "Use plan_update to mark each step as you go. "
+        "Do NOT skip steps."
     )
 
 

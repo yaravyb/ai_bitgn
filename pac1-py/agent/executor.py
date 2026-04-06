@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import time
 from pathlib import Path
 
@@ -34,6 +35,17 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 
 
+def _parse_strategy_steps(strategy: str) -> list[str]:
+    """Parse numbered steps from a planner strategy string."""
+    steps = []
+    for line in strategy.strip().split("\n"):
+        line = line.strip()
+        m = re.match(r"^\d+\.\s+(.+)", line)
+        if m:
+            steps.append(m.group(1))
+    return steps
+
+
 def _run_executor(
     config: AgentConfig,
     model: str,
@@ -46,11 +58,16 @@ def _run_executor(
     run_id: str = "",
     defer: bool = True,
     instructions: list | None = None,
+    strategy_steps: list[str] | None = None,
 ) -> tuple[dict | None, TaskManager]:
     """Run one executor session. Returns (result dict, task manager)."""
     tm = TaskManager()
     if instructions:
         tm.set_instructions(instructions)
+
+    # Pre-populate plan from planner strategy so the model follows it
+    if strategy_steps:
+        tm.create(strategy_steps)
 
     messages: list[dict] = [
         {"role": "system", "content": executor_system},
@@ -58,6 +75,11 @@ def _run_executor(
         {"role": "assistant", "content": "I have the workspace context. Ready to execute."},
         {"role": "user", "content": task_msg},
     ]
+
+    # If plan is pre-populated, inject it into the conversation
+    if strategy_steps:
+        plan_text = tm.render()
+        messages.append({"role": "assistant", "content": f"Plan is ready:\n{plan_text}\n\nStarting step 1."})
 
     print(f"\n{CLI_BOLD}{'─' * 50}{CLI_CLR}")
     print(f"{CLI_BOLD}Executor {run_id}{CLI_CLR} {CLI_DIM}(full tools, {config.max_executor_steps} steps max){CLI_CLR}")
@@ -77,8 +99,6 @@ def _run_executor(
         if not choice.message.tool_calls:
             text = (choice.message.content or "").strip()
             print(f"  {CLI_DIM}LLM → text ({elapsed_ms} ms){CLI_CLR}")
-            # If the model returned text instead of calling report_completion,
-            # treat the text as the answer with OUTCOME_OK
             if text:
                 print(f"  {CLI_YELLOW}⚠ text response rescued as report_completion{CLI_CLR}")
                 return {
@@ -110,7 +130,7 @@ def _run_executor(
                 message = args.get("message", "")
                 confidence = args.get("confidence", 1.0)
                 grounding = args.get("grounding_refs", [])
-                # Guard: reject empty message for OK outcomes — ask model to retry
+                # Guard: reject empty message for OK outcomes
                 if outcome == "OUTCOME_OK" and not message.strip():
                     print(f"    {CLI_YELLOW}⚠ empty message — nudging model{CLI_CLR}")
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": (
@@ -119,12 +139,15 @@ def _run_executor(
                         "the answer. Also include grounding_refs with file paths you read."
                     )})
                     continue
+                # Auto-merge all tracked read files into grounding_refs
+                tracked = list(tm._files_read)
+                merged = list(dict.fromkeys(grounding + tracked))
                 print(f"    {CLI_CYAN}■ report_completion{CLI_CLR} → {outcome}")
                 return {
                     "outcome": outcome,
                     "message": message,
                     "confidence": confidence,
-                    "grounding_refs": grounding,
+                    "grounding_refs": merged,
                     "execution_context": tm.render(),
                 }, tm
 
@@ -184,6 +207,9 @@ def run_agent(
             log.warning("Planner rejection: vm.answer failed: %s", exc)
         return
 
+    # Parse planner strategy into steps for the executor
+    strategy_steps = _parse_strategy_steps(plan.get("strategy", ""))
+
     # Build executor context and task message
     executor_system = build_executor_system()
     context_msg = build_executor_context(phase1_ctx, skill_loader)
@@ -195,6 +221,7 @@ def run_agent(
         executor_system, context_msg, task_msg,
         metadata, run_id="", defer=True,
         instructions=plan.get("instructions", []),
+        strategy_steps=strategy_steps,
     )
 
     if not result:
@@ -237,6 +264,7 @@ def run_agent(
         print(f"\n{CLI_DIM}Skipping {len(pending)} writes (outcome: {outcome}){CLI_CLR}")
 
     # Submit the final answer
+    grounding = result.get("grounding_refs", [])
     outcome_style = CLI_GREEN if outcome == "OUTCOME_OK" else CLI_YELLOW
     print(f"\n{CLI_BOLD}Final{CLI_CLR} → {outcome_style}{outcome}{CLI_CLR}")
     print(f"  {message}")
@@ -244,7 +272,7 @@ def run_agent(
         vm.answer(AnswerRequest(
             message=message,
             outcome=OUTCOME_BY_NAME.get(outcome, Outcome.OUTCOME_ERR_INTERNAL),
-            refs=result.get("grounding_refs", []),
+            refs=grounding,
         ))
     except Exception as exc:
         log.warning("Final answer failed: %s", exc)
