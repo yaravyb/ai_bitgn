@@ -109,12 +109,22 @@ def _run_executor(
                 outcome = args.get("outcome", "OUTCOME_ERR_INTERNAL")
                 message = args.get("message", "")
                 confidence = args.get("confidence", 1.0)
+                grounding = args.get("grounding_refs", [])
+                # Guard: reject empty message for OK outcomes — ask model to retry
+                if outcome == "OUTCOME_OK" and not message.strip():
+                    print(f"    {CLI_YELLOW}⚠ empty message — nudging model{CLI_CLR}")
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": (
+                        "Error: message is empty. You MUST include the actual answer "
+                        "data in the message field. Call report_completion again with "
+                        "the answer. Also include grounding_refs with file paths you read."
+                    )})
+                    continue
                 print(f"    {CLI_CYAN}■ report_completion{CLI_CLR} → {outcome}")
                 return {
                     "outcome": outcome,
                     "message": message,
                     "confidence": confidence,
-                    "grounding_refs": args.get("grounding_refs", []),
+                    "grounding_refs": grounding,
                     "execution_context": tm.render(),
                 }, tm
 
