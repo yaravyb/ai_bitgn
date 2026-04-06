@@ -129,6 +129,14 @@ class TaskManager:
     def get_pending_writes(self) -> list[dict]:
         return self._pending_writes
 
+    @property
+    def files_deleted(self) -> list[str]:
+        return self._files_deleted
+
+    @property
+    def pending_writes(self) -> list[dict]:
+        return self._pending_writes
+
     # -- Compliance --
 
     def set_compliance(self, account_id: str, cross_account: bool, flags: list[str], proceed: bool, reason: str) -> str:

@@ -1,0 +1,29 @@
+{
+  "featureName": "modular-refactor",
+  "description": "Approach B: Split pac1-py agent.py (1347 lines) into composable modules, add unit test suite for critical components (decision-lock, TaskManager, dispatch), enhance observability with span-level tracing, centralize configuration, and deduplicate prompt rules — while preserving the 100% (30/30) PAC1 benchmark score.",
+  "codeName": "modular-refactor",
+  "language": "en",
+  "createdAt": "2026-04-05T17:45:01Z",
+  "updatedAt": "2026-04-05T20:15:00Z",
+  "status": "implemented",
+  "phases": {
+    "requirements": "generated",
+    "design": "generated",
+    "tasks": "generated",
+    "implementation": "completed"
+  },
+  "approvals": {
+    "requirements": {
+      "generated": true,
+      "approved": true
+    },
+    "design": {
+      "generated": true,
+      "approved": true
+    },
+    "tasks": {
+      "generated": true,
+      "approved": false
+    }
+  }
+}
