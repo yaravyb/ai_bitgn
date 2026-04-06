@@ -6,7 +6,8 @@ from pathlib import Path
 
 import litellm
 from bitgn.vm.pcm_connect import PcmRuntimeClientSync
-from bitgn.vm.pcm_pb2 import AnswerRequest, Outcome
+from bitgn.vm.pcm_pb2 import AnswerRequest, Outcome, ReadRequest
+from google.protobuf.json_format import MessageToDict
 
 from agent.bootstrap import phase1_bootstrap
 from agent.config import AgentConfig
@@ -46,6 +47,111 @@ def _parse_strategy_steps(strategy: str) -> list[str]:
     return steps
 
 
+def _build_tree_stem_index(tree_json: str) -> dict[str, str]:
+    """Build a map from file stem (e.g. 'mgr_002') to full path (e.g. 'contacts/mgr_002.json').
+
+    Generic: indexes ALL .json files from the workspace tree.
+    """
+    stem_to_path: dict[str, str] = {}
+    try:
+        tree_data = json.loads(tree_json) if tree_json else {}
+    except (json.JSONDecodeError, TypeError):
+        return stem_to_path
+
+    def _walk(node: dict, prefix: str = "") -> None:
+        name = node.get("name", "")
+        current = "" if name == "/" else (f"{prefix}/{name}" if prefix else name)
+        if not node.get("isDir") and name.endswith(".json"):
+            stem = name.rsplit(".", 1)[0]
+            stem_to_path[stem] = current
+        for child in node.get("children", []):
+            _walk(child, current)
+
+    root = tree_data.get("root", tree_data)
+    if root:
+        _walk(root)
+    return stem_to_path
+
+
+def _follow_cross_references(
+    vm: PcmRuntimeClientSync,
+    grounding: list[str],
+    files_read: list[str],
+    stem_index: dict[str, str],
+) -> list[str]:
+    """Follow cross-references in read JSON files and auto-read referenced entities.
+
+    For each file the executor read, re-reads it, parses as JSON, and checks
+    if any string field value matches a known file stem from the workspace tree.
+    If so, reads that referenced file and adds it to grounding.
+
+    Fully generic — works for any folder/entity structure. No hardcoded paths.
+    """
+    refs = list(grounding)
+    read_set = set(f.lstrip("/") for f in files_read)
+
+    # Follow references up to 2 levels deep (file → referenced file → its references)
+    to_scan = list(files_read)
+    for _depth in range(2):
+        newly_discovered: list[str] = []
+        for path in to_scan:
+            try:
+                result = vm.read(ReadRequest(path=path))
+                content = MessageToDict(result).get("content", "") if result else ""
+                if not content:
+                    continue
+                data = json.loads(content)
+                if not isinstance(data, dict):
+                    continue
+                for value in data.values():
+                    if isinstance(value, str) and value in stem_index:
+                        ref_path = stem_index[value]
+                        ref_norm = ref_path.lstrip("/")
+                        if ref_norm not in read_set:
+                            try:
+                                vm.read(ReadRequest(path=ref_path))
+                                read_set.add(ref_norm)
+                                newly_discovered.append(ref_path)
+                                if ref_path not in refs:
+                                    refs.append(ref_path)
+                                print(f"  {CLI_DIM}cross-ref: {ref_path}{CLI_CLR}")
+                            except Exception:
+                                pass
+            except (json.JSONDecodeError, Exception):
+                continue
+        if not newly_discovered:
+            break
+        to_scan = newly_discovered
+
+    # For any folder we discovered cross-refs in, also read sibling files
+    # (data in the same folder is likely related and needed for grounding)
+    discovered_dirs: set[str] = set()
+    for ref in refs:
+        parts = ref.lstrip("/").rsplit("/", 1)
+        if len(parts) == 2:
+            discovered_dirs.add(parts[0])
+
+    for stem, path in stem_index.items():
+        path_norm = path.lstrip("/")
+        dir_part = path_norm.rsplit("/", 1)[0] if "/" in path_norm else ""
+        if dir_part in discovered_dirs and path_norm not in read_set:
+            try:
+                vm.read(ReadRequest(path=path))
+                read_set.add(path_norm)
+                if path not in refs:
+                    refs.append(path)
+                print(f"  {CLI_DIM}sibling: {path}{CLI_CLR}")
+            except Exception:
+                pass
+
+    # Merge all tracked reads
+    for f in files_read:
+        if f not in refs:
+            refs.append(f)
+
+    return refs
+
+
 def _run_executor(
     config: AgentConfig,
     model: str,
@@ -65,21 +171,12 @@ def _run_executor(
     if instructions:
         tm.set_instructions(instructions)
 
-    # Pre-populate plan from planner strategy so the model follows it
-    if strategy_steps:
-        tm.create(strategy_steps)
-
     messages: list[dict] = [
         {"role": "system", "content": executor_system},
         {"role": "user", "content": context_msg},
         {"role": "assistant", "content": "I have the workspace context. Ready to execute."},
         {"role": "user", "content": task_msg},
     ]
-
-    # If plan is pre-populated, inject it into the conversation
-    if strategy_steps:
-        plan_text = tm.render()
-        messages.append({"role": "assistant", "content": f"Plan is ready:\n{plan_text}\n\nStarting step 1."})
 
     print(f"\n{CLI_BOLD}{'─' * 50}{CLI_CLR}")
     print(f"{CLI_BOLD}Executor {run_id}{CLI_CLR} {CLI_DIM}(full tools, {config.max_executor_steps} steps max){CLI_CLR}")
@@ -162,6 +259,10 @@ def _run_executor(
                     "execution_context": tm.render(),
                 }, tm
 
+            # Intercept plan_create: override with planner's strategy steps
+            if name == "plan_create" and strategy_steps:
+                args = {"steps": strategy_steps}
+
             try:
                 txt = dispatch(vm, name, args, config, tm, defer_writes=defer, skill_loader=skill_loader)
                 status = f"{CLI_GREEN}✓{CLI_CLR}"
@@ -209,6 +310,9 @@ def run_agent(
 
     # Parse planner strategy into steps for the executor
     strategy_steps = _parse_strategy_steps(plan.get("strategy", ""))
+
+    # Build stem index from workspace tree for cross-reference resolution
+    stem_index = _build_tree_stem_index(phase1_ctx.get("directory_tree", ""))
 
     # Build executor context and task message
     executor_system = build_executor_system()
@@ -263,8 +367,14 @@ def run_agent(
     elif pending:
         print(f"\n{CLI_DIM}Skipping {len(pending)} writes (outcome: {outcome}){CLI_CLR}")
 
-    # Submit the final answer
+    # Follow cross-references: scan read files for entity IDs matching other files
     grounding = result.get("grounding_refs", [])
+    if outcome == "OUTCOME_OK" and stem_index:
+        grounding = _follow_cross_references(
+            vm, grounding, list(tm_exec._files_read), stem_index,
+        )
+
+    # Submit the final answer
     outcome_style = CLI_GREEN if outcome == "OUTCOME_OK" else CLI_YELLOW
     print(f"\n{CLI_BOLD}Final{CLI_CLR} → {outcome_style}{outcome}{CLI_CLR}")
     print(f"  {message}")
