@@ -123,18 +123,24 @@ def _follow_cross_references(
             break
         to_scan = newly_discovered
 
-    # For any folder we discovered cross-refs in, also read sibling files
-    # (data in the same folder is likely related and needed for grounding)
-    discovered_dirs: set[str] = set()
+    # For folders found ONLY via cross-references (not already visited by executor),
+    # read sibling files so all related entities in that folder are grounded
+    executor_dirs = set()
+    for f in files_read:
+        parts = f.lstrip("/").rsplit("/", 1)
+        if len(parts) == 2:
+            executor_dirs.add(parts[0])
+
+    crossref_only_dirs: set[str] = set()
     for ref in refs:
         parts = ref.lstrip("/").rsplit("/", 1)
-        if len(parts) == 2:
-            discovered_dirs.add(parts[0])
+        if len(parts) == 2 and parts[0] not in executor_dirs:
+            crossref_only_dirs.add(parts[0])
 
     for stem, path in stem_index.items():
         path_norm = path.lstrip("/")
         dir_part = path_norm.rsplit("/", 1)[0] if "/" in path_norm else ""
-        if dir_part in discovered_dirs and path_norm not in read_set:
+        if dir_part in crossref_only_dirs and path_norm not in read_set:
             try:
                 vm.read(ReadRequest(path=path))
                 read_set.add(path_norm)
