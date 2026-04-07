@@ -43,8 +43,15 @@ class TestExtractDecisionOutcome:
         result = extract_decision_outcome(ctx)
         assert result == "OUTCOME_NONE_CLARIFICATION"
 
-    def test_explicit_decision_proceed(self):
+    def test_explicit_decision_proceed_without_admin_trust_needs_validator(self):
+        # PROCEED without admin trust is inherently uncertain — validator must check
         ctx = "DECISION=PROCEED"
+        result = extract_decision_outcome(ctx)
+        assert result == "NEEDS_VALIDATOR"
+
+    def test_explicit_decision_proceed_with_admin_trust_is_ok(self):
+        # Admin trust + PROCEED → definitively OK (validator skipped)
+        ctx = "trust=admin\nDECISION=PROCEED"
         result = extract_decision_outcome(ctx)
         assert result == "OUTCOME_OK"
 

@@ -1,6 +1,10 @@
 import json
 import time
 
+from bitgn.vm.pcm_connect import PcmRuntimeClientSync
+from bitgn.vm.pcm_pb2 import ReadRequest
+from google.protobuf.json_format import MessageToDict
+
 from agent.config import AgentConfig
 from agent.llm import call_llm
 from agent.prompts import CLI_CLR, CLI_DIM, CLI_GREEN, CLI_YELLOW, build_validator_system
@@ -69,18 +73,19 @@ def extract_decision_outcome(execution_context: str, tm: TaskManager | None = No
         # Non-admin: escalate CLARIFICATION → DENY
         if "OUTCOME_NONE_CLARIFICATION" in decisions:
             decisions.append("OUTCOME_DENIED_SECURITY")
-        # Non-admin + model said PROCEED → uncertain, needs LLM validator
-        if "OUTCOME_DENIED_SECURITY" not in decisions and "OUTCOME_OK" in decisions:
-            return "NEEDS_VALIDATOR"
 
     # ── Priority resolution ──
-
+    # DENY_SECURITY and CLARIFICATION are definitive (deterministic guards).
+    # But PROCEED without admin trust is inherently uncertain — send to
+    # validator for a second opinion.
     if "OUTCOME_DENIED_SECURITY" in decisions:
         return "OUTCOME_DENIED_SECURITY"
     if "OUTCOME_NONE_CLARIFICATION" in decisions:
         return "OUTCOME_NONE_CLARIFICATION"
-    if decisions:
-        return "OUTCOME_OK"
+    if "OUTCOME_OK" in decisions:
+        if trust_level == "admin":
+            return "OUTCOME_OK"
+        return "NEEDS_VALIDATOR"
     return None
 
 
@@ -94,6 +99,8 @@ def validate_completion(
     execution_context: str,
     metadata: dict | None = None,
     tm: TaskManager | None = None,
+    vm: PcmRuntimeClientSync | None = None,
+    files_read: list[str] | None = None,
 ) -> dict | None:
     """Validate proposed answer before submitting.
 
@@ -109,9 +116,24 @@ def validate_completion(
             print(f"  {CLI_GREEN}decision-lock: confirmed {decision_outcome}{CLI_CLR}")
             return None  # approved, skip validator
     elif decision_outcome == "NEEDS_VALIDATOR":
-        print(f"  {CLI_YELLOW}decision-lock: uncertain (valid channel + PROCEED) → validator{CLI_CLR}")
+        print(f"  {CLI_YELLOW}decision-lock: uncertain → validator{CLI_CLR}")
 
     print(f"  {CLI_DIM}validating...{CLI_CLR}", end=" ", flush=True)
+
+    # Provide raw file contents to the validator so it can verify executor's claims
+    raw_files_section = ""
+    if vm and files_read:
+        file_blocks = []
+        for path in files_read:
+            try:
+                result = vm.read(ReadRequest(path=path))
+                content = MessageToDict(result).get("content", "") if result else ""
+                if content:
+                    file_blocks.append(f"<file path=\"{path}\">\n{content}\n</file>")
+            except Exception:
+                continue
+        if file_blocks:
+            raw_files_section = "\n\n<source-files>\n" + "\n".join(file_blocks) + "\n</source-files>"
 
     messages = [
         {"role": "system", "content": build_validator_system()},
@@ -123,6 +145,7 @@ def validate_completion(
                 f"<proposed-message>{proposed_message}</proposed-message>\n\n"
                 f"<execution-context>\n{execution_context}\n</execution-context>\n\n"
                 f"<agents-md>\n{agents_md[:1500]}\n</agents-md>"
+                f"{raw_files_section}"
             ),
         },
     ]
