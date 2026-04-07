@@ -354,7 +354,7 @@ def run_agent(
     correction = validate_completion(
         config, model, task_text, message, outcome,
         phase1_ctx.get("agents_md", ""),
-        execution_context, metadata, tm_exec,
+        execution_context, metadata,
         vm=vm, files_read=list(tm_exec._files_read),
     )
     if correction:
