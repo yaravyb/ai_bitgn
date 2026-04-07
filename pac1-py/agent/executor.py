@@ -361,16 +361,6 @@ def run_agent(
         outcome = correction["outcome"]
         message = correction["message"]
 
-    # Post-process: enforce sorting when the task requests it
-    if outcome == "OUTCOME_OK" and message.strip():
-        task_lower = task_text.lower()
-        if "sorted alphabetically" in task_lower or "alphabetical order" in task_lower:
-            lines = [l for l in message.strip().split("\n") if l.strip()]
-            sorted_lines = sorted(lines, key=str.casefold)
-            if lines != sorted_lines:
-                message = "\n".join(sorted_lines)
-                print(f"  {CLI_DIM}post-process: re-sorted {len(lines)} lines alphabetically{CLI_CLR}")
-
     # Apply deferred writes only for OK outcomes
     pending = tm_exec.get_pending_writes()
     if outcome == "OUTCOME_OK" and pending:
