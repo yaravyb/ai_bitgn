@@ -60,15 +60,6 @@ class TestTaskManager:
         assert tm._files_written == ["/b.md"]
         assert tm._files_deleted == ["/c.md"]
 
-    def test_set_and_get_compliance(self):
-        tm = TaskManager()
-        tm.set_compliance("acc-1", True, ["flag1"], False, "cross-account")
-        c = tm.get_compliance()
-        assert c is not None
-        assert c["account_id"] == "acc-1"
-        assert c["cross_account"] is True
-        assert c["proceed"] is False
-
     def test_render_output_format(self):
         tm = TaskManager()
         tm.set_instructions(["Rule 1", "Rule 2"])

@@ -16,7 +16,6 @@ class TaskManager:
         self._files_deleted: list[str] = []
         self._files_read: list[str] = []
         self._pending_writes: list[dict] = []
-        self._compliance: dict | None = None  # structured compliance result
 
     # -- Instructions --
 
@@ -137,21 +136,6 @@ class TaskManager:
     def pending_writes(self) -> list[dict]:
         return self._pending_writes
 
-    # -- Compliance --
-
-    def set_compliance(self, account_id: str, cross_account: bool, flags: list[str], proceed: bool, reason: str) -> str:
-        self._compliance = {
-            "account_id": account_id,
-            "cross_account": cross_account,
-            "flags": flags,
-            "proceed": proceed,
-            "reason": reason,
-        }
-        return self.render()
-
-    def get_compliance(self) -> dict | None:
-        return self._compliance
-
     # -- Notes --
 
     def add_note(self, note: str) -> str:
@@ -189,9 +173,6 @@ class TaskManager:
             done = sum(1 for t in self._tasks if t["status"] in ("completed", "skipped"))
             total = len(self._tasks)
             lines.append(f"\n({done}/{total} done)")
-        if self._compliance:
-            c = self._compliance
-            lines.append(f"\nCompliance: account={c['account_id']} cross_account={'yes' if c['cross_account'] else 'no'} proceed={'yes' if c['proceed'] else 'no'} reason={c['reason']}")
         if self._files_written:
             lines.append("\nFiles written:")
             for f in self._files_written:

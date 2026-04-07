@@ -194,10 +194,6 @@ def dispatch(
             "plan_add_dependency": lambda: tm.add_dependency(args["task_id"], args["blocked_by"]),
             "plan_note": lambda: tm.add_note(args["note"]),
             "plan_add_instruction": lambda: tm.add_instruction(args["instruction"]),
-            "plan_compliance": lambda: tm.set_compliance(
-                args["account_id"], args["cross_account"],
-                args.get("flags", []), args["proceed"], args["reason"],
-            ),
             "plan_status": lambda: tm.list_all(),
         })
     handler = handlers.get(name)
