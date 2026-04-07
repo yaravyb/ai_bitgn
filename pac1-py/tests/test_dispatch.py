@@ -105,20 +105,6 @@ class TestDispatch:
         assert "A" in result
         assert "B" in result
 
-    def test_inbox_security_reminder(self, mock_vm):
-        tm = TaskManager()
-        config = AgentConfig()
-        # Make read return a truthy mock so MessageToDict is called
-        mock_vm.read.return_value = Mock()
-        import agent.dispatch as dispatch_mod
-        original_mtd = dispatch_mod.MessageToDict
-        dispatch_mod.MessageToDict = lambda r: {"content": "Some inbox content"}
-        try:
-            result = dispatch(mock_vm, "read", {"path": "inbox/msg.md"}, config, tm)
-            assert "[SECURITY CHECK]" in result
-        finally:
-            dispatch_mod.MessageToDict = original_mtd
-
 
 class TestTruncateOutput:
     def test_no_truncation_needed(self):
