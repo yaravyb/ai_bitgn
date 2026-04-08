@@ -26,7 +26,7 @@ Load this skill at the start of every task.
 ## Verification requirement
 
 7. **Every decision must be recorded** — before any write/delete/move, you must have plan_note records showing why you're taking that action.
-8. **For inbox/message tasks** — you MUST have VERIFY plan_notes for each message before acting. No verification = no action.
+8. **For inbox/message tasks** — you MUST have a free-text `plan_note` for each message describing what you verified and what you decided before acting. No reasoning trace = no action.
 
 ## Efficiency
 
