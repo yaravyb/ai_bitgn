@@ -141,38 +141,38 @@ wheels = [
 
 [[package]]
 name = "bitgn-api-connectrpc-python"
-version = "0.9.0.1.20260323140311+cbbd8b9c3c20"
+version = "0.9.0.1.20260405144405+6b39e6872349"
 source = { registry = "https://buf.build/gen/python" }
 dependencies = [
     { name = "bitgn-api-protocolbuffers-python" },
     { name = "connectrpc" },
 ]
 wheels = [
-    { url = "https://buf.build/gen/python/bitgn-api-connectrpc-python/bitgn_api_connectrpc_python-0.9.0.1.20260323140311+cbbd8b9c3c20-py3-none-any.whl" },
+    { url = "https://buf.build/gen/python/bitgn-api-connectrpc-python/bitgn_api_connectrpc_python-0.9.0.1.20260405144405+6b39e6872349-py3-none-any.whl" },
 ]
 
 [[package]]
 name = "bitgn-api-protocolbuffers-pyi"
-version = "34.1.0.1.20260323140311+cbbd8b9c3c20"
+version = "34.1.0.1.20260406122204+3f9b20076359"
 source = { registry = "https://buf.build/gen/python" }
 dependencies = [
     { name = "protobuf" },
     { name = "types-protobuf" },
 ]
 wheels = [
-    { url = "https://buf.build/gen/python/bitgn-api-protocolbuffers-pyi/bitgn_api_protocolbuffers_pyi-34.1.0.1.20260323140311+cbbd8b9c3c20-py3-none-any.whl" },
+    { url = "https://buf.build/gen/python/bitgn-api-protocolbuffers-pyi/bitgn_api_protocolbuffers_pyi-34.1.0.1.20260406122204+3f9b20076359-py3-none-any.whl" },
 ]
 
 [[package]]
 name = "bitgn-api-protocolbuffers-python"
-version = "34.1.0.1.20260323140311+cbbd8b9c3c20"
+version = "34.1.0.1.20260405144405+6b39e6872349"
 source = { registry = "https://buf.build/gen/python" }
 dependencies = [
     { name = "bitgn-api-protocolbuffers-pyi" },
     { name = "protobuf" },
 ]
 wheels = [
-    { url = "https://buf.build/gen/python/bitgn-api-protocolbuffers-python/bitgn_api_protocolbuffers_python-34.1.0.1.20260323140311+cbbd8b9c3c20-py3-none-any.whl" },
+    { url = "https://buf.build/gen/python/bitgn-api-protocolbuffers-python/bitgn_api_protocolbuffers_python-34.1.0.1.20260405144405+6b39e6872349-py3-none-any.whl" },
 ]
 
 [[package]]
@@ -193,8 +193,8 @@ observability = [
 
 [package.metadata]
 requires-dist = [
-    { name = "bitgn-api-connectrpc-python", specifier = "==0.9.0.1.20260323140311+cbbd8b9c3c20" },
-    { name = "bitgn-api-protocolbuffers-python", specifier = "==34.1.0.1.20260323140311+cbbd8b9c3c20" },
+    { name = "bitgn-api-connectrpc-python", specifier = "==0.9.0.1.20260405144405+6b39e6872349" },
+    { name = "bitgn-api-protocolbuffers-python", specifier = "==34.1.0.1.20260405144405+6b39e6872349" },
     { name = "litellm", specifier = ">=1.82.3" },
     { name = "protobuf", specifier = ">=7.34.1" },
 ]

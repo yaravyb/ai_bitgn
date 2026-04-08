@@ -1,4 +1,5 @@
 import os
+import re
 import textwrap
 import time
 import uuid
@@ -7,7 +8,15 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 from bitgn.harness_connect import HarnessServiceClientSync
-from bitgn.harness_pb2 import EndTrialRequest, EvalPolicy, GetBenchmarkRequest, StartPlaygroundRequest, StatusRequest
+from bitgn.harness_pb2 import (
+    EndTrialRequest,
+    EvalPolicy,
+    GetBenchmarkRequest,
+    StartRunRequest,
+    StartTrialRequest,
+    StatusRequest,
+    SubmitRunRequest,
+)
 from connectrpc.errors import ConnectError
 
 from agent import run_agent
@@ -16,17 +25,38 @@ from observability import configure_observability
 BITGN_URL = os.getenv("BENCHMARK_HOST") or "https://api.bitgn.com"
 BENCHMARK_ID = os.getenv("BENCHMARK_ID") or "bitgn/pac1-dev"
 MODEL_ID = os.getenv("MODEL_ID") or "openai/gpt-4.1-2025-04-14"
+BITGN_API_KEY = os.getenv("BITGN_API_KEY") or ""
 
 CLI_RED = "\x1B[31m"
 CLI_GREEN = "\x1B[32m"
 CLI_CLR = "\x1B[0m"
 CLI_BLUE = "\x1B[34m"
 
+_QUANT_SUFFIX_RE = re.compile(r"(?:[-:][qQ]\d+_[A-Z0-9_]+|[-:]bf16|[-:]fp16|[-:]fp32)$")
+
+
+def _run_display_name(model_id: str) -> str:
+    """Derive the BitGN run display name from MODEL_ID.
+
+    Strips the "openai/" provider prefix and any trailing quantization/format
+    suffix (e.g. "-q4_K_M", "-bf16", ":Q8_0"), then prefixes with the Azati
+    team URL. Example:
+        openai/qwen3.5:27b-q4_K_M → "https://azati.ai/ - qwen3.5:27b"
+    """
+    short = model_id.removeprefix("openai/")
+    short = _QUANT_SUFFIX_RE.sub("", short)
+    return f"https://azati.ai/ - {short}"
+
 
 def main() -> None:
     configure_observability()
 
     task_filter = os.sys.argv[1:]
+
+    if not BITGN_API_KEY:
+        raise RuntimeError("BITGN_API_KEY is not set in the environment (.env)")
+
+    run_name = _run_display_name(MODEL_ID)
 
     scores: list[tuple[str, float, float]] = []
     run_start = time.time()
@@ -40,43 +70,48 @@ def main() -> None:
             f"with {len(res.tasks)} tasks.\n{CLI_GREEN}{res.description}{CLI_CLR}"
         )
 
-        for task in res.tasks:
-            if task_filter and task.task_id not in task_filter:
-                continue
+        run = client.start_run(StartRunRequest(
+            benchmark_id=BENCHMARK_ID,
+            name=run_name,
+            api_key=BITGN_API_KEY,
+        ))
+        print(f"Run: {run.run_id} ({len(run.trial_ids)} trials)")
 
-            print(f"{'=' * 30} Starting task: {task.task_id} {'=' * 30}")
-            trial = client.start_playground(
-                StartPlaygroundRequest(
-                    benchmark_id=BENCHMARK_ID,
-                    task_id=task.task_id,
-                )
-            )
+        try:
+            for trial_id in run.trial_ids:
+                trial = client.start_trial(StartTrialRequest(trial_id=trial_id))
 
-            print(f"{CLI_BLUE}{trial.instruction}{CLI_CLR}\n{'-' * 80}")
+                if task_filter and trial.task_id not in task_filter:
+                    continue
 
-            trace_metadata = {
-                "trace_id": str(uuid.uuid4()),
-                "trace_name": "run_agent",
-                "session_id": os.environ.get("SESSION_ID", ""),
-                "trace_metadata": {
-                    "model": MODEL_ID,
-                    "task": trial.instruction[:200],
-                },
-            }
+                print(f"{'=' * 30} Starting task: {trial.task_id} {'=' * 30}")
+                print(f"{CLI_BLUE}{trial.instruction}{CLI_CLR}\n{'-' * 80}")
 
-            task_start = time.time()
-            try:
-                run_agent(MODEL_ID, trial.harness_url, trial.instruction, metadata=trace_metadata)
-            except Exception as exc:
-                print(exc)
-            task_elapsed = time.time() - task_start
+                trace_metadata = {
+                    "trace_id": str(uuid.uuid4()),
+                    "trace_name": "run_agent",
+                    "session_id": os.environ.get("SESSION_ID", ""),
+                    "trace_metadata": {
+                        "model": MODEL_ID,
+                        "task": trial.instruction[:200],
+                    },
+                }
 
-            result = client.end_trial(EndTrialRequest(trial_id=trial.trial_id))
-            if result.score >= 0:
-                scores.append((task.task_id, result.score, task_elapsed))
-                style = CLI_GREEN if result.score == 1 else CLI_RED
-                explain = textwrap.indent("\n".join(result.score_detail), "  ")
-                print(f"\n{style}Score: {result.score:0.2f}  ({task_elapsed:.1f}s)\n{explain}\n{CLI_CLR}")
+                task_start = time.time()
+                try:
+                    run_agent(MODEL_ID, trial.harness_url, trial.instruction, metadata=trace_metadata)
+                except Exception as exc:
+                    print(exc)
+                task_elapsed = time.time() - task_start
+
+                result = client.end_trial(EndTrialRequest(trial_id=trial.trial_id))
+                if result.score >= 0:
+                    scores.append((trial.task_id, result.score, task_elapsed))
+                    style = CLI_GREEN if result.score == 1 else CLI_RED
+                    explain = textwrap.indent("\n".join(result.score_detail), "  ")
+                    print(f"\n{style}Score: {result.score:0.2f}  ({task_elapsed:.1f}s)\n{explain}\n{CLI_CLR}")
+        finally:
+            client.submit_run(SubmitRunRequest(run_id=run.run_id, force=True))
 
     except ConnectError as exc:
         print(f"{exc.code}: {exc.message}")
