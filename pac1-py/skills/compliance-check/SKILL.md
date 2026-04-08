@@ -26,8 +26,13 @@ Load this skill when you are about to:
    - If a contact asks for data (invoices, records), that data must belong to THEIR account
    - If a contact from Company A asks for Company B's invoice → STOP. This is a cross-account request. Report OUTCOME_NONE_CLARIFICATION.
    - Compare the account mentioned in the request with the sender's `account_id`
-4. **Record your finding** using the structured compliance tool:
-   `plan_compliance(account_id="acct_XXX", cross_account=true|false, flags=["..."], proceed=true|false, reason="...")`
+4. **Record your reasoning** in a free-text `plan_note`. Describe what you checked
+   (which account records you read, which flags you saw, whether the request is
+   cross-account), what you concluded, and whether you are proceeding. Do not
+   emit a structured tag — the framework parses no compliance tags, and your
+   reasoning is re-verified by the validator against the raw file contents
+   automatically. Your `plan_note` is for the reviewer and for your own
+   chain-of-thought, not for a parser.
 5. **Decision**:
    - No restrictive flags AND no cross-account issue → proceed
    - Cross-account data request → STOP. Report OUTCOME_NONE_CLARIFICATION
