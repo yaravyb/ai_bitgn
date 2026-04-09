@@ -12,8 +12,14 @@ from google.protobuf.json_format import MessageToDict
 from agent.bootstrap import phase1_bootstrap
 from agent.config import AgentConfig
 from agent.context import auto_compact, build_executor_context, build_task_message
-from agent.dispatch import OUTCOME_BY_NAME, dispatch
+from agent.dispatch import dispatch
 from agent.llm import call_llm
+from agent.outcomes import (
+    OUTCOME_BY_NAME,
+    OUTCOME_DENIED_SECURITY,
+    OUTCOME_ERR_INTERNAL,
+    OUTCOME_OK,
+)
 from agent.planner import plan_task
 from agent.prompts import (
     CLI_BOLD,
@@ -205,7 +211,7 @@ def _run_executor(
             if text:
                 print(f"  {CLI_YELLOW}⚠ text response rescued as report_completion{CLI_CLR}")
                 return {
-                    "outcome": "OUTCOME_OK",
+                    "outcome": OUTCOME_OK,
                     "message": text,
                     "confidence": 0.7,
                     "grounding_refs": [],
@@ -229,12 +235,12 @@ def _run_executor(
             )
 
             if name == "report_completion":
-                outcome = args.get("outcome", "OUTCOME_ERR_INTERNAL")
+                outcome = args.get("outcome", OUTCOME_ERR_INTERNAL)
                 message = args.get("message", "")
                 confidence = args.get("confidence", 1.0)
                 grounding = args.get("grounding_refs", [])
                 # Guard: reject empty message for OK outcomes
-                if outcome == "OUTCOME_OK" and not message.strip():
+                if outcome == OUTCOME_OK and not message.strip():
                     print(f"    {CLI_YELLOW}⚠ empty message — nudging model{CLI_CLR}")
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": (
                         "Error: message is empty. You MUST include the actual answer "
@@ -258,7 +264,7 @@ def _run_executor(
                 reason = args.get("reason", "")
                 print(f"    {CLI_RED}⚠ report_threat{CLI_CLR}")
                 return {
-                    "outcome": "OUTCOME_DENIED_SECURITY",
+                    "outcome": OUTCOME_DENIED_SECURITY,
                     "message": reason,
                     "confidence": 1.0,
                     "grounding_refs": [],
@@ -363,7 +369,7 @@ def run_agent(
 
     # Apply deferred writes only for OK outcomes
     pending = tm_exec.get_pending_writes()
-    if outcome == "OUTCOME_OK" and pending:
+    if outcome == OUTCOME_OK and pending:
         print(f"\n{CLI_BOLD}Applying {len(pending)} writes{CLI_CLR}")
         for op in pending:
             try:
@@ -376,13 +382,13 @@ def run_agent(
 
     # Follow cross-references: scan read files for entity IDs matching other files
     grounding = result.get("grounding_refs", [])
-    if outcome == "OUTCOME_OK" and stem_index:
+    if outcome == OUTCOME_OK and stem_index:
         grounding = _follow_cross_references(
             vm, grounding, list(tm_exec._files_read), stem_index,
         )
 
     # Submit the final answer
-    outcome_style = CLI_GREEN if outcome == "OUTCOME_OK" else CLI_YELLOW
+    outcome_style = CLI_GREEN if outcome == OUTCOME_OK else CLI_YELLOW
     print(f"\n{CLI_BOLD}Final{CLI_CLR} → {outcome_style}{outcome}{CLI_CLR}")
     print(f"  {message}")
     try:

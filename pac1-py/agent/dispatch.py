@@ -20,22 +20,11 @@ from bitgn.vm.pcm_pb2 import (
 from google.protobuf.json_format import MessageToDict
 
 from agent.config import AgentConfig
+from agent.outcomes import OUTCOME_BY_NAME
 from skills import SkillLoader
 from tasks import TaskManager
 
 log = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-OUTCOME_BY_NAME = {
-    "OUTCOME_OK": Outcome.OUTCOME_OK,
-    "OUTCOME_DENIED_SECURITY": Outcome.OUTCOME_DENIED_SECURITY,
-    "OUTCOME_NONE_CLARIFICATION": Outcome.OUTCOME_NONE_CLARIFICATION,
-    "OUTCOME_NONE_UNSUPPORTED": Outcome.OUTCOME_NONE_UNSUPPORTED,
-    "OUTCOME_ERR_INTERNAL": Outcome.OUTCOME_ERR_INTERNAL,
-}
 
 
 # ---------------------------------------------------------------------------
