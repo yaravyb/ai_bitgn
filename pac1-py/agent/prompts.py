@@ -153,7 +153,12 @@ def build_planner_system() -> str:
         "For example, if looking for accounts managed by someone, also look up "
         "that person's record in contacts/ to ground the answer.\n"
         "4. GROUNDING: Plan to collect all file paths read during execution "
-        "and include them in grounding_refs when reporting completion.\n\n"
+        "and include them in grounding_refs when reporting completion.\n"
+        "5. DATE ARITHMETIC: If the task involves relative dates ('X days ago', "
+        "'in two weeks', 'last Tuesday'), do NOT pre-calculate the date from "
+        "file timestamps or folder names. Plan for the executor to call "
+        "current_date() FIRST, then compute the target date from the result. "
+        "File timestamps are not a reliable proxy for 'today'.\n\n"
         "Use the plan_task tool."
     )
 
