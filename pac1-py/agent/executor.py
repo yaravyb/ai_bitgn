@@ -248,6 +248,21 @@ def _run_executor(
                         "the answer. Also include grounding_refs with file paths you read."
                     )})
                     continue
+                # Guard: answer references file paths but no files were read
+                if (
+                    outcome == OUTCOME_OK
+                    and not tm._files_read
+                    and "/" in message
+                    and any(ext in message for ext in (".md", ".json", ".txt"))
+                ):
+                    print(f"    {CLI_YELLOW}⚠ answer references files but none were read — nudging{CLI_CLR}")
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": (
+                        "Error: your answer references file paths but you have not "
+                        "read() any files. The validator requires source files to "
+                        "verify your answer. Call read() on the file(s) you found, "
+                        "then call report_completion again with grounding_refs."
+                    )})
+                    continue
                 # Auto-merge all tracked read files into grounding_refs
                 tracked = list(tm._files_read)
                 merged = list(dict.fromkeys(grounding + tracked))

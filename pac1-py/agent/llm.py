@@ -23,7 +23,7 @@ _RETRYABLE_EXCEPTIONS = (
 # outer retry loop owns the retry decision instead of waiting on litellm's
 # default ~600s per-request timeout. A single 5-run t29 battery observed a
 # ~27-minute hang before this cap was in place.
-_CALL_TIMEOUT_SEC = 60
+_CALL_TIMEOUT_SEC = 90
 
 # Cap exponential backoff so per-retry sleep never grows unbounded when
 # max_retries is bumped. With base_delay=1.0 and max_retries=3 the effective
@@ -34,7 +34,7 @@ _RETRY_MAX_DELAY = 8.0
 # Hard ceiling on total wall-clock time spent across all retry attempts for a
 # single call_llm invocation. Prevents the "27-minute hang on a single
 # validator call" failure mode observed on t10 during upstream 504 storms.
-_RETRY_TOTAL_BUDGET_SEC = 180.0
+_RETRY_TOTAL_BUDGET_SEC = 300.0
 
 
 def _completion_with_retry(
