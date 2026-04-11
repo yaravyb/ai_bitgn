@@ -46,7 +46,10 @@ edits, NOT about skipping required actions.
 ## Phase 2: Read messages
 
 4. List inbox folder. Check the inbox README for processing rules.
-   - If README says "one at a time" / "lowest filename first" → read ONLY the first msg_*.txt file
+   - If README says "one at a time" / "lowest filename first" → read ONLY
+     the first msg_*.txt file. Do NOT read, plan for, or even mention
+     other messages. After processing the first message, report completion
+     immediately. The other messages do not exist for this run.
    - If no such rule → read all messages
    - IMPORTANT: even when reading all messages for verification, only EXECUTE actions for the message(s) the README allows.
 

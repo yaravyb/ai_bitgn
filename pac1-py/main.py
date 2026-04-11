@@ -38,12 +38,20 @@ _QUANT_SUFFIX_RE = re.compile(r"(?:[-:][qQ]\d+_[A-Z0-9_]+|[-:]bf16|[-:]fp16|[-:]
 def _run_display_name(model_id: str) -> str:
     """Derive the BitGN run display name from MODEL_ID.
 
-    Strips the "openai/" provider prefix and any trailing quantization/format
-    suffix (e.g. "-q4_K_M", "-bf16", ":Q8_0"), then prefixes with the Azati
-    team URL. Example:
-        openai/qwen3.5:27b-q4_K_M → "https://azati.ai/ - qwen3.5:27b"
+    Strips the provider prefix and any trailing quantization/format suffix
+    (e.g. "-q4_K_M", "-bf16", ":Q8_0"), then prefixes with the Azati team URL.
+    Examples:
+        openai/qwen3.5:27b-q4_K_M   → "https://azati.ai/ - qwen3.5:27b"
+        openrouter/qwen/qwen3.5-27b  → "https://azati.ai/ - qwen3.5-27b"
+        bedrock/us.meta.llama4-...    → "https://azati.ai/ - us.meta.llama4-..."
     """
-    short = model_id.removeprefix("openai/")
+    # Strip known provider prefixes; for openrouter/ also strip the org segment
+    if model_id.startswith("openrouter/"):
+        # openrouter/qwen/qwen3.5-27b → qwen3.5-27b (drop provider + org)
+        parts = model_id.split("/", 2)
+        short = parts[2] if len(parts) > 2 else parts[-1]
+    else:
+        short = model_id.split("/", 1)[-1]
     short = _QUANT_SUFFIX_RE.sub("", short)
     return f"https://azati.ai/ - {short}"
 
