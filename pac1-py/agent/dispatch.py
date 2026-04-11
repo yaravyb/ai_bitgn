@@ -116,6 +116,84 @@ def truncate_output(text: str, cap: int, smart: bool = False) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Safe arithmetic evaluator (AST-based, no eval)
+# ---------------------------------------------------------------------------
+
+import ast
+import operator
+from datetime import date, timedelta
+
+_SAFE_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+
+def _date_offset(iso_date: str, days: int) -> str:
+    """Add/subtract days from an ISO date. Returns ISO string."""
+    return (date.fromisoformat(iso_date) + timedelta(days=days)).isoformat()
+
+
+def _days_between(iso_start: str, iso_end: str) -> int:
+    """Count days between two ISO dates."""
+    return (date.fromisoformat(iso_end) - date.fromisoformat(iso_start)).days
+
+
+_SAFE_FUNCS = {
+    "sum": sum, "len": len, "min": min, "max": max,
+    "abs": abs, "round": round, "sorted": sorted,
+    "date_offset": _date_offset,
+    "days_between": _days_between,
+}
+
+
+def _ast_eval(node: ast.AST):
+    """Recursively evaluate an AST node with only arithmetic + safe funcs."""
+    if isinstance(node, ast.Expression):
+        return _ast_eval(node.body)
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float, str)):
+            return node.value
+        raise ValueError(f"unsupported constant: {node.value!r}")
+    if isinstance(node, ast.BinOp):
+        op = _SAFE_OPS.get(type(node.op))
+        if op is None:
+            raise ValueError(f"unsupported operator: {type(node.op).__name__}")
+        return op(_ast_eval(node.left), _ast_eval(node.right))
+    if isinstance(node, ast.UnaryOp):
+        op = _SAFE_OPS.get(type(node.op))
+        if op is None:
+            raise ValueError(f"unsupported operator: {type(node.op).__name__}")
+        return op(_ast_eval(node.operand))
+    if isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Name) and node.func.id in _SAFE_FUNCS:
+            func = _SAFE_FUNCS[node.func.id]
+            call_args = [_ast_eval(a) for a in node.args]
+            return func(*call_args)
+        raise ValueError(f"unsupported function: {ast.dump(node.func)}")
+    if isinstance(node, ast.List):
+        return [_ast_eval(e) for e in node.elts]
+    raise ValueError(f"unsupported node: {type(node).__name__}")
+
+
+def _safe_calculate(expression: str) -> str:
+    """Evaluate arithmetic or date expression in a restricted AST sandbox."""
+    try:
+        tree = ast.parse(expression, mode="eval")
+        result = _ast_eval(tree)
+        return str(result)
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+# ---------------------------------------------------------------------------
 # Dispatch: tool name + JSON args -> PCM runtime call -> result string
 # ---------------------------------------------------------------------------
 
@@ -154,6 +232,7 @@ def dispatch(
         "list": lambda: vm.list(ListRequest(name=args.get("path", "/"))),
         "read": lambda: vm.read(ReadRequest(path=args["path"])),
         "current_date": lambda: vm.context(ContextRequest()),
+        "calculate": lambda: _safe_calculate(args.get("expression", "")),
         "load_skill": lambda: load_skill(vm, skill_loader, args.get("name", args.get("path", ""))) if skill_loader else "Error: no skill loader",
         "write": lambda: vm.write(WriteRequest(path=args["path"], content=args["content"])),
         "delete": lambda: vm.delete(DeleteRequest(path=args["path"])),

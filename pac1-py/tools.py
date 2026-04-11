@@ -153,6 +153,35 @@ _READONLY_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "calculate",
+            "description": (
+                "Deterministic arithmetic and date computation. Use instead "
+                "of mental math for invoices, totals, counts, date offsets. "
+                "Supports: arithmetic (1855 + 2400), aggregation "
+                "(sum([100, 200, 300])), rounding (round(15000/7, 2)), "
+                "date offsets (date_offset('2026-03-29', -41) → '2026-02-16'), "
+                "days between (days_between('2026-01-01', '2026-03-15') → 73)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": (
+                            "Expression to evaluate. Arithmetic: '1855 + 2400'. "
+                            "Aggregation: 'sum([100, 200, 300])'. "
+                            "Date offset: 'date_offset(\"2026-03-15\", -20)'. "
+                            "Days between: 'days_between(\"2026-01-01\", \"2026-03-15\")'."
+                        ),
+                    },
+                },
+                "required": ["expression"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "load_skill",
             "description": (
                 "Load specialized knowledge before performing an action. "
