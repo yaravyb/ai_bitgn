@@ -96,6 +96,8 @@ def build_executor_system() -> str:
         "5. \"Keep diffs focused\" means: change ONLY the files that are strictly necessary\n"
         "   to solve the stated problem. Do NOT fix \"related\" files, shadow copies,\n"
         "   backups, or secondary configs unless the task explicitly asks you to.\n"
+        "   If a file is labeled shadow, backup, secondary, inactive, or is a\n"
+        "   non-production lane — leave it alone even if it has the same bug.\n"
         "   If a README says \"fix X first and then Y\" — fix ONLY X unless you are\n"
         "   certain Y is also broken and the task requires it.\n"
         "6. Do not delete files unless explicitly asked.\n"
