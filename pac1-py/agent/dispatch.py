@@ -2,6 +2,15 @@ import json
 import logging
 import re
 
+# Frontmatter gap normalizer: strip extra blank lines between closing --- and body.
+# LLMs often write "---\n\n# Heading" but strict parsers expect "---\n# Heading".
+_FRONTMATTER_GAP_RE = re.compile(r"^(---\n.*?\n---)\n{2,}", re.DOTALL)
+
+
+def _normalize_frontmatter_gap(content: str) -> str:
+    """Ensure exactly one newline between YAML frontmatter closing --- and body."""
+    return _FRONTMATTER_GAP_RE.sub(r"\1\n", content)
+
 from bitgn.vm.pcm_connect import PcmRuntimeClientSync
 from bitgn.vm.pcm_pb2 import (
     AnswerRequest,
@@ -234,7 +243,7 @@ def dispatch(
         "current_date": lambda: vm.context(ContextRequest()),
         "calculate": lambda: _safe_calculate(args.get("expression", "")),
         "load_skill": lambda: load_skill(vm, skill_loader, args.get("name", args.get("path", ""))) if skill_loader else "Error: no skill loader",
-        "write": lambda: vm.write(WriteRequest(path=args["path"], content=args["content"])),
+        "write": lambda: vm.write(WriteRequest(path=args["path"], content=_normalize_frontmatter_gap(args["content"]))),
         "delete": lambda: vm.delete(DeleteRequest(path=args["path"])),
         "mkdir": lambda: vm.mk_dir(MkDirRequest(path=args["path"])),
         "move": lambda: vm.move(MoveRequest(from_name=args["from_name"], to_name=args["to_name"])),

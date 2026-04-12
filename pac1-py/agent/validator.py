@@ -34,12 +34,15 @@ def validate_completion(
     if vm and files_read:
         file_blocks = []
         for path in files_read:
+            # Normalize path: strip leading "/" for VM compatibility
+            norm_path = path.lstrip("/")
             try:
-                result = vm.read(ReadRequest(path=path))
+                result = vm.read(ReadRequest(path=norm_path))
                 content = MessageToDict(result).get("content", "") if result else ""
                 if content:
                     file_blocks.append(f"<file path=\"{path}\">\n{content}\n</file>")
-            except Exception:
+            except Exception as exc:
+                print(f"{CLI_DIM}source-file skip {norm_path}: {exc}{CLI_CLR}", end=" ", flush=True)
                 continue
         if file_blocks:
             raw_files_section = "\n\n<source-files>\n" + "\n".join(file_blocks) + "\n</source-files>"

@@ -194,6 +194,8 @@ def _run_executor(
     print(f"{CLI_BOLD}Executor {run_id}{CLI_CLR} {CLI_DIM}(full tools, {config.max_executor_steps} steps max){CLI_CLR}")
     print(f"{CLI_BOLD}{'─' * 50}{CLI_CLR}")
 
+    did_search = False  # tracks if list/find/search was called
+
     for _ in range(config.max_executor_steps):
         started = time.time()
         resp = call_llm(config, model, messages, EXECUTOR_TOOLS, metadata)
@@ -263,6 +265,33 @@ def _run_executor(
                         "then call report_completion again with grounding_refs."
                     )})
                     continue
+                # Guard: searched for files but never read any
+                if (
+                    outcome == OUTCOME_OK
+                    and not tm._files_read
+                    and did_search
+                ):
+                    print(f"    {CLI_YELLOW}⚠ searched but never read — nudging to ground answer{CLI_CLR}")
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": (
+                        "Error: you used list/find/search but never called read() on "
+                        "any file. The answer must be grounded by reading the source "
+                        "record. Call read() on the canonical file for your answer, "
+                        "then call report_completion again with grounding_refs."
+                    )})
+                    continue
+                # Guard: grounding_refs claim files that were never read
+                read_set = {f.lstrip("/") for f in tm._files_read}
+                unread = [r for r in grounding if r and r.lstrip("/") not in read_set]
+                if outcome == OUTCOME_OK and unread:
+                    print(f"    {CLI_YELLOW}⚠ grounding_refs claim {len(unread)} unread files — nudging{CLI_CLR}")
+                    samples = ", ".join(unread[:3])
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": (
+                        f"Error: your grounding_refs include files you never read(): "
+                        f"{samples}{'...' if len(unread) > 3 else ''}. "
+                        "Call read() on each grounding_ref file before calling "
+                        "report_completion. The validator will reject unread refs."
+                    )})
+                    continue
                 # Auto-merge all tracked read files into grounding_refs
                 tracked = list(tm._files_read)
                 merged = list(dict.fromkeys(grounding + tracked))
@@ -289,6 +318,9 @@ def _run_executor(
             # Intercept plan_create: override with planner's strategy steps
             if name == "plan_create" and strategy_steps:
                 args = {"steps": strategy_steps}
+
+            if name in ("list", "find", "search"):
+                did_search = True
 
             try:
                 txt = dispatch(vm, name, args, config, tm, defer_writes=defer, skill_loader=skill_loader)
@@ -372,11 +404,16 @@ def run_agent(
     message = result["message"]
     execution_context = result.get("execution_context", "")
 
+    # Merge actual reads + claimed grounding_refs so the validator can
+    # re-read everything the executor references, not just what it read().
+    grounding = result.get("grounding_refs", [])
+    all_refs = list(dict.fromkeys(list(tm_exec._files_read) + grounding))
+
     correction = validate_completion(
         config, model, task_text, message, outcome,
         phase1_ctx.get("agents_md", ""),
         execution_context, metadata,
-        vm=vm, files_read=list(tm_exec._files_read),
+        vm=vm, files_read=all_refs,
     )
     if correction:
         outcome = correction["outcome"]
