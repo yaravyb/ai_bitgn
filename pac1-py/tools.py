@@ -155,12 +155,15 @@ _READONLY_SCHEMAS: list[dict] = [
         "function": {
             "name": "calculate",
             "description": (
-                "Deterministic arithmetic and date computation. Use instead "
-                "of mental math for invoices, totals, counts, date offsets. "
-                "Supports: arithmetic (1855 + 2400), aggregation "
-                "(sum([100, 200, 300])), rounding (round(15000/7, 2)), "
-                "date offsets (date_offset('2026-03-29', -41) → '2026-02-16'), "
-                "days between (days_between('2026-01-01', '2026-03-15') → 73)."
+                "Deterministic computation with pandas. Use instead of mental "
+                "math. After load_records(), query 'df' (pandas DataFrame): "
+                "df['total_eur'].sum(), "
+                "df[df['counterparty'] == 'X']['_file'].tolist(), "
+                "df[df['_file'].str.contains('keyword')].shape[0], "
+                "df.sort_values('birthday').head(). "
+                "Also: arithmetic (1855 + 2400), "
+                "date_offset('2026-03-29', -41), "
+                "days_between('2026-01-01', '2026-03-15')."
             ),
             "parameters": {
                 "type": "object",
@@ -168,14 +171,42 @@ _READONLY_SCHEMAS: list[dict] = [
                     "expression": {
                         "type": "string",
                         "description": (
-                            "Expression to evaluate. Arithmetic: '1855 + 2400'. "
-                            "Aggregation: 'sum([100, 200, 300])'. "
-                            "Date offset: 'date_offset(\"2026-03-15\", -20)'. "
-                            "Days between: 'days_between(\"2026-01-01\", \"2026-03-15\")'."
+                            "Python/pandas expression. "
+                            "DataFrame: df['col'].sum(), df[df['x']=='y'], "
+                            "df.groupby('col').sum(), df.sort_values('col'). "
+                            "Arithmetic: '1855 + 2400'. "
+                            "Date: 'date_offset(\"2026-03-15\", -20)'. "
+                            "String: df[df['name'].str.contains('keyword')]."
                         ),
                     },
                 },
                 "required": ["expression"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "load_records",
+            "description": (
+                "Load all structured files from a folder into a queryable "
+                "table. Parses JSON files and markdown files with YAML "
+                "frontmatter. Use BEFORE calculate() to query records. "
+                "Example: load_records('10_entities/cast') then "
+                "calculate(\"[r['full_name'] for r in records "
+                "if r.get('birthday', '').startswith('1989')]\"). "
+                "Prefer this over reading files one by one for counts, "
+                "sums, filters, and lookups across multiple records."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Folder path to load records from.",
+                    },
+                },
+                "required": ["path"],
             },
         },
     },

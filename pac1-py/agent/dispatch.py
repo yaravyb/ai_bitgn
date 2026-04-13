@@ -155,51 +155,180 @@ def _days_between(iso_start: str, iso_end: str) -> int:
     return (date.fromisoformat(iso_end) - date.fromisoformat(iso_start)).days
 
 
-_SAFE_FUNCS = {
+import pandas as pd
+
+# Shared state for loaded data
+_loaded_df: pd.DataFrame | None = None
+_loaded_records: list[dict] = []
+
+# Restricted namespace for calculate() — no builtins, no imports
+_CALC_NAMESPACE: dict = {
+    "__builtins__": {},
+    # Math
     "sum": sum, "len": len, "min": min, "max": max,
     "abs": abs, "round": round, "sorted": sorted,
+    "str": str, "int": int, "float": float, "bool": bool,
+    "any": any, "all": all, "list": list, "set": set, "dict": dict,
+    "True": True, "False": False, "None": None,
+    # Date helpers
     "date_offset": _date_offset,
     "days_between": _days_between,
+    # Pandas
+    "pd": pd,
 }
 
 
-def _ast_eval(node: ast.AST):
-    """Recursively evaluate an AST node with only arithmetic + safe funcs."""
-    if isinstance(node, ast.Expression):
-        return _ast_eval(node.body)
-    if isinstance(node, ast.Constant):
-        if isinstance(node.value, (int, float, str)):
-            return node.value
-        raise ValueError(f"unsupported constant: {node.value!r}")
-    if isinstance(node, ast.BinOp):
-        op = _SAFE_OPS.get(type(node.op))
-        if op is None:
-            raise ValueError(f"unsupported operator: {type(node.op).__name__}")
-        return op(_ast_eval(node.left), _ast_eval(node.right))
-    if isinstance(node, ast.UnaryOp):
-        op = _SAFE_OPS.get(type(node.op))
-        if op is None:
-            raise ValueError(f"unsupported operator: {type(node.op).__name__}")
-        return op(_ast_eval(node.operand))
-    if isinstance(node, ast.Call):
-        if isinstance(node.func, ast.Name) and node.func.id in _SAFE_FUNCS:
-            func = _SAFE_FUNCS[node.func.id]
-            call_args = [_ast_eval(a) for a in node.args]
-            return func(*call_args)
-        raise ValueError(f"unsupported function: {ast.dump(node.func)}")
-    if isinstance(node, ast.List):
-        return [_ast_eval(e) for e in node.elts]
-    raise ValueError(f"unsupported node: {type(node).__name__}")
-
-
 def _safe_calculate(expression: str) -> str:
-    """Evaluate arithmetic or date expression in a restricted AST sandbox."""
+    """Evaluate expression with pandas, arithmetic, and date helpers.
+
+    The expression runs in a restricted namespace: no __builtins__,
+    no imports. Only pre-approved functions, pandas, and loaded data
+    (df, records) are accessible.
+    """
+    ns = dict(_CALC_NAMESPACE)
+    if _loaded_df is not None:
+        ns["df"] = _loaded_df
+    ns["records"] = list(_loaded_records)
+
     try:
-        tree = ast.parse(expression, mode="eval")
-        result = _ast_eval(tree)
+        result = eval(compile(expression, "<calc>", "eval"), ns)  # noqa: S307 — restricted namespace, agent-generated only
+        # Convert pandas types to Python for clean display
+        if isinstance(result, pd.DataFrame):
+            return result.to_string(index=False)
+        if isinstance(result, pd.Series):
+            return result.to_string(index=False)
+        if hasattr(result, 'item'):  # numpy scalar
+            return str(result.item())
         return str(result)
     except Exception as exc:
         return f"Error: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# load_records: parse a folder of structured files into a queryable table
+# ---------------------------------------------------------------------------
+
+import yaml
+
+
+def _parse_yaml_frontmatter(text: str) -> dict | None:
+    """Extract YAML frontmatter from a markdown file. Returns None if no frontmatter."""
+    if not text.startswith("---"):
+        return None
+    end = text.find("\n---", 3)
+    if end == -1:
+        return None
+    try:
+        return yaml.safe_load(text[4:end]) or {}
+    except Exception:
+        return None
+
+
+def _load_records(vm, path: str) -> str:
+    """Load all structured files from a folder into a pandas DataFrame.
+
+    Parses JSON files and markdown files with YAML frontmatter.
+    Validates structural consistency, infers types, builds df.
+    """
+    global _loaded_records, _loaded_df
+
+    # List folder
+    try:
+        list_result = vm.list(ListRequest(name=path.lstrip("/")))
+        entries_raw = MessageToDict(list_result).get("entries", [])
+        entries = [e.get("name", "") for e in entries_raw if e.get("name", "")]
+    except Exception as exc:
+        return f"Error listing {path}: {exc}"
+
+    # Filter to parseable files
+    files = [e for e in entries if e.endswith((".json", ".md")) and not e.upper().startswith(("README", "AGENTS"))]
+    if not files:
+        return f"No structured files found in {path}"
+
+    # Parse all files
+    records = []
+    parse_errors = 0
+    for fname in files:
+        fpath = f"{path.strip('/')}/{fname}"
+        try:
+            result = vm.read(ReadRequest(path=fpath))
+            content = MessageToDict(result).get("content", "")
+            if not content:
+                continue
+        except Exception:
+            parse_errors += 1
+            continue
+
+        record = None
+        if fname.endswith(".json"):
+            try:
+                record = json.loads(content)
+                if not isinstance(record, dict):
+                    record = None
+            except json.JSONDecodeError:
+                parse_errors += 1
+        elif fname.endswith(".md"):
+            record = _parse_yaml_frontmatter(content)
+            if record is not None:
+                # Capture the markdown body for content queries
+                body_start = content.find("\n---", 3)
+                if body_start != -1:
+                    body = content[body_start + 4:].strip()
+                    if body:
+                        record["_body"] = body[:800]
+
+        if record and isinstance(record, dict):
+            record["_file"] = fname
+            records.append(record)
+
+    if not records:
+        return f"No parseable records in {path} ({parse_errors} parse errors)"
+
+    # Validate structural consistency
+    sample = records[:min(5, len(records))]
+    field_sets = [set(r.keys()) - {"_file", "_body"} for r in sample]
+    common_fields = field_sets[0]
+    for fs in field_sets[1:]:
+        common_fields &= fs
+    if len(common_fields) < 2:
+        return f"Inconsistent structure in {path}: files don't share enough common fields"
+
+    # Build DataFrame
+    _loaded_records = records
+    _loaded_df = pd.DataFrame(records)
+
+    # Serialize list/dict columns to JSON strings for easier querying
+    for col in _loaded_df.columns:
+        if _loaded_df[col].apply(lambda x: isinstance(x, (list, dict))).any():
+            _loaded_df[col] = _loaded_df[col].apply(
+                lambda x: json.dumps(x) if isinstance(x, (list, dict)) else x
+            )
+
+    # Auto-detect and convert date columns
+    for col in _loaded_df.columns:
+        if col.startswith("_"):
+            continue
+        sample_vals = _loaded_df[col].dropna().head(3).astype(str)
+        if len(sample_vals) > 0 and sample_vals.str.match(r"^\d{4}-\d{2}-\d{2}").all():
+            try:
+                _loaded_df[col] = pd.to_datetime(_loaded_df[col], errors="coerce")
+            except Exception:
+                pass
+
+    # Build summary
+    cols = [c for c in _loaded_df.columns if c != "_body"]
+    dtypes = {c: str(_loaded_df[c].dtype) for c in cols}
+    dtype_info = ", ".join(f"{c}({dtypes[c]})" for c in cols[:15])
+
+    return (
+        f"Loaded {len(records)} records into df. "
+        f"Columns: {dtype_info}. "
+        f"Query with calculate(): "
+        f"df['col'].sum(), df[df['col'] == 'X'], "
+        f"df[df['_file'].str.contains('keyword')].shape[0], "
+        f"df.sort_values('col').head(), "
+        f"len(df[df['status'] == 'active'])"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +371,7 @@ def dispatch(
         "read": lambda: vm.read(ReadRequest(path=args["path"])),
         "current_date": lambda: vm.context(ContextRequest()),
         "calculate": lambda: _safe_calculate(args.get("expression", "")),
+        "load_records": lambda: _load_records(vm, args.get("path", "")),
         "load_skill": lambda: load_skill(vm, skill_loader, args.get("name", args.get("path", ""))) if skill_loader else "Error: no skill loader",
         "write": lambda: vm.write(WriteRequest(path=args["path"], content=_normalize_frontmatter_gap(args["content"]))),
         "delete": lambda: vm.delete(DeleteRequest(path=args["path"])),
@@ -405,5 +535,24 @@ def dispatch(
             txt = json.dumps(result_dict, indent=2)
 
     txt = truncate_output(txt, config.output_cap, smart=config.smart_truncation_enabled)
+
+    # Auto-load: when listing a folder with structured files, transparently
+    # try load_records() so df is ready for calculate() queries.
+    # Falls back silently if files aren't structured.
+    if name == "list":
+        list_path = args.get("path", "/")
+        entries = result_dict.get("entries", [])
+        structured_count = sum(
+            1 for e in entries
+            if e.get("name", "").endswith((".json", ".md"))
+            and not e.get("name", "").upper().startswith(("README", "AGENTS"))
+        )
+        if structured_count >= 3:
+            try:
+                load_result = _load_records(vm, list_path)
+                if "Loaded" in load_result:
+                    txt += f"\n\n[AUTO] {load_result}"
+            except Exception:
+                pass  # silent fallback — agent reads files normally
 
     return txt

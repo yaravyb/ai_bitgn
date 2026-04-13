@@ -9,6 +9,7 @@ dependencies = [
     "bitgn-api-protocolbuffers-python==34.1.0.1.20260405144405+6b39e6872349",
     "boto3>=1.42.88",
     "litellm>=1.82.3",
+    "pandas>=3.0.2",
     "protobuf>=7.34.1",
 ]
 
