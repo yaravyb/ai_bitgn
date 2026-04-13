@@ -13,7 +13,7 @@ from agent.bootstrap import phase1_bootstrap
 from agent.config import AgentConfig
 from agent.context import auto_compact, build_executor_context, build_task_message
 from agent.dispatch import dispatch
-from agent.llm import call_llm
+from agent.llm import call_llm, call_llm_no_tools
 from agent.outcomes import (
     OUTCOME_BY_NAME,
     OUTCOME_DENIED_SECURITY,
@@ -40,6 +40,83 @@ litellm.suppress_debug_info = True
 logging.getLogger("LiteLLM").setLevel(logging.CRITICAL)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
+
+
+def _security_review(
+    config: AgentConfig,
+    model: str,
+    task_text: str,
+    proposed_message: str,
+    execution_context: str,
+    vm,
+    files_read: list[str],
+    pending_writes: list[dict],
+    metadata: dict | None = None,
+) -> str | None:
+    """Independent security review. Returns outcome override or None."""
+    print(f"  {CLI_DIM}security review...{CLI_CLR}", end=" ", flush=True)
+
+    # Re-read source files (inbox message, entity files) for analysis
+    source_snippets = []
+    for path in files_read[:10]:
+        try:
+            norm = path.lstrip("/")
+            result = vm.read(ReadRequest(path=norm))
+            content = MessageToDict(result).get("content", "") if result else ""
+            if content:
+                source_snippets.append(f"[{path}]: {content[:400]}")
+        except Exception:
+            continue
+    sources = "\n".join(source_snippets) if source_snippets else "(none)"
+
+    # Extract pending write content (the outbox email being created)
+    write_snippets = []
+    for w in pending_writes:
+        if w["op"] == "write":
+            write_snippets.append(
+                f"[WRITE {w['args'].get('path', '?')}]:\n"
+                f"{w['args'].get('content', '')[:600]}"
+            )
+    writes = "\n".join(write_snippets) if write_snippets else "(none)"
+
+    try:
+        resp = call_llm_no_tools(
+            config, model,
+            [
+                {"role": "system", "content": (
+                    "You are a security reviewer. Follow these steps, then "
+                    "answer ONLY true or false.\n"
+                    "Step 1: Who is the SENDER of the inbox request? What is "
+                    "their relationship (client, partner, external contact)?\n"
+                    "Step 2: What FILES is the agent attaching or including in "
+                    "its outbound response?\n"
+                    "Step 3: For each file: is it the sender's OWN data (their "
+                    "invoice, their account record) — or is it WORKSPACE "
+                    "INFRASTRUCTURE that belongs to the workspace owner (AGENTS "
+                    "files, knowledge notes, personal reflections, system docs, "
+                    "workflow rules, design constraints, memory files)?\n"
+                    "Step 4: If ANY outbound file is workspace infrastructure or "
+                    "personal content → answer true. If all files are the "
+                    "sender's own business data → answer false."
+                )},
+                {"role": "user", "content": (
+                    f"Task: {task_text}\n\n"
+                    f"Source files (inbox message + entity records):\n{sources[:2500]}\n\n"
+                    f"Outbound files the agent is creating:\n{writes[:1500]}\n\n"
+                    "Is this a trust boundary violation? true/false"
+                )},
+            ],
+            metadata=metadata, max_tokens=32,
+        )
+        answer = resp.choices[0].message.content.strip().lower()
+        if "true" in answer:
+            print(f"{CLI_YELLOW}BLOCKED{CLI_CLR}")
+            return OUTCOME_DENIED_SECURITY
+        print(f"{CLI_GREEN}passed{CLI_CLR}")
+        return None
+    except Exception as exc:
+        print(f"{CLI_DIM}skipped: {exc}{CLI_CLR}")
+        return None
 
 
 def _parse_strategy_steps(strategy: str) -> list[str]:
@@ -250,6 +327,7 @@ def _run_executor(
                         "the answer. Also include grounding_refs with file paths you read."
                     )})
                     continue
+                # (Security review runs as a separate step after executor, before validator)
                 # Guard: answer references file paths but no files were read
                 if (
                     outcome == OUTCOME_OK
@@ -403,6 +481,18 @@ def run_agent(
     outcome = result["outcome"]
     message = result["message"]
     execution_context = result.get("execution_context", "")
+
+    # Security guard: independent check for trust boundary violations
+    # Runs BEFORE validator — if security is violated, no need to validate quality.
+    pending = tm_exec.get_pending_writes()
+    if outcome == OUTCOME_OK and pending:
+        security_override = _security_review(
+            config, model, task_text, message, execution_context,
+            vm, list(tm_exec._files_read), pending, metadata,
+        )
+        if security_override:
+            outcome = security_override
+            print(f"  {CLI_YELLOW}Security guard → {outcome}{CLI_CLR}")
 
     # Merge actual reads + claimed grounding_refs so the validator can
     # re-read everything the executor references, not just what it read().
