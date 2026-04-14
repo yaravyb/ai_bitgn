@@ -3,7 +3,7 @@ from pathlib import Path
 from unittest.mock import Mock, MagicMock
 
 from agent.config import AgentConfig
-from agent.dispatch import dispatch, truncate_output
+from agent.dispatch import dispatch, truncate_output, _normalize_yaml_quoting, _normalize_write_content
 from skills import SkillLoader
 from tasks import TaskManager
 
@@ -129,3 +129,61 @@ class TestTruncateOutput:
         text = json.dumps(data, indent=2)
         result = truncate_output(text, 200, smart=True)
         assert "[truncated]" in result
+
+
+class TestYamlQuotingNormalizer:
+    def test_no_frontmatter_passthrough(self):
+        content = "Just plain text\nNo YAML here."
+        assert _normalize_yaml_quoting(content) == content
+
+    def test_valid_frontmatter_unchanged(self):
+        content = "---\ntitle: Hello World\ndate: 2026-01-01\n---\nBody text."
+        assert _normalize_yaml_quoting(content) == content
+
+    def test_colon_in_subject_gets_quoted(self):
+        content = "---\nsubject: Re: Invoice request\nto: alice@test.com\n---\nBody."
+        result = _normalize_yaml_quoting(content)
+        assert "yaml" not in result.lower() or "---" in result  # shouldn't error
+        # The fixed content should parse as valid YAML
+        import yaml
+        end = result.find("\n---", 3)
+        fm = result[4:end]
+        parsed = yaml.safe_load(fm)
+        assert parsed["subject"] == "Re: Invoice request"
+        assert parsed["to"] == "alice@test.com"
+
+    def test_multiple_colons_in_value(self):
+        content = "---\nsubject: Fwd: Re: Meeting notes: Q3\nfrom: bob@test.com\n---\nBody."
+        result = _normalize_yaml_quoting(content)
+        import yaml
+        end = result.find("\n---", 3)
+        parsed = yaml.safe_load(result[4:end])
+        assert "Meeting notes" in parsed["subject"]
+
+    def test_already_quoted_values_unchanged(self):
+        content = '---\nsubject: "Re: Already quoted"\nto: alice@test.com\n---\nBody.'
+        result = _normalize_yaml_quoting(content)
+        import yaml
+        end = result.find("\n---", 3)
+        parsed = yaml.safe_load(result[4:end])
+        assert parsed["subject"] == "Re: Already quoted"
+
+    def test_inner_double_quotes_escaped(self):
+        content = '---\nsubject: Re: He said "hello"\nto: x@y.com\n---\nBody.'
+        result = _normalize_yaml_quoting(content)
+        import yaml
+        end = result.find("\n---", 3)
+        parsed = yaml.safe_load(result[4:end])
+        assert 'He said "hello"' in parsed["subject"]
+
+    def test_chained_normalizer(self):
+        # Gap + quoting combined
+        content = "---\nsubject: Re: Test\nto: a@b.com\n---\n\n\nBody."
+        result = _normalize_write_content(content)
+        # Gap should be normalized
+        assert "\n---\n\n\n" not in result
+        # YAML should be valid
+        import yaml
+        end = result.find("\n---", 3)
+        parsed = yaml.safe_load(result[4:end])
+        assert parsed["subject"] == "Re: Test"

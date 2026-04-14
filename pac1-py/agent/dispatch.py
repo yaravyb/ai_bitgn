@@ -2,6 +2,8 @@ import json
 import logging
 import re
 
+import yaml as _yaml
+
 # Frontmatter gap normalizer: strip extra blank lines between closing --- and body.
 # LLMs often write "---\n\n# Heading" but strict parsers expect "---\n# Heading".
 _FRONTMATTER_GAP_RE = re.compile(r"^(---\n.*?\n---)\n{2,}", re.DOTALL)
@@ -10,6 +12,75 @@ _FRONTMATTER_GAP_RE = re.compile(r"^(---\n.*?\n---)\n{2,}", re.DOTALL)
 def _normalize_frontmatter_gap(content: str) -> str:
     """Ensure exactly one newline between YAML frontmatter closing --- and body."""
     return _FRONTMATTER_GAP_RE.sub(r"\1\n", content)
+
+
+def _normalize_yaml_quoting(content: str) -> str:
+    """Auto-quote YAML frontmatter values that contain colons.
+
+    LLMs write things like ``subject: Re: Invoice`` which breaks YAML
+    because the second colon starts a new mapping.  This function parses
+    the frontmatter block, and if it fails, rewrites each value line by
+    wrapping the value portion in double quotes (escaping inner quotes).
+    """
+    if not content.startswith("---\n"):
+        return content
+    end = content.find("\n---", 3)
+    if end == -1:
+        return content
+
+    fm_block = content[4:end]
+    rest = content[end:]  # includes the closing "\n---..." and body
+
+    # Fast path: if the frontmatter already parses, nothing to fix
+    try:
+        _yaml.safe_load(fm_block)
+        return content
+    except _yaml.YAMLError:
+        pass
+
+    # Rewrite each line: quote values that contain unquoted colons
+    fixed_lines = []
+    for line in fm_block.split("\n"):
+        # Match "key: value" lines (not continuation/list lines)
+        m = re.match(r"^(\s*[A-Za-z_][\w-]*\s*:\s*)(.+)$", line)
+        if m:
+            key_part, val = m.group(1), m.group(2)
+            # Already quoted → leave alone
+            if (val.startswith('"') and val.endswith('"')) or \
+               (val.startswith("'") and val.endswith("'")):
+                fixed_lines.append(line)
+            elif ":" in val:
+                # Escape inner double quotes, then wrap in double quotes
+                escaped = val.replace("\\", "\\\\").replace('"', '\\"')
+                fixed_lines.append(f'{key_part}"{escaped}"')
+            else:
+                fixed_lines.append(line)
+        else:
+            fixed_lines.append(line)
+
+    new_fm = "\n".join(fixed_lines)
+    # Verify the fix actually works
+    try:
+        _yaml.safe_load(new_fm)
+    except _yaml.YAMLError:
+        return content  # give up — don't make it worse
+
+    return "---\n" + new_fm + rest
+
+
+def _normalize_write_content(content: str) -> str:
+    """Chain all write normalizers and warn if YAML is still broken."""
+    content = _normalize_frontmatter_gap(content)
+    content = _normalize_yaml_quoting(content)
+    # Post-normalization check: log warning if frontmatter is still invalid
+    if content.startswith("---\n"):
+        end = content.find("\n---", 3)
+        if end != -1:
+            try:
+                _yaml.safe_load(content[4:end])
+            except _yaml.YAMLError as exc:
+                log.warning("Write normalizer: YAML frontmatter still invalid after fix: %s", exc)
+    return content
 
 from bitgn.vm.pcm_connect import PcmRuntimeClientSync
 from bitgn.vm.pcm_pb2 import (
@@ -373,7 +444,7 @@ def dispatch(
         "calculate": lambda: _safe_calculate(args.get("expression", "")),
         "load_records": lambda: _load_records(vm, args.get("path", "")),
         "load_skill": lambda: load_skill(vm, skill_loader, args.get("name", args.get("path", ""))) if skill_loader else "Error: no skill loader",
-        "write": lambda: vm.write(WriteRequest(path=args["path"], content=_normalize_frontmatter_gap(args["content"]))),
+        "write": lambda: vm.write(WriteRequest(path=args["path"], content=_normalize_write_content(args["content"]))),
         "delete": lambda: vm.delete(DeleteRequest(path=args["path"])),
         "mkdir": lambda: vm.mk_dir(MkDirRequest(path=args["path"])),
         "move": lambda: vm.move(MoveRequest(from_name=args["from_name"], to_name=args["to_name"])),
