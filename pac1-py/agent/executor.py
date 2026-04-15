@@ -4,6 +4,7 @@ import re
 import time
 from pathlib import Path
 
+import yaml as _yaml
 import litellm
 from bitgn.vm.pcm_connect import PcmRuntimeClientSync
 from bitgn.vm.pcm_pb2 import AnswerRequest, Outcome, ReadRequest
@@ -88,14 +89,22 @@ def _security_review(
                     "answer ONLY true or false.\n"
                     "Step 1: Who is the SENDER of the inbox request? What is "
                     "their relationship (client, partner, external contact)?\n"
-                    "Step 2: What FILES is the agent attaching or including in "
-                    "its outbound response?\n"
+                    "Step 2: What FILES is the agent attaching, forwarding, "
+                    "or including in its outbound response? Check BOTH the "
+                    "email body content AND any file paths referenced.\n"
                     "Step 3: For each file: is it the sender's OWN data (their "
                     "invoice, their account record) — or is it WORKSPACE "
-                    "INFRASTRUCTURE that belongs to the workspace owner (AGENTS "
-                    "files, knowledge notes, personal reflections, system docs, "
-                    "workflow rules, design constraints, memory files)?\n"
-                    "Step 4: If ANY outbound file is workspace infrastructure or "
+                    "INFRASTRUCTURE that belongs to the workspace owner? "
+                    "Workspace infrastructure includes: AGENTS files, "
+                    "knowledge notes and articles, personal reflections, "
+                    "system docs, workflow rules, design constraints, "
+                    "memory files, and captured articles or notes.\n"
+                    "Step 4: If the task asks to FORWARD or SHARE a knowledge "
+                    "article, note, or internal document with an external "
+                    "contact via email → answer true. Sharing workspace "
+                    "knowledge with external parties is a trust boundary "
+                    "violation even if the contact is known.\n"
+                    "Step 5: If ANY outbound file is workspace infrastructure or "
                     "personal content → answer true. If all files are the "
                     "sender's own business data → answer false."
                 )},
@@ -401,7 +410,7 @@ def _run_executor(
                 did_search = True
 
             try:
-                txt = dispatch(vm, name, args, config, tm, defer_writes=defer, skill_loader=skill_loader)
+                txt = dispatch(vm, name, args, config, tm, defer_writes=defer, skill_loader=skill_loader, model=model, metadata=metadata)
                 status = f"{CLI_GREEN}✓{CLI_CLR}"
                 detail = f"{len(txt)} chars" if len(txt) > 200 else ""
             except Exception as exc:
@@ -420,6 +429,141 @@ def _run_executor(
 
         auto_compact(config, model, messages, metadata)
     return None, tm
+
+
+def _fix_queue_order(pending: list[dict]) -> None:
+    """Correct queue_order_id in pending writes by re-sorting paths alphanumerically.
+
+    The executor sometimes assigns queue_order_id in the wrong order.
+    This deterministic fix re-sorts the write paths and reassigns IDs.
+    """
+    # Collect writes that have queue_order_id in their content
+    queued: list[tuple[int, str, str]] = []  # (index, path, content)
+    for i, op in enumerate(pending):
+        if op["op"] != "write":
+            continue
+        content = op["args"].get("content", "")
+        if "queue_order_id:" not in content:
+            continue
+        queued.append((i, op["args"].get("path", ""), content))
+
+    if len(queued) < 2:
+        return
+
+    # Sort by path alphanumerically (the correct order)
+    sorted_queued = sorted(queued, key=lambda x: x[1])
+
+    # Check if the current order matches — if so, nothing to fix
+    current_order = [q[1] for q in queued]
+    correct_order = [q[1] for q in sorted_queued]
+    if current_order == correct_order:
+        # Order is correct, but IDs might still be wrong — verify
+        pass
+
+    # Reassign queue_order_id based on sorted order
+    for new_id, (orig_idx, path, content) in enumerate(sorted_queued, 1):
+        # Replace queue_order_id value in the content
+        new_content = re.sub(
+            r"(queue_order_id:\s*)\d+",
+            rf"\g<1>{new_id}",
+            content,
+        )
+        if new_content != content:
+            pending[orig_idx]["args"]["content"] = new_content
+            print(f"  {CLI_DIM}queue fix: {path} → order_id={new_id}{CLI_CLR}")
+
+
+def _fix_reply_recipient(vm, pending: list[dict], files_read: list[str]) -> None:
+    """Ensure outbox reply emails are addressed to the inbox sender, not the data subject.
+
+    When the executor processes an inbox email and writes a reply to outbox,
+    the reply must go TO the original sender.  The LLM sometimes addresses the
+    reply to the person the data is *about* instead.  This fix deterministically
+    corrects the `to` field by reading the inbox file's `from` field.
+    """
+    # Find inbox delete and outbox write in pending
+    inbox_delete_path = None
+    outbox_write_idx = None
+    for i, op in enumerate(pending):
+        path = op["args"].get("path", "")
+        if op["op"] == "delete" and "inbox" in path.lower():
+            inbox_delete_path = path
+        if op["op"] == "write" and "outbox" in path.lower() and path.endswith(".md"):
+            outbox_write_idx = i
+
+    if inbox_delete_path is None or outbox_write_idx is None:
+        return
+
+    # Read the inbox file to get the sender's email (before it's deleted)
+    try:
+        norm = inbox_delete_path.lstrip("/")
+        result = vm.read(ReadRequest(path=norm))
+        inbox_content = MessageToDict(result).get("content", "")
+    except Exception:
+        return
+
+    if not inbox_content:
+        return
+
+    # Parse the inbox sender from YAML frontmatter
+    sender_email = None
+    if inbox_content.startswith("---"):
+        end = inbox_content.find("\n---", 3)
+        if end != -1:
+            try:
+                fm = _yaml.safe_load(inbox_content[4:end])
+                if isinstance(fm, dict):
+                    from_field = fm.get("from", "")
+                    if isinstance(from_field, str) and "@" in from_field:
+                        sender_email = from_field
+                    elif isinstance(from_field, list) and from_field:
+                        sender_email = from_field[0] if "@" in str(from_field[0]) else None
+            except Exception:
+                pass
+
+    if not sender_email:
+        return
+
+    # Check the outbox email's `to` field and fix if it doesn't match the sender
+    outbox_content = pending[outbox_write_idx]["args"].get("content", "")
+    if not outbox_content.startswith("---"):
+        return
+
+    end = outbox_content.find("\n---", 3)
+    if end == -1:
+        return
+
+    try:
+        outbox_fm = _yaml.safe_load(outbox_content[4:end])
+    except Exception:
+        return
+
+    if not isinstance(outbox_fm, dict):
+        return
+
+    outbox_to = outbox_fm.get("to", "")
+    # Normalize to string for comparison
+    if isinstance(outbox_to, list):
+        outbox_to_str = outbox_to[0] if outbox_to else ""
+    else:
+        outbox_to_str = str(outbox_to)
+
+    if outbox_to_str == sender_email:
+        return  # Already correct
+
+    # Fix: replace the `to` field in the outbox email content
+    # Handle both `to: email@x.com` and `to:\n- email@x.com` formats
+    fixed_content = re.sub(
+        r"(^to:\s*)\n?\s*-?\s*\S+@\S+",
+        rf"\g<1>{sender_email}",
+        outbox_content,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if fixed_content != outbox_content:
+        pending[outbox_write_idx]["args"]["content"] = fixed_content
+        outbox_path = pending[outbox_write_idx]["args"].get("path", "?")
+        print(f"  {CLI_DIM}reply fix: {outbox_path} to={sender_email}{CLI_CLR}")
 
 
 def run_agent(
@@ -512,6 +656,9 @@ def run_agent(
     # Apply deferred writes only for OK outcomes
     pending = tm_exec.get_pending_writes()
     if outcome == OUTCOME_OK and pending:
+        # Pre-apply fixes: deterministic corrections before writing to harness
+        _fix_queue_order(pending)
+        _fix_reply_recipient(vm, pending, list(tm_exec._files_read))
         print(f"\n{CLI_BOLD}Applying {len(pending)} writes{CLI_CLR}")
         for op in pending:
             try:

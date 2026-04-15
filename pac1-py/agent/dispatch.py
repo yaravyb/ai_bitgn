@@ -68,10 +68,119 @@ def _normalize_yaml_quoting(content: str) -> str:
     return "---\n" + new_fm + rest
 
 
+def _normalize_ascii_tables(content: str) -> str:
+    """Re-format ASCII tables so column widths are consistent.
+
+    LLMs generate tables where header and data rows have different column
+    widths.  This parser finds ``+---+`` style tables inside ```text
+    fenced blocks, parses them into grids, and re-renders with uniform
+    widths computed from the longest cell value in each column.
+    """
+    if "+--" not in content:
+        return content
+
+    # Find all ```text ... ``` blocks that contain tables
+    parts = re.split(r"(```text\n.*?```)", content, flags=re.DOTALL)
+    changed = False
+    for i, part in enumerate(parts):
+        if not part.startswith("```text\n") or "+--" not in part:
+            continue
+        inner = part[len("```text\n"):-len("```")]
+        fixed = _reformat_table_block(inner)
+        if fixed != inner:
+            parts[i] = "```text\n" + fixed + "```"
+            changed = True
+
+    return "".join(parts) if changed else content
+
+
+def _reformat_table_block(block: str) -> str:
+    """Re-format a single block that may contain one or more ASCII tables."""
+    lines = block.split("\n")
+    result: list[str] = []
+    i = 0
+    while i < len(lines):
+        # Detect table start: a separator line like +---+---+
+        if re.match(r"^\+[-+]+\+$", lines[i].strip()):
+            table_lines: list[str] = []
+            while i < len(lines) and (
+                re.match(r"^\+[-+]+\+$", lines[i].strip()) or
+                re.match(r"^\|.*\|$", lines[i].strip())
+            ):
+                table_lines.append(lines[i].strip())
+                i += 1
+            reformatted = _reformat_single_table(table_lines)
+            result.extend(reformatted)
+        else:
+            result.append(lines[i])
+            i += 1
+    return "\n".join(result)
+
+
+def _reformat_single_table(table_lines: list[str]) -> list[str]:
+    """Parse and re-render a single ASCII table with consistent column widths."""
+    # Parse all data rows to find cell values
+    rows: list[list[str]] = []
+    separator_positions: list[int] = []  # which line indices are separators
+
+    for idx, line in enumerate(table_lines):
+        if re.match(r"^\+[-+]+\+$", line):
+            separator_positions.append(idx)
+            rows.append([])  # placeholder for separator
+        elif re.match(r"^\|.*\|$", line):
+            # Split by | and strip whitespace
+            cells = [c.strip() for c in line.split("|")[1:-1]]
+            rows.append(cells)
+        else:
+            rows.append([line])  # unknown line, keep as-is
+
+    # Find max number of columns
+    data_rows = [r for i, r in enumerate(rows) if i not in separator_positions and len(r) > 1]
+    if not data_rows:
+        return table_lines
+
+    n_cols = max(len(r) for r in data_rows)
+
+    # Pad rows with fewer columns
+    for r in data_rows:
+        while len(r) < n_cols:
+            r.append("")
+
+    # Compute column widths (max cell width per column, minimum 1)
+    col_widths = [1] * n_cols
+    for r in data_rows:
+        for j, cell in enumerate(r):
+            if j < n_cols:
+                col_widths[j] = max(col_widths[j], len(cell))
+
+    # Re-render
+    def make_separator() -> str:
+        return "+" + "+".join("-" * (w + 2) for w in col_widths) + "+"
+
+    def make_data_row(cells: list[str]) -> str:
+        parts = []
+        for j, cell in enumerate(cells):
+            w = col_widths[j] if j < n_cols else len(cell)
+            parts.append(" " + cell.ljust(w) + " ")
+        return "|" + "|".join(parts) + "|"
+
+    output: list[str] = []
+    for idx, row in enumerate(rows):
+        if idx in separator_positions:
+            output.append(make_separator())
+        elif len(row) > 1:
+            output.append(make_data_row(row))
+        elif len(row) == 1:
+            output.append(row[0])
+
+    return output
+
+
 def _normalize_write_content(content: str) -> str:
     """Chain all write normalizers and warn if YAML is still broken."""
     content = _normalize_frontmatter_gap(content)
     content = _normalize_yaml_quoting(content)
+    content = _normalize_ascii_tables(content)
     # Post-normalization check: log warning if frontmatter is still invalid
     if content.startswith("---\n"):
         end = content.find("\n---", 3)
@@ -227,10 +336,24 @@ def _days_between(iso_start: str, iso_end: str) -> int:
 
 
 import pandas as pd
+from dateutil.parser import parse as _dateutil_parse
 
 # Shared state for loaded data
 _loaded_df: pd.DataFrame | None = None
 _loaded_records: list[dict] = []
+
+def _text_match(text: str, keywords: str) -> bool:
+    """Check if ALL keywords appear in text (case-insensitive, word-level).
+
+    Splits keywords on whitespace, checks each word appears anywhere
+    in the text.  Useful for fuzzy matching item descriptions in records.
+    Example: text_match('2 TB SATA SSD drive', 'SATA SSD') → True
+    """
+    if not isinstance(text, str) or not isinstance(keywords, str):
+        return False
+    text_lower = text.lower()
+    return all(w.lower() in text_lower for w in keywords.split())
+
 
 # Restricted namespace for calculate() — no builtins, no imports
 _CALC_NAMESPACE: dict = {
@@ -244,6 +367,10 @@ _CALC_NAMESPACE: dict = {
     # Date helpers
     "date_offset": _date_offset,
     "days_between": _days_between,
+    # Text helpers
+    "text_match": _text_match,
+    # Date parsing (flexible — handles many formats)
+    "parse_date": lambda s: _dateutil_parse(s, fuzzy=True).strftime("%Y-%m-%d"),
     # Pandas
     "pd": pd,
 }
@@ -295,11 +422,136 @@ def _parse_yaml_frontmatter(text: str) -> dict | None:
         return None
 
 
-def _load_records(vm, path: str) -> str:
+def _parse_ascii_table(text: str) -> dict | None:
+    """Extract key-value pairs from an ASCII table in a markdown file.
+
+    Parses tables like:
+        +----------------+-----------------------------+
+        | field          | value                       |
+        +----------------+-----------------------------+
+        | record_type    | bill                        |
+        | purchased_on   | 2026-02-07                  |
+        +----------------+-----------------------------+
+
+    Returns a dict of {field: value} pairs, or None if no parseable table.
+    """
+    # Find ASCII table in the content
+    lines = text.split("\n")
+    record: dict = {}
+    in_table = False
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r"^\+[-+]+\+$", stripped):
+            in_table = True
+            continue
+        if in_table and stripped.startswith("|") and stripped.endswith("|"):
+            cells = [c.strip() for c in stripped.split("|")[1:-1]]
+            if len(cells) == 2:
+                key, val = cells[0], cells[1]
+                # Skip header row and empty values
+                if key and val and key != "field" and val != "value":
+                    record[key] = val
+        elif in_table and not stripped.startswith("|") and not re.match(r"^\+[-+]+\+$", stripped):
+            # End of table block — but might be more tables
+            if record and len(record) >= 3:
+                break  # Got enough from the main fields table
+            in_table = False
+
+    return record if len(record) >= 3 else None
+
+
+# Cache for LLM-generated parsers: folder_path → callable
+_generated_parsers: dict = {}
+
+
+def _generate_parser_from_sample(
+    sample_content: str, config: "AgentConfig", model: str, metadata: dict | None,
+):
+    """Use a single LLM call to generate a Python extraction function from sample content.
+
+    Returns a callable(content: str) -> dict or None on failure.
+    The generated code runs in a restricted namespace (same security model
+    as _safe_calculate — no real builtins, agent-controlled input only).
+    """
+    from agent.llm import call_llm_no_tools
+
+    prompt = (
+        "Analyze this file content and write a Python function body that "
+        "extracts all structured key-value fields into a dictionary.\n\n"
+        "RULES:\n"
+        "- The function signature is: def extract(content: str) -> dict\n"
+        "- Return a dict of {field_name: value} with string values\n"
+        "- Extract ALL fields you find (record_type, dates, amounts, names, etc.)\n"
+        "- Also add a '_body' key with the full content (max 800 chars)\n"
+        "- Only use standard Python (re, str methods). No imports needed.\n"
+        "- Return empty dict {} if parsing fails\n"
+        "- Output ONLY the function body inside ```python``` markers, nothing else\n\n"
+        f"SAMPLE FILE:\n```\n{sample_content[:2000]}\n```"
+    )
+
+    try:
+        resp = call_llm_no_tools(
+            config, model,
+            [{"role": "user", "content": prompt}],
+            metadata=metadata, max_tokens=1024,
+        )
+        code = resp.choices[0].message.content.strip()
+        # Extract code from markdown fence
+        if "```python" in code:
+            code = code.split("```python", 1)[1].split("```", 1)[0].strip()
+        elif "```" in code:
+            code = code.split("```", 1)[1].split("```", 1)[0].strip()
+
+        # Wrap in function definition if not already
+        if not code.startswith("def extract"):
+            code = "def extract(content):\n" + "\n".join(
+                f"    {line}" if line.strip() else line for line in code.split("\n")
+            )
+
+        # Compile and extract the function in a restricted namespace
+        # Security: restricted builtins (same model as _safe_calculate),
+        # code is from our own LLM call, not external user input
+        ns: dict = {
+            "re": re,
+            "__builtins__": {
+                "dict": dict, "str": str, "len": len, "list": list,
+                "int": int, "float": float, "enumerate": enumerate,
+                "range": range, "True": True, "False": False, "None": None,
+                "isinstance": isinstance, "ValueError": ValueError,
+                "Exception": Exception, "min": min, "max": max, "zip": zip,
+            },
+        }
+        compiled = compile(code, "<llm-parser>", "exec")
+        # Restricted exec — same security model as calculate()'s eval()
+        _run_compiled(compiled, ns)
+        fn = ns.get("extract")
+        if fn is None:
+            return None
+
+        # Validate: the function should return a dict on the sample
+        test_result = fn(sample_content)
+        if isinstance(test_result, dict) and len(test_result) >= 2:
+            log.info("Generated parser OK: %d fields from sample", len(test_result))
+            return fn
+        return None
+    except Exception as exc:
+        log.warning("Parser generation failed: %s", exc)
+        return None
+
+
+def _run_compiled(compiled, ns):
+    """Execute compiled code in namespace. Isolated for security audit."""
+    exec(compiled, ns)  # noqa: S102 — restricted namespace, LLM-generated parser only
+
+
+def _load_records(vm, path: str, config: "AgentConfig | None" = None, model: str = "", metadata: dict | None = None) -> str:
     """Load all structured files from a folder into a pandas DataFrame.
 
-    Parses JSON files and markdown files with YAML frontmatter.
-    Validates structural consistency, infers types, builds df.
+    Parsing strategy (three phases):
+    1. Try JSON, YAML frontmatter, ASCII table (fast, deterministic)
+    2. If many files unparsed AND model available, generate a Python parser
+       via single LLM call and apply it (adaptive, one-shot)
+    3. Build DataFrame, auto-detect types, extract dates from filenames
     """
     global _loaded_records, _loaded_df
 
@@ -312,24 +564,26 @@ def _load_records(vm, path: str) -> str:
         return f"Error listing {path}: {exc}"
 
     # Filter to parseable files
-    files = [e for e in entries if e.endswith((".json", ".md")) and not e.upper().startswith(("README", "AGENTS"))]
+    files = [e for e in entries if e.endswith((".json", ".md", ".txt")) and not e.upper().startswith(("README", "AGENTS"))]
     if not files:
         return f"No structured files found in {path}"
 
-    # Parse all files
-    records = []
-    parse_errors = 0
+    # Phase 1: Read all file contents upfront
+    file_contents: dict[str, str] = {}
     for fname in files:
         fpath = f"{path.strip('/')}/{fname}"
         try:
             result = vm.read(ReadRequest(path=fpath))
             content = MessageToDict(result).get("content", "")
-            if not content:
-                continue
+            if content:
+                file_contents[fname] = content
         except Exception:
-            parse_errors += 1
-            continue
+            pass
 
+    # Phase 2: Try static parsers (fast, deterministic)
+    records = []
+    unparsed: dict[str, str] = {}
+    for fname, content in file_contents.items():
         record = None
         if fname.endswith(".json"):
             try:
@@ -337,23 +591,63 @@ def _load_records(vm, path: str) -> str:
                 if not isinstance(record, dict):
                     record = None
             except json.JSONDecodeError:
-                parse_errors += 1
-        elif fname.endswith(".md"):
+                pass
+        elif fname.endswith((".md", ".txt")):
             record = _parse_yaml_frontmatter(content)
             if record is not None:
-                # Capture the markdown body for content queries
                 body_start = content.find("\n---", 3)
                 if body_start != -1:
                     body = content[body_start + 4:].strip()
                     if body:
                         record["_body"] = body[:800]
+            else:
+                record = _parse_ascii_table(content)
+                if record is not None:
+                    record["_body"] = content[:800]
 
         if record and isinstance(record, dict):
             record["_file"] = fname
+            try:
+                parsed_dt = _dateutil_parse(fname, fuzzy=True)
+                record["_date_from_file"] = parsed_dt.strftime("%Y-%m-%d")
+            except (ValueError, OverflowError):
+                pass
             records.append(record)
+        else:
+            unparsed[fname] = content
+
+    # Phase 3: LLM-generated parser for remaining unparsed files
+    norm_path = path.strip("/")
+    if unparsed and model and config:
+        parser_fn = _generated_parsers.get(norm_path)
+        if parser_fn is None:
+            sample_fname = next(iter(unparsed))
+            sample = unparsed[sample_fname]
+            log.info("Generating parser for %s (%d unparsed files, sample: %s)",
+                     path, len(unparsed), sample_fname)
+            parser_fn = _generate_parser_from_sample(sample, config, model, metadata)
+            if parser_fn:
+                _generated_parsers[norm_path] = parser_fn
+
+        if parser_fn:
+            for fname, content in unparsed.items():
+                try:
+                    record = parser_fn(content)
+                    if record and isinstance(record, dict) and len(record) >= 2:
+                        record["_file"] = fname
+                        if "_body" not in record:
+                            record["_body"] = content[:800]
+                        try:
+                            parsed_dt = _dateutil_parse(fname, fuzzy=True)
+                            record["_date_from_file"] = parsed_dt.strftime("%Y-%m-%d")
+                        except (ValueError, OverflowError):
+                            pass
+                        records.append(record)
+                except Exception:
+                    pass
 
     if not records:
-        return f"No parseable records in {path} ({parse_errors} parse errors)"
+        return f"No parseable records in {path} ({len(unparsed)} unparsed files)"
 
     # Validate structural consistency
     sample = records[:min(5, len(records))]
@@ -398,7 +692,10 @@ def _load_records(vm, path: str) -> str:
         f"df['col'].sum(), df[df['col'] == 'X'], "
         f"df[df['_file'].str.contains('keyword')].shape[0], "
         f"df.sort_values('col').head(), "
-        f"len(df[df['status'] == 'active'])"
+        f"len(df[df['status'] == 'active']). "
+        f"Helpers: text_match(text, keywords) for fuzzy item search "
+        f"(all keywords must appear, case-insensitive); "
+        f"_date_from_file column has date extracted from filename"
     )
 
 
@@ -415,6 +712,8 @@ def dispatch(
     tm: TaskManager | None = None,
     defer_writes: bool = False,
     skill_loader: SkillLoader | None = None,
+    model: str = "",
+    metadata: dict | None = None,
 ) -> str:
     """Execute a tool call against the PCM runtime. Returns result string.
 
@@ -442,7 +741,7 @@ def dispatch(
         "read": lambda: vm.read(ReadRequest(path=args["path"])),
         "current_date": lambda: vm.context(ContextRequest()),
         "calculate": lambda: _safe_calculate(args.get("expression", "")),
-        "load_records": lambda: _load_records(vm, args.get("path", "")),
+        "load_records": lambda: _load_records(vm, args.get("path", ""), config=config, model=model, metadata=metadata),
         "load_skill": lambda: load_skill(vm, skill_loader, args.get("name", args.get("path", ""))) if skill_loader else "Error: no skill loader",
         "write": lambda: vm.write(WriteRequest(path=args["path"], content=_normalize_write_content(args["content"]))),
         "delete": lambda: vm.delete(DeleteRequest(path=args["path"])),

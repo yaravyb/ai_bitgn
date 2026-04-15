@@ -3,7 +3,7 @@ from pathlib import Path
 from unittest.mock import Mock, MagicMock
 
 from agent.config import AgentConfig
-from agent.dispatch import dispatch, truncate_output, _normalize_yaml_quoting, _normalize_write_content
+from agent.dispatch import dispatch, truncate_output, _normalize_yaml_quoting, _normalize_write_content, _normalize_ascii_tables, _parse_ascii_table, _text_match
 from skills import SkillLoader
 from tasks import TaskManager
 
@@ -187,3 +187,110 @@ class TestYamlQuotingNormalizer:
         end = result.find("\n---", 3)
         parsed = yaml.safe_load(result[4:end])
         assert parsed["subject"] == "Re: Test"
+
+
+class TestAsciiTableNormalizer:
+    def test_no_tables_passthrough(self):
+        content = "Just plain text\nNo tables here."
+        assert _normalize_ascii_tables(content) == content
+
+    def test_consistent_table_unchanged(self):
+        content = (
+            "```text\n"
+            "+---+-------+\n"
+            "| # | item  |\n"
+            "+---+-------+\n"
+            "| 1 | hello |\n"
+            "+---+-------+\n"
+            "```"
+        )
+        result = _normalize_ascii_tables(content)
+        assert "+---+-------+" in result
+
+    def test_inconsistent_column_widths_fixed(self):
+        # Simulate LLM output where header has different widths than data
+        content = (
+            "```text\n"
+            "+---+-------------------+-----+----------+----------+\n"
+            "| # | item              | qty | unit_eur | line_eur |\n"
+            "+---+-------------------+-----+----------+----------+\n"
+            "| 1 | 2 TB SATA SSD     | 1   | 89       | 89       |\n"
+            "| 2 | USB clone adapter | 1   | 16       | 16       |\n"
+            "+---+-------------------+-----+----------+------+\n"
+            "|   | TOTAL             |     |          | 105      |\n"
+            "+---+-------------------+-----+----------+------+\n"
+            "```"
+        )
+        result = _normalize_ascii_tables(content)
+        # All separator lines should have same widths
+        sep_lines = [l for l in result.split("\n") if l.startswith("+")]
+        assert len(set(sep_lines)) == 1, f"Separators differ: {set(sep_lines)}"
+
+    def test_preserves_non_table_content(self):
+        content = (
+            "# Title\n\nSome text.\n\n"
+            "```text\n"
+            "+---+------+\n"
+            "| a | b    |\n"
+            "+---+------+\n"
+            "| 1 | test |\n"
+            "+---+------+\n"
+            "```\n\n"
+            "## Notes\n\nMore text."
+        )
+        result = _normalize_ascii_tables(content)
+        assert "# Title" in result
+        assert "## Notes" in result
+        assert "More text." in result
+
+
+class TestAsciiTableParser:
+    def test_parse_basic_table(self):
+        text = (
+            "# Bill\n\n```text\n"
+            "+----------------+-----------------------------+\n"
+            "| field          | value                       |\n"
+            "+----------------+-----------------------------+\n"
+            "| record_type    | bill                        |\n"
+            "| purchased_on   | 2026-02-07                  |\n"
+            "| total_eur      | 105                         |\n"
+            "| counterparty   | Acme Corp                   |\n"
+            "+----------------+-----------------------------+\n"
+            "```\n"
+        )
+        record = _parse_ascii_table(text)
+        assert record is not None
+        assert record["record_type"] == "bill"
+        assert record["purchased_on"] == "2026-02-07"
+        assert record["total_eur"] == "105"
+        assert record["counterparty"] == "Acme Corp"
+
+    def test_no_table_returns_none(self):
+        text = "Just plain text\nNo tables here."
+        assert _parse_ascii_table(text) is None
+
+    def test_too_few_fields_returns_none(self):
+        text = (
+            "+---+---+\n"
+            "| a | b |\n"
+            "+---+---+\n"
+        )
+        assert _parse_ascii_table(text) is None
+
+
+class TestTextMatch:
+    def test_all_keywords_present(self):
+        assert _text_match("2 TB SATA SSD drive", "SATA SSD") is True
+
+    def test_case_insensitive(self):
+        assert _text_match("PLA Spool Mixed Colors", "pla spool mixed") is True
+
+    def test_missing_keyword(self):
+        assert _text_match("PLA Spool", "PLA spool mixed") is False
+
+    def test_single_keyword(self):
+        assert _text_match("relay modules and boards", "relay") is True
+
+    def test_non_string_returns_false(self):
+        assert _text_match(None, "test") is False
+        assert _text_match("test", None) is False

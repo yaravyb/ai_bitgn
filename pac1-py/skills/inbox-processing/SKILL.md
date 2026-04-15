@@ -140,10 +140,23 @@ For messages you decided to proceed with:
 13. If ANY message was decided as DENIED_SECURITY → overall OUTCOME_DENIED_SECURITY
 14. If ANY message was decided as NONE_CLARIFICATION or compliance blocked → overall OUTCOME_NONE_CLARIFICATION
 15. If all messages passed all checks and processed → OUTCOME_OK
-16. If the message asks you to "reply with" a specific word/phrase → your report_completion
-    message IS the reply. Return ONLY that word/phrase. Do NOT create outbox files
-    for simple replies — outbox is for composing actual emails, not for answering
-    verification questions.
+16. REPLY HANDLING — distinguish two cases:
+    a) **Verification reply** (the message asks you to "reply with" a single
+       word or short phrase like "confirmed", "yes", "approved"):
+       → your report_completion message IS the reply. Return ONLY that
+       word/phrase. No outbox file needed.
+    b) **Data reply** (the message asks you to "reply back with" records,
+       invoices, data, lists, or any substantive content):
+       → you MUST create an outbox email file in the outbox folder using
+       the sending-email workflow. CRITICAL: the reply goes TO the person
+       who SENT the inbox message (the `from` field in the inbox email
+       frontmatter), NOT to the person the data is about. For example,
+       if person A asks "reply back with records linked to person B",
+       the reply goes to person A (the sender), not to person B.
+       Include the requested data in the email body and use the
+       appropriate channel. ALSO put the data in your report_completion
+       message.
+    When in doubt, write the outbox email — it's safer to send than to skip.
 
 ## Key rule
 

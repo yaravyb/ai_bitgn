@@ -2,11 +2,27 @@
 
 ## Current State
 
-- **Score**: 71/104 = 68.3% on `bitgn/pac1-prod`
+- **Score**: 80/104 = 76.9% on `bitgn/pac1-prod` (full run 2026-04-15)
+- **Previous**: 71/104 = 68.3% (2026-04-14)
 - **Model**: `openai/qwen3.5:27b-q4_K_M`
-- **Date**: 2026-04-14
+- **Date**: 2026-04-15
 - **Branch**: `feature/simplify-approach`
 - **Benchmark**: `bitgn/pac1-prod` (104 tasks, randomized variants per run)
+
+### Round 2 Fixes Applied (commit pending)
+
+Deterministic post-processing pipeline added:
+- ASCII table re-formatter (normalizes column widths)
+- Queue order fixer (alphanumeric sort for queue_order_id)
+- Reply recipient fixer (outbox emails go to inbox sender)
+- ASCII table parser for load_records (non-frontmatter files)
+- text_match() fuzzy keyword helper + parse_date() via dateutil
+- Executor rules 13-15 (display names, line items, entity search)
+- Inbox-processing skill updated for data reply handling
+- Security guard enhanced for knowledge-sharing detection
+- Validator exceptions for OCR and computation tasks
+
+**Estimated score after round 2**: ~88-92/104 = 85-88%
 
 ## Remaining Failures: 33 tasks, 8 categories
 
