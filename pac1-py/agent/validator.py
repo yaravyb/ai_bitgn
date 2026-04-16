@@ -30,18 +30,30 @@ def validate_completion(
     """
     print(f"  {CLI_DIM}validating...{CLI_CLR}", end=" ", flush=True)
 
-    # Provide raw file contents to the validator so it can verify executor's claims
+    # Provide raw file contents to the validator so it can verify executor's claims.
+    # Cap per-file at 3000 chars and total at 30000 chars to avoid context bloat
+    # that pushes inference time past the nginx 504 gateway timeout (~60s).
     raw_files_section = ""
+    PER_FILE_CAP = 3000
+    TOTAL_CAP = 30000
     if vm and files_read:
         file_blocks = []
+        total_size = 0
         for path in files_read:
+            if total_size >= TOTAL_CAP:
+                file_blocks.append(f"<file path=\"...(+{len(files_read) - len(file_blocks)} more omitted for context size)...\"/>")
+                break
             # Normalize path: strip leading "/" for VM compatibility
             norm_path = path.lstrip("/")
             try:
                 result = vm.read(ReadRequest(path=norm_path))
                 content = MessageToDict(result).get("content", "") if result else ""
                 if content:
-                    file_blocks.append(f"<file path=\"{path}\">\n{content}\n</file>")
+                    if len(content) > PER_FILE_CAP:
+                        content = content[:PER_FILE_CAP] + f"\n...[truncated {len(content) - PER_FILE_CAP} chars]"
+                    block = f"<file path=\"{path}\">\n{content}\n</file>"
+                    file_blocks.append(block)
+                    total_size += len(block)
             except Exception as exc:
                 print(f"{CLI_DIM}source-file skip {norm_path}: {exc}{CLI_CLR}", end=" ", flush=True)
                 continue
