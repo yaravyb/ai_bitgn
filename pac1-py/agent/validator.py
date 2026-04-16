@@ -22,6 +22,7 @@ def validate_completion(
     metadata: dict | None = None,
     vm: PcmRuntimeClientSync | None = None,
     files_read: list[str] | None = None,
+    virtual_date: str = "",
 ) -> dict | None:
     """Validate proposed answer before submitting.
 
@@ -47,6 +48,16 @@ def validate_completion(
         if file_blocks:
             raw_files_section = "\n\n<source-files>\n" + "\n".join(file_blocks) + "\n</source-files>"
 
+    virtual_date_section = ""
+    if virtual_date:
+        virtual_date_section = (
+            f"\n\n<virtual-current-date>{virtual_date}</virtual-current-date>\n"
+            "IMPORTANT: The date above is the ONLY authoritative current date for "
+            "this task. Do NOT use your own knowledge of today's date. All date "
+            "calculations (birthdays, deadlines, 'N days ago') must be verified "
+            "against this date, not any other."
+        )
+
     messages = [
         {"role": "system", "content": build_validator_system()},
         {
@@ -58,6 +69,7 @@ def validate_completion(
                 f"<execution-context>\n{execution_context}\n</execution-context>\n\n"
                 f"<agents-md>\n{agents_md[:1500]}\n</agents-md>"
                 f"{raw_files_section}"
+                f"{virtual_date_section}"
             ),
         },
     ]

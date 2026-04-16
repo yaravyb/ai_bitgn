@@ -15,6 +15,7 @@ class TaskManager:
         self._files_written: list[str] = []
         self._files_deleted: list[str] = []
         self._files_read: list[str] = []
+        self._failed_reads: list[str] = []
         self._pending_writes: list[dict] = []
 
     # -- Instructions --
@@ -113,6 +114,11 @@ class TaskManager:
     def track_read(self, path: str) -> None:
         if path and path not in self._files_read:
             self._files_read.append(path)
+
+    def track_read_error(self, path: str) -> None:
+        """Track a read that failed (file not found, permission error, etc.)."""
+        if path and path not in self._failed_reads:
+            self._failed_reads.append(path)
 
     def track_write(self, path: str) -> None:
         if path and path not in self._files_written:
