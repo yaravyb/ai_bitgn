@@ -482,7 +482,7 @@ def _generate_parser_from_sample(
         "- The function signature is: def extract(content: str) -> dict\n"
         "- Return a dict of {field_name: value} with string values\n"
         "- Extract ALL fields you find (record_type, dates, amounts, names, etc.)\n"
-        "- Also add a '_body' key with the full content (max 800 chars)\n"
+        "- Also add a '_body' key with the full content (max 2000 chars)\n"
         "- Only use standard Python (re, str methods). No imports needed.\n"
         "- Return empty dict {} if parsing fails\n"
         "- Output ONLY the function body inside ```python``` markers, nothing else\n\n"
@@ -599,11 +599,11 @@ def _load_records(vm, path: str, config: "AgentConfig | None" = None, model: str
                 if body_start != -1:
                     body = content[body_start + 4:].strip()
                     if body:
-                        record["_body"] = body[:800]
+                        record["_body"] = body[:2000]
             else:
                 record = _parse_ascii_table(content)
                 if record is not None:
-                    record["_body"] = content[:800]
+                    record["_body"] = content[:2000]
 
         if record and isinstance(record, dict):
             record["_file"] = fname
@@ -636,7 +636,7 @@ def _load_records(vm, path: str, config: "AgentConfig | None" = None, model: str
                     if record and isinstance(record, dict) and len(record) >= 2:
                         record["_file"] = fname
                         if "_body" not in record:
-                            record["_body"] = content[:800]
+                            record["_body"] = content[:2000]
                         try:
                             parsed_dt = _dateutil_parse(fname, fuzzy=True)
                             record["_date_from_file"] = parsed_dt.strftime("%Y-%m-%d")

@@ -7,7 +7,7 @@ from pathlib import Path
 import yaml as _yaml
 import litellm
 from bitgn.vm.pcm_connect import PcmRuntimeClientSync
-from bitgn.vm.pcm_pb2 import AnswerRequest, ContextRequest, Outcome, ReadRequest
+from bitgn.vm.pcm_pb2 import AnswerRequest, Outcome, ReadRequest
 from google.protobuf.json_format import MessageToDict
 
 from agent.bootstrap import phase1_bootstrap
@@ -413,6 +413,9 @@ def _run_executor(
                 txt = dispatch(vm, name, args, config, tm, defer_writes=defer, skill_loader=skill_loader, model=model, metadata=metadata)
                 status = f"{CLI_GREEN}✓{CLI_CLR}"
                 detail = f"{len(txt)} chars" if len(txt) > 200 else ""
+                # Capture the actual current_date from execution (not startup)
+                if name == "current_date" and tm is not None:
+                    tm._current_date_result = txt
             except Exception as exc:
                 txt = f"Error: {exc}"
                 status = f"{CLI_RED}✗{CLI_CLR}"
@@ -569,6 +572,143 @@ def _fix_reply_recipient(vm, pending: list[dict], files_read: list[str]) -> None
         print(f"  {CLI_DIM}reply fix: {outbox_path} to={sender_email}{CLI_CLR}")
 
 
+def _fix_invoice_selection(vm, pending: list[dict], files_read: list[str]) -> None:
+    """Re-verify invoice attachments against the inbox request.
+
+    When the executor creates an outbox email with invoice attachments
+    in response to an inbox request like "oldest N invoices linked to X",
+    this fix re-reads the inbox message, identifies the entity and count,
+    then independently loads ALL invoices and selects the correct set
+    using broad entity matching (related_entity, counterparty, project).
+
+    Replaces the attachment list if the executor's selection was wrong.
+    """
+    # Find inbox delete and outbox write with attachments
+    inbox_path = None
+    outbox_idx = None
+    for i, op in enumerate(pending):
+        path = op["args"].get("path", "")
+        if op["op"] == "delete" and "inbox" in path.lower():
+            inbox_path = path
+        if op["op"] == "write" and "outbox" in path.lower() and path.endswith(".md"):
+            outbox_idx = i
+
+    if inbox_path is None or outbox_idx is None:
+        return
+
+    # Parse outbox to check if it has invoice attachments
+    outbox_content = pending[outbox_idx]["args"].get("content", "")
+    if not outbox_content.startswith("---"):
+        return
+    oend = outbox_content.find("\n---", 3)
+    if oend == -1:
+        return
+    try:
+        ofm = _yaml.safe_load(outbox_content[4:oend])
+    except Exception:
+        return
+    if not isinstance(ofm, dict):
+        return
+    attachments = ofm.get("attachments", [])
+    if not isinstance(attachments, list) or len(attachments) < 2:
+        return
+    # Only fix invoice attachments (files from finance/invoices)
+    if not any("invoice" in str(a).lower() for a in attachments):
+        return
+
+    # Read inbox message to extract entity name and count
+    try:
+        norm = inbox_path.lstrip("/")
+        result = vm.read(ReadRequest(path=norm))
+        inbox_content = MessageToDict(result).get("content", "")
+    except Exception:
+        return
+    if not inbox_content:
+        return
+
+    # Extract the request from inbox body
+    body = inbox_content
+    if inbox_content.startswith("---"):
+        bend = inbox_content.find("\n---", 3)
+        if bend != -1:
+            body = inbox_content[bend + 4:].strip()
+
+    # Parse "oldest N invoices linked to X" pattern
+    import re as _re
+    count_match = _re.search(r"oldest\s+(\d+)\s+invoices?\s+linked\s+to\s+(.+?)[\.\n]",
+                             body, _re.IGNORECASE)
+    if not count_match:
+        return
+    requested_count = int(count_match.group(1))
+    entity_hint = count_match.group(2).strip().rstrip(".,;:!?")
+
+    if requested_count != len(attachments):
+        return  # Count already matches, nothing to fix
+
+    # Load all invoices and find matches for this entity
+    from agent.dispatch import _load_records, _loaded_df
+    import pandas as _pd
+
+    _load_records(vm, "50_finance/invoices/")
+    if _loaded_df is None:
+        return
+
+    df = _loaded_df
+    # Broad entity match: check related_entity, counterparty, _body, _file
+    hint_lower = entity_hint.lower()
+    hint_words = hint_lower.split()
+
+    def _matches_entity(row):
+        """Check if any text column contains the entity hint words."""
+        for col in ["related_entity", "counterparty", "_body", "_file", "project"]:
+            val = str(row.get(col, "")).lower()
+            if all(w in val for w in hint_words):
+                return True
+        return False
+
+    mask = df.apply(_matches_entity, axis=1)
+    matched = df[mask].copy()
+
+    if len(matched) < requested_count:
+        return  # Not enough matches found
+
+    # Sort by date (oldest first) and take the requested count
+    date_col = "issued_on" if "issued_on" in matched.columns else "_date_from_file"
+    try:
+        matched = matched.sort_values(date_col).head(requested_count)
+    except Exception:
+        return
+
+    # Build correct attachment paths (newest first for outbox format)
+    folder = "50_finance/invoices/"
+    correct_atts = []
+    for _, row in matched.sort_values(date_col, ascending=False).iterrows():
+        fname = row.get("_file", "")
+        if fname:
+            correct_atts.append(folder + fname)
+
+    if not correct_atts or set(correct_atts) == set(str(a) for a in attachments):
+        return  # Already correct
+
+    # Replace attachments in outbox content using targeted text replacement
+    fm_block = outbox_content[4:oend]
+    att_match = _re.search(
+        r"^(attachments:\s*\n)((?:\s*-\s*.+\n?)+)",
+        fm_block, _re.MULTILINE,
+    )
+    if not att_match:
+        return
+
+    new_att_block = "attachments:\n" + "".join(
+        f"  - {a}\n" for a in correct_atts
+    )
+    new_fm = fm_block[:att_match.start()] + new_att_block + fm_block[att_match.end():]
+    rest = outbox_content[oend:]
+    pending[outbox_idx]["args"]["content"] = "---\n" + new_fm + rest
+    outbox_path = pending[outbox_idx]["args"].get("path", "?")
+    print(f"  {CLI_DIM}invoice fix: {outbox_path} → re-selected {len(correct_atts)} invoices{CLI_CLR}")
+
+
 def _fix_attachment_order(pending: list[dict]) -> None:
     """Sort attachments in outbox emails by date — newest first.
 
@@ -650,9 +790,20 @@ def _check_incomplete_request(result: dict, tm: "TaskManager") -> str | None:
         return None
 
     # Layer 1: structural — read() exceptions were tracked
-    if tm._failed_reads:
-        paths = ", ".join(tm._failed_reads[:3])
-        print(f"  {CLI_YELLOW}incomplete-request fix: {len(tm._failed_reads)} read(s) failed "
+    # Exclude files that are in the pending writes (deferred writes that
+    # haven't been applied yet — reading them fails expectedly)
+    written_paths = {
+        op["args"].get("path", "").lstrip("/")
+        for op in pending
+        if op["op"] == "write"
+    }
+    real_failed = [
+        p for p in tm._failed_reads
+        if p.lstrip("/") not in written_paths
+    ]
+    if real_failed:
+        paths = ", ".join(real_failed[:3])
+        print(f"  {CLI_YELLOW}incomplete-request fix: {len(real_failed)} read(s) failed "
               f"({paths}) but outcome=OK → CLARIFICATION{CLI_CLR}")
         return "OUTCOME_NONE_CLARIFICATION"
 
@@ -773,15 +924,6 @@ def run_agent(
     # Phase 1: Deterministic bootstrap
     phase1_ctx = phase1_bootstrap(vm)
 
-    # Capture virtual current date for validator
-    virtual_date = ""
-    try:
-        ctx_result = vm.context(ContextRequest())
-        ctx_dict = MessageToDict(ctx_result) if ctx_result else {}
-        virtual_date = json.dumps(ctx_dict)
-    except Exception:
-        pass
-
     # Planner: classify task and generate strategy
     plan = plan_task(config, model, task_text, phase1_ctx, skill_loader, metadata)
     if plan["rejection"]:
@@ -861,6 +1003,35 @@ def run_agent(
     grounding = result.get("grounding_refs", [])
     all_refs = list(dict.fromkeys(list(tm_exec._files_read) + grounding))
 
+    # Ground pending attachments: read files listed in outbox email
+    # attachments so the validator can verify invoice data instead of
+    # flagging it as fabrication (the executor finds invoices via
+    # load_records/calculate but may not read() them individually).
+    pending = tm_exec.get_pending_writes()
+    if outcome == OUTCOME_OK and pending:
+        for op in pending:
+            if op["op"] != "write" or "outbox" not in op["args"].get("path", ""):
+                continue
+            content = op["args"].get("content", "")
+            if not content.startswith("---"):
+                continue
+            oend = content.find("\n---", 3)
+            if oend == -1:
+                continue
+            # Extract attachment paths from YAML
+            for m in re.finditer(r"^\s*-\s*(\S+/invoices/\S+\.md)", content[:oend], re.MULTILINE):
+                att_path = m.group(1)
+                if att_path not in all_refs:
+                    try:
+                        vm.read(ReadRequest(path=att_path.lstrip("/")))
+                        all_refs.append(att_path)
+                    except Exception:
+                        pass
+
+    # Use the actual current_date from executor dispatch (not startup vm.context)
+    # This ensures validator uses the same virtual date the executor computed with
+    virtual_date = tm_exec._current_date_result or ""
+
     correction = validate_completion(
         config, model, task_text, message, outcome,
         phase1_ctx.get("agents_md", ""),
@@ -878,6 +1049,7 @@ def run_agent(
         # Pre-apply fixes: deterministic corrections before writing to harness
         _fix_queue_order(pending)
         _fix_reply_recipient(vm, pending, list(tm_exec._files_read))
+        _fix_invoice_selection(vm, pending, list(tm_exec._files_read))
         _fix_attachment_order(pending)
         print(f"\n{CLI_BOLD}Applying {len(pending)} writes{CLI_CLR}")
         for op in pending:

@@ -17,6 +17,7 @@ class TaskManager:
         self._files_read: list[str] = []
         self._failed_reads: list[str] = []
         self._pending_writes: list[dict] = []
+        self._current_date_result: str = ""
 
     # -- Instructions --
 
