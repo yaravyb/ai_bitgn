@@ -316,26 +316,24 @@ class TestCheckIncompleteRequest:
         # Should return None without calling LLM (no pending writes)
         assert _check_incomplete_request(config, "m", "t", result, tm, None) is None
 
-    def test_failed_reads_triggers_clarification(self):
+    def test_no_inbox_delete_skips(self):
         from agent.executor import _check_incomplete_request
         config = AgentConfig()
         tm = TaskManager()
-        tm.track_read_error("/some/missing.md")
-        tm.defer_write("write", {"path": "other.md", "content": ""})
+        # Pending write without inbox delete — judge should NOT run
+        tm.defer_write("write", {"path": "note.md", "content": ""})
         result = {"outcome": "OUTCOME_OK", "message": "done"}
-        # Failed read not in pending writes → structural override fires (no LLM)
-        assert _check_incomplete_request(config, "m", "t", result, tm, None) == "OUTCOME_NONE_CLARIFICATION"
+        # Should return None without calling LLM (no inbox delete gate)
+        assert _check_incomplete_request(config, "m", "t", result, tm, None) is None
 
-    def test_failed_read_matching_pending_write_does_not_trigger(self):
+    def test_empty_message_skips(self):
         from agent.executor import _check_incomplete_request
         config = AgentConfig()
         tm = TaskManager()
-        # This is the false-positive case: read of deferred write fails
-        tm.track_read_error("/outbox/email.md")
-        tm.defer_write("write", {"path": "/outbox/email.md", "content": ""})
-        # Must NOT trigger Layer 1; will fall through to Layer 2 (but there's
-        # no inbox delete, so Layer 2 also skips without calling LLM)
-        result = {"outcome": "OUTCOME_OK", "message": "done"}
+        tm.defer_write("delete", {"path": "00_inbox/msg.md"})
+        tm.defer_write("write", {"path": "other.md", "content": ""})
+        result = {"outcome": "OUTCOME_OK", "message": ""}
+        # Should return None without calling LLM (empty completion message)
         assert _check_incomplete_request(config, "m", "t", result, tm, None) is None
 
 

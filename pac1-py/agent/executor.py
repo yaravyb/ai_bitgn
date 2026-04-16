@@ -595,58 +595,71 @@ def _fix_date_lookup_clarification(
     if not msg:
         return None
 
-    try:
-        resp = call_llm_no_tools(
-            config, model,
-            [
-                {"role": "system", "content": (
-                    "You are a rescue judge for a benchmark agent. The "
-                    "agent reported CLARIFICATION (could not fully "
-                    "answer) but may have still found the relevant "
-                    "information in its own message.\n\n"
-                    "Your job: determine if the agent's message actually "
-                    "contains enough information to derive the requested "
-                    "answer. If so, compute the answer and respond with "
-                    "just the value.\n\n"
-                    "Guidelines:\n"
-                    "- If the task asks for a TOTAL / SUM across matching "
-                    "records and the message lists multiple matching "
-                    "records with amounts, SUM those amounts and return "
-                    "the total.\n"
-                    "- If the message shows one clear match, return that "
-                    "value.\n"
-                    "- If the message is a genuine failure to find the "
-                    "record (no matches mentioned), respond 'NO'.\n"
-                    "- Format the answer exactly as the task asks "
-                    "(e.g. just a number for 'answer with a number only', "
-                    "a YYYY-MM-DD date for date-only tasks, etc.).\n"
-                    "- No extra text, no explanation, no quotes, no units. "
-                    "Just 'NO' or the bare answer value.\n"
-                    "- Do NOT invent or guess — only compute from values "
-                    "already present in the message."
-                )},
-                {"role": "user", "content": (
-                    f"Task: {task_text}\n\n"
-                    f"Agent's CLARIFICATION message:\n{msg[:2000]}\n\n"
-                    "Compute the answer from the message, or 'NO'."
-                )},
-            ],
-            metadata=metadata, max_tokens=64,
-        )
-        answer = resp.choices[0].message.content.strip()
-    except Exception as exc:
-        print(f"  {CLI_DIM}rescue-judge skipped: {exc}{CLI_CLR}")
+    system_msg = (
+        "You are a rescue judge for a benchmark agent. The "
+        "agent reported CLARIFICATION (could not fully "
+        "answer) but may have still found the relevant "
+        "information in its own message.\n\n"
+        "Your job: determine if the agent's message actually "
+        "contains enough information to derive the requested "
+        "answer. If so, compute the answer and respond with "
+        "just the value.\n\n"
+        "Guidelines:\n"
+        "- If the task asks for a TOTAL / SUM across matching "
+        "records and the message lists multiple matching "
+        "records with amounts, SUM those amounts and return "
+        "the total.\n"
+        "- If the message shows one clear match, return that "
+        "value.\n"
+        "- If the message is a genuine failure to find the "
+        "record (no matches mentioned), respond 'NO'.\n"
+        "- Format the answer exactly as the task asks "
+        "(e.g. just a number for 'answer with a number only', "
+        "a YYYY-MM-DD date for date-only tasks, etc.).\n"
+        "- No extra text, no explanation, no quotes, no units. "
+        "Just 'NO' or the bare answer value.\n"
+        "- Do NOT invent or guess — only compute from values "
+        "already present in the message."
+    )
+    user_msg = (
+        f"Task: {task_text}\n\n"
+        f"Agent's CLARIFICATION message:\n{msg[:2000]}\n\n"
+        "Compute the answer from the message, or 'NO'."
+    )
+
+    # Retry up to 2 times on empty/error responses (common 504 recovery).
+    # An empty LLM response must NOT be interpreted as "NO" — that's a
+    # silent failure mode that loses real answers.
+    answer = ""
+    for attempt in range(2):
+        try:
+            resp = call_llm_no_tools(
+                config, model,
+                [{"role": "system", "content": system_msg},
+                 {"role": "user", "content": user_msg}],
+                metadata=metadata, max_tokens=64,
+            )
+            answer = resp.choices[0].message.content.strip()
+            if answer:
+                break
+        except Exception as exc:
+            if attempt == 0:
+                continue  # retry once
+            print(f"  {CLI_DIM}rescue-judge skipped: {exc}{CLI_CLR}")
+            return None
+
+    if not answer:
+        print(f"  {CLI_DIM}rescue-judge: LLM returned empty after retries — skipping{CLI_CLR}")
         return None
 
-    if not answer or answer.upper() in ("NO", "NONE", ""):
-        return None
     # Strip common surrounding artifacts
-    answer = answer.strip().strip('"').strip("'").rstrip(".")
-    if not answer or answer.upper() == "NO":
+    answer_clean = answer.strip().strip('"').strip("'").rstrip(".")
+    if not answer_clean or answer_clean.upper() in ("NO", "NONE"):
+        print(f"  {CLI_DIM}rescue-judge: declined (LLM said '{answer[:40]}'){CLI_CLR}")
         return None
 
-    print(f"  {CLI_YELLOW}rescue-judge: CLARIFICATION → OK with answer '{answer}'{CLI_CLR}")
-    return {"outcome": "OUTCOME_OK", "message": answer}
+    print(f"  {CLI_YELLOW}rescue-judge: CLARIFICATION → OK with answer '{answer_clean}'{CLI_CLR}")
+    return {"outcome": "OUTCOME_OK", "message": answer_clean}
 
 
 def _fix_invoice_selection(vm, pending: list[dict], files_read: list[str]) -> None:
@@ -854,11 +867,10 @@ def _check_incomplete_request(
 ) -> str | None:
     """Detect incomplete batch requests where the agent silently skipped work.
 
-    Two-layer detection (no hardcoded English phrases):
-    1. Structural: executor encountered read() exceptions (file not found)
-       AND still has pending writes AND reports OUTCOME_OK
-    2. LLM judge: asks the model whether the agent's own completion
-       message admits to skipping or failing part of the requested work.
+    Uses an LLM judge with both signals (failed reads + completion message)
+    as evidence.  The judge decides whether the task was asking to process
+    items that couldn't be completed, vs. the agent exploring wrong paths
+    during search.
 
     Returns override outcome or None.
     """
@@ -868,28 +880,8 @@ def _check_incomplete_request(
     if not pending:
         return None
 
-    # Layer 1: structural — read() exceptions were tracked.
-    # Exclude files that are in the pending writes (deferred writes that
-    # haven't been applied yet — reading them fails expectedly).
-    written_paths = {
-        op["args"].get("path", "").lstrip("/")
-        for op in pending
-        if op["op"] == "write"
-    }
-    real_failed = [
-        p for p in tm._failed_reads
-        if p.lstrip("/") not in written_paths
-    ]
-    if real_failed:
-        paths = ", ".join(real_failed[:3])
-        print(f"  {CLI_YELLOW}incomplete-request fix: {len(real_failed)} read(s) failed "
-              f"({paths}) but outcome=OK → CLARIFICATION{CLI_CLR}")
-        return "OUTCOME_NONE_CLARIFICATION"
-
-    # Layer 2: LLM judge — catches cases where the agent inferred a file
-    # was missing without actually calling read() (no exception tracked).
-    # Only runs for batch-style tasks (inbox delete + writes) to keep
-    # the judge narrowly scoped and cheap.
+    # Only run for batch-style tasks (inbox processing with pending writes);
+    # other tasks don't have the incomplete-batch failure mode.
     has_inbox_delete = any(
         op["op"] == "delete" and "inbox" in op["args"].get("path", "").lower()
         for op in pending
@@ -901,38 +893,78 @@ def _check_incomplete_request(
     if not msg:
         return None
 
-    try:
-        resp = call_llm_no_tools(
-            config, model,
-            [
-                {"role": "system", "content": (
-                    "You judge whether an agent's completion message admits "
-                    "to skipping, omitting, or failing part of the requested "
-                    "work.\n\n"
-                    "Answer ONLY 'true' or 'false':\n"
-                    "- true = the message says some requested item was NOT "
-                    "processed (e.g. a file could not be found, a step was "
-                    "skipped, an entity was missing, a duplicate was "
-                    "detected and dropped).\n"
-                    "- false = the message describes full successful "
-                    "completion with no omissions."
-                )},
-                {"role": "user", "content": (
-                    f"Task: {task_text}\n\n"
-                    f"Agent's completion message:\n{msg[:1500]}\n\n"
-                    "Did the agent skip or fail any part of the request?"
-                )},
-            ],
-            metadata=metadata, max_tokens=8,
+    # Collect evidence: failed reads (excluding deferred-write paths)
+    written_paths = {
+        op["args"].get("path", "").lstrip("/")
+        for op in pending
+        if op["op"] == "write"
+    }
+    real_failed = [
+        p for p in tm._failed_reads
+        if p.lstrip("/") not in written_paths
+    ]
+
+    failed_reads_block = ""
+    if real_failed:
+        failed_reads_block = (
+            "\nFiles the agent tried to read but failed "
+            "(may be task-related OR exploratory misses):\n"
+            + "\n".join(f"- {p}" for p in real_failed[:5])
         )
-        answer = resp.choices[0].message.content.strip().lower()
-    except Exception as exc:
-        print(f"  {CLI_DIM}incomplete-judge skipped: {exc}{CLI_CLR}")
-        return None
+
+    system_msg = (
+        "You judge whether a batch task was incompletely fulfilled.\n\n"
+        "A batch task is one where the user asked the agent to process "
+        "MULTIPLE specific items (files, records, entities).  It is "
+        "incompletely fulfilled when the agent completed SOME but not "
+        "ALL of the explicitly requested items.\n\n"
+        "Evidence to consider:\n"
+        "- The task text (what was requested)\n"
+        "- The agent's completion message (what it says it did)\n"
+        "- Files the agent tried to read but failed (these might be "
+        "task-referenced items that don't exist, OR the agent "
+        "exploring wrong paths during search — distinguish carefully)\n\n"
+        "Answer ONLY 'true' or 'false':\n"
+        "- true = the task asked for N items, the agent completed fewer "
+        "(e.g. inbox message listed 5 files, agent could only process "
+        "4 because the 5th doesn't exist and this was explicitly "
+        "mentioned in the agent's message).\n"
+        "- false = either the task succeeded in full, OR the failed "
+        "reads were the agent's own search attempts (not items the "
+        "task explicitly asked to process)."
+    )
+    user_msg = (
+        f"Task: {task_text}\n\n"
+        f"Agent's completion message:\n{msg[:1500]}"
+        f"{failed_reads_block}\n\n"
+        "Did the agent incompletely fulfill a batch request?"
+    )
+
+    # Retry once on empty responses; treat empty as skip, not as "false"
+    answer = ""
+    for attempt in range(2):
+        try:
+            resp = call_llm_no_tools(
+                config, model,
+                [{"role": "system", "content": system_msg},
+                 {"role": "user", "content": user_msg}],
+                metadata=metadata, max_tokens=8,
+            )
+            answer = resp.choices[0].message.content.strip().lower()
+            if answer:
+                break
+        except Exception as exc:
+            if attempt == 0:
+                continue
+            print(f"  {CLI_DIM}incomplete-judge skipped: {exc}{CLI_CLR}")
+            return None
+
+    if not answer:
+        return None  # silent failure — don't override
 
     if "true" in answer:
         print(f"  {CLI_YELLOW}incomplete-request fix: LLM judge found "
-              f"skipped work in completion message → CLARIFICATION{CLI_CLR}")
+              f"incomplete batch fulfillment → CLARIFICATION{CLI_CLR}")
         return "OUTCOME_NONE_CLARIFICATION"
     return None
 
