@@ -294,3 +294,62 @@ class TestTextMatch:
     def test_non_string_returns_false(self):
         assert _text_match(None, "test") is False
         assert _text_match("test", None) is False
+
+
+class TestCheckIncompleteRequest:
+    """Structural checks run without any LLM call — verify short-circuits."""
+
+    def test_non_ok_outcome_skips(self):
+        from agent.executor import _check_incomplete_request
+        config = AgentConfig()
+        tm = TaskManager()
+        tm.defer_write("write", {"path": "a.md", "content": ""})
+        result = {"outcome": "OUTCOME_NONE_CLARIFICATION", "message": "x"}
+        # Should return None without calling LLM (outcome is not OK)
+        assert _check_incomplete_request(config, "m", "t", result, tm, None) is None
+
+    def test_no_pending_writes_skips(self):
+        from agent.executor import _check_incomplete_request
+        config = AgentConfig()
+        tm = TaskManager()
+        result = {"outcome": "OUTCOME_OK", "message": "x"}
+        # Should return None without calling LLM (no pending writes)
+        assert _check_incomplete_request(config, "m", "t", result, tm, None) is None
+
+    def test_failed_reads_triggers_clarification(self):
+        from agent.executor import _check_incomplete_request
+        config = AgentConfig()
+        tm = TaskManager()
+        tm.track_read_error("/some/missing.md")
+        tm.defer_write("write", {"path": "other.md", "content": ""})
+        result = {"outcome": "OUTCOME_OK", "message": "done"}
+        # Failed read not in pending writes → structural override fires (no LLM)
+        assert _check_incomplete_request(config, "m", "t", result, tm, None) == "OUTCOME_NONE_CLARIFICATION"
+
+    def test_failed_read_matching_pending_write_does_not_trigger(self):
+        from agent.executor import _check_incomplete_request
+        config = AgentConfig()
+        tm = TaskManager()
+        # This is the false-positive case: read of deferred write fails
+        tm.track_read_error("/outbox/email.md")
+        tm.defer_write("write", {"path": "/outbox/email.md", "content": ""})
+        # Must NOT trigger Layer 1; will fall through to Layer 2 (but there's
+        # no inbox delete, so Layer 2 also skips without calling LLM)
+        result = {"outcome": "OUTCOME_OK", "message": "done"}
+        assert _check_incomplete_request(config, "m", "t", result, tm, None) is None
+
+
+class TestFixDateLookupClarification:
+    def test_non_clarification_outcome_skips(self):
+        from agent.executor import _fix_date_lookup_clarification
+        config = AgentConfig()
+        result = {"outcome": "OUTCOME_OK", "message": "x"}
+        # Should return None without calling LLM (not a CLARIFICATION)
+        assert _fix_date_lookup_clarification(config, "m", "t", result, None) is None
+
+    def test_empty_message_skips(self):
+        from agent.executor import _fix_date_lookup_clarification
+        config = AgentConfig()
+        result = {"outcome": "OUTCOME_NONE_CLARIFICATION", "message": ""}
+        # Should return None without calling LLM (empty message)
+        assert _fix_date_lookup_clarification(config, "m", "t", result, None) is None
