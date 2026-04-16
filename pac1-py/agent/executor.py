@@ -595,56 +595,44 @@ def _fix_date_lookup_clarification(
     if not msg:
         return None
 
+    # Direct, minimal prompt — small quantized models work better with
+    # very structured, example-driven instructions and NO preamble.
     system_msg = (
-        "You are a rescue judge for a benchmark agent. The "
-        "agent reported CLARIFICATION (could not fully "
-        "answer) but may have still found the relevant "
-        "information in its own message.\n\n"
-        "Your job: determine if the agent's message actually "
-        "contains enough information to derive the requested "
-        "answer. If so, compute the answer and respond with "
-        "just the value.\n\n"
-        "Guidelines:\n"
-        "- If the task asks for a TOTAL / SUM across matching "
-        "records and the message lists multiple matching "
-        "records with amounts, SUM those amounts and return "
-        "the total.\n"
-        "- If the message shows one clear match, return that "
-        "value.\n"
-        "- If the message is a genuine failure to find the "
-        "record (no matches mentioned), respond 'NO'.\n"
-        "- Format the answer exactly as the task asks "
-        "(e.g. just a number for 'answer with a number only', "
-        "a YYYY-MM-DD date for date-only tasks, etc.).\n"
-        "- No extra text, no explanation, no quotes, no units. "
-        "Just 'NO' or the bare answer value.\n"
-        "- Do NOT invent or guess — only compute from values "
-        "already present in the message."
+        "Read the agent's message.  If it contains the answer the task "
+        "asks for, output ONLY that answer value on a single line with "
+        "no other text.  Otherwise output the single word NO.\n\n"
+        "Rules:\n"
+        "- If the task asks 'how much in total' and the message lists "
+        "multiple matching records with amounts, SUM them.\n"
+        "- If one clear match is shown, output that value.\n"
+        "- If no matches are mentioned, output NO.\n"
+        "- Output format must match the task (bare number for 'number "
+        "only', bare YYYY-MM-DD for date-only, etc.).\n"
+        "- Do NOT add units, currency, quotes, explanation, or labels."
     )
     user_msg = (
         f"Task: {task_text}\n\n"
-        f"Agent's CLARIFICATION message:\n{msg[:2000]}\n\n"
-        "Compute the answer from the message, or 'NO'."
+        f"Agent message:\n{msg[:2000]}\n\n"
+        "Answer (bare value or NO):"
     )
 
-    # Retry up to 2 times on empty/error responses (common 504 recovery).
-    # An empty LLM response must NOT be interpreted as "NO" — that's a
-    # silent failure mode that loses real answers.
+    # Retry on empty/error responses — an empty LLM response must NOT
+    # be interpreted as "NO" (silent 504 recovery loses real answers).
     answer = ""
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             resp = call_llm_no_tools(
                 config, model,
                 [{"role": "system", "content": system_msg},
                  {"role": "user", "content": user_msg}],
-                metadata=metadata, max_tokens=64,
+                metadata=metadata, max_tokens=128,
             )
             answer = resp.choices[0].message.content.strip()
             if answer:
                 break
         except Exception as exc:
-            if attempt == 0:
-                continue  # retry once
+            if attempt < 2:
+                continue
             print(f"  {CLI_DIM}rescue-judge skipped: {exc}{CLI_CLR}")
             return None
 
