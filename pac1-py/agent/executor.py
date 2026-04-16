@@ -480,29 +480,44 @@ def _fix_queue_order(pending: list[dict]) -> None:
 
 
 def _fix_reply_recipient(vm, pending: list[dict], files_read: list[str]) -> None:
-    """Ensure outbox reply emails are addressed to the inbox sender, not the data subject.
+    """Ensure reply messages are addressed to the original sender.
 
-    When the executor processes an inbox email and writes a reply to outbox,
-    the reply must go TO the original sender.  The LLM sometimes addresses the
-    reply to the person the data is *about* instead.  This fix deterministically
-    corrects the `to` field by reading the inbox file's `from` field.
+    When the executor deletes a source message file and writes a reply
+    message file, the reply's `to:` must match the source's `from:`.
+    The LLM sometimes addresses the reply to the person the data is
+    *about* instead.  This fix corrects the `to:` field by reading
+    the source file's `from:` field.
+
+    Task-agnostic: detects reply pattern via YAML frontmatter structure
+    (delete+write of files that both have from:/to: fields), not via
+    folder names like "inbox" or "outbox".
     """
-    # Find inbox delete and outbox write in pending
-    inbox_delete_path = None
-    outbox_write_idx = None
+    # Find a deferred-delete of a message (YAML has from:) and a
+    # deferred-write of a message (YAML has to:) in the same batch.
+    source_path = None
+    reply_idx = None
     for i, op in enumerate(pending):
         path = op["args"].get("path", "")
-        if op["op"] == "delete" and "inbox" in path.lower():
-            inbox_delete_path = path
-        if op["op"] == "write" and "outbox" in path.lower() and path.endswith(".md"):
-            outbox_write_idx = i
+        if not path.endswith(".md"):
+            continue
+        if op["op"] == "delete":
+            # Tentatively treat any .md delete as a potential source — we
+            # verify later by reading the file and checking for `from:`.
+            source_path = path
+        elif op["op"] == "write":
+            content = op["args"].get("content", "")
+            # Reply candidate: YAML frontmatter with `to:` field
+            if content.startswith("---") and re.search(
+                r"^to:\s*\S", content[:1000], re.MULTILINE,
+            ):
+                reply_idx = i
 
-    if inbox_delete_path is None or outbox_write_idx is None:
+    if source_path is None or reply_idx is None:
         return
 
-    # Read the inbox file to get the sender's email (before it's deleted)
+    # Read the source file to get the sender's email (before it's deleted)
     try:
-        norm = inbox_delete_path.lstrip("/")
+        norm = source_path.lstrip("/")
         result = vm.read(ReadRequest(path=norm))
         inbox_content = MessageToDict(result).get("content", "")
     except Exception:
@@ -531,7 +546,7 @@ def _fix_reply_recipient(vm, pending: list[dict], files_read: list[str]) -> None
         return
 
     # Check the outbox email's `to` field and fix if it doesn't match the sender
-    outbox_content = pending[outbox_write_idx]["args"].get("content", "")
+    outbox_content = pending[reply_idx]["args"].get("content", "")
     if not outbox_content.startswith("---"):
         return
 
@@ -567,8 +582,8 @@ def _fix_reply_recipient(vm, pending: list[dict], files_read: list[str]) -> None
         flags=re.MULTILINE,
     )
     if fixed_content != outbox_content:
-        pending[outbox_write_idx]["args"]["content"] = fixed_content
-        outbox_path = pending[outbox_write_idx]["args"].get("path", "?")
+        pending[reply_idx]["args"]["content"] = fixed_content
+        outbox_path = pending[reply_idx]["args"].get("path", "?")
         print(f"  {CLI_DIM}reply fix: {outbox_path} to={sender_email}{CLI_CLR}")
 
 
@@ -650,143 +665,6 @@ def _fix_date_lookup_clarification(
     return {"outcome": "OUTCOME_OK", "message": answer_clean}
 
 
-def _fix_invoice_selection(vm, pending: list[dict], files_read: list[str]) -> None:
-    """Re-verify invoice attachments against the inbox request.
-
-    When the executor creates an outbox email with invoice attachments
-    in response to an inbox request like "oldest N invoices linked to X",
-    this fix re-reads the inbox message, identifies the entity and count,
-    then independently loads ALL invoices and selects the correct set
-    using broad entity matching (related_entity, counterparty, project).
-
-    Replaces the attachment list if the executor's selection was wrong.
-    """
-    # Find inbox delete and outbox write with attachments
-    inbox_path = None
-    outbox_idx = None
-    for i, op in enumerate(pending):
-        path = op["args"].get("path", "")
-        if op["op"] == "delete" and "inbox" in path.lower():
-            inbox_path = path
-        if op["op"] == "write" and "outbox" in path.lower() and path.endswith(".md"):
-            outbox_idx = i
-
-    if inbox_path is None or outbox_idx is None:
-        return
-
-    # Parse outbox to check if it has invoice attachments
-    outbox_content = pending[outbox_idx]["args"].get("content", "")
-    if not outbox_content.startswith("---"):
-        return
-    oend = outbox_content.find("\n---", 3)
-    if oend == -1:
-        return
-    try:
-        ofm = _yaml.safe_load(outbox_content[4:oend])
-    except Exception:
-        return
-    if not isinstance(ofm, dict):
-        return
-    attachments = ofm.get("attachments", [])
-    if not isinstance(attachments, list) or len(attachments) < 2:
-        return
-    # Only fix invoice attachments (files from finance/invoices)
-    if not any("invoice" in str(a).lower() for a in attachments):
-        return
-
-    # Read inbox message to extract entity name and count
-    try:
-        norm = inbox_path.lstrip("/")
-        result = vm.read(ReadRequest(path=norm))
-        inbox_content = MessageToDict(result).get("content", "")
-    except Exception:
-        return
-    if not inbox_content:
-        return
-
-    # Extract the request from inbox body
-    body = inbox_content
-    if inbox_content.startswith("---"):
-        bend = inbox_content.find("\n---", 3)
-        if bend != -1:
-            body = inbox_content[bend + 4:].strip()
-
-    # Parse "oldest N invoices linked to X" pattern
-    import re as _re
-    count_match = _re.search(r"oldest\s+(\d+)\s+invoices?\s+linked\s+to\s+(.+?)[\.\n]",
-                             body, _re.IGNORECASE)
-    if not count_match:
-        return
-    requested_count = int(count_match.group(1))
-    entity_hint = count_match.group(2).strip().rstrip(".,;:!?")
-
-    if requested_count != len(attachments):
-        return  # Count already matches, nothing to fix
-
-    # Load all invoices and find matches for this entity
-    from agent.dispatch import _load_records, _loaded_df
-    import pandas as _pd
-
-    _load_records(vm, "50_finance/invoices/")
-    if _loaded_df is None:
-        return
-
-    df = _loaded_df
-    # Broad entity match: check related_entity, counterparty, _body, _file
-    hint_lower = entity_hint.lower()
-    hint_words = hint_lower.split()
-
-    def _matches_entity(row):
-        """Check if any text column contains the entity hint words."""
-        for col in ["related_entity", "counterparty", "_body", "_file", "project"]:
-            val = str(row.get(col, "")).lower()
-            if all(w in val for w in hint_words):
-                return True
-        return False
-
-    mask = df.apply(_matches_entity, axis=1)
-    matched = df[mask].copy()
-
-    if len(matched) < requested_count:
-        return  # Not enough matches found
-
-    # Sort by date (oldest first) and take the requested count
-    date_col = "issued_on" if "issued_on" in matched.columns else "_date_from_file"
-    try:
-        matched = matched.sort_values(date_col).head(requested_count)
-    except Exception:
-        return
-
-    # Build correct attachment paths (newest first for outbox format)
-    folder = "50_finance/invoices/"
-    correct_atts = []
-    for _, row in matched.sort_values(date_col, ascending=False).iterrows():
-        fname = row.get("_file", "")
-        if fname:
-            correct_atts.append(folder + fname)
-
-    if not correct_atts or set(correct_atts) == set(str(a) for a in attachments):
-        return  # Already correct
-
-    # Replace attachments in outbox content using targeted text replacement
-    fm_block = outbox_content[4:oend]
-    att_match = _re.search(
-        r"^(attachments:\s*\n)((?:\s*-\s*.+\n?)+)",
-        fm_block, _re.MULTILINE,
-    )
-    if not att_match:
-        return
-
-    new_att_block = "attachments:\n" + "".join(
-        f"  - {a}\n" for a in correct_atts
-    )
-    new_fm = fm_block[:att_match.start()] + new_att_block + fm_block[att_match.end():]
-    rest = outbox_content[oend:]
-    pending[outbox_idx]["args"]["content"] = "---\n" + new_fm + rest
-    outbox_path = pending[outbox_idx]["args"].get("path", "?")
-    print(f"  {CLI_DIM}invoice fix: {outbox_path} → re-selected {len(correct_atts)} invoices{CLI_CLR}")
-
-
 def _fix_attachment_order(pending: list[dict]) -> None:
     """Sort attachments in outbox emails by date — newest first.
 
@@ -802,7 +680,7 @@ def _fix_attachment_order(pending: list[dict]) -> None:
         if op["op"] != "write":
             continue
         path = op["args"].get("path", "")
-        if "outbox" not in path.lower() or not path.endswith(".md"):
+        if not path.endswith(".md"):
             continue
         content = op["args"].get("content", "")
         if not content.startswith("---"):
@@ -811,7 +689,8 @@ def _fix_attachment_order(pending: list[dict]) -> None:
         if end == -1:
             continue
 
-        # Extract attachments from YAML using regex (avoids datetime conversion)
+        # Structural selector: only fix writes that have an
+        # `attachments:` YAML list — no folder-name assumption.
         fm_block = content[4:end]
         att_match = re.search(
             r"^(attachments:\s*\n)((?:\s*-\s*.+\n?)+)",
@@ -868,13 +747,13 @@ def _check_incomplete_request(
     if not pending:
         return None
 
-    # Only run for batch-style tasks (inbox processing with pending writes);
-    # other tasks don't have the incomplete-batch failure mode.
-    has_inbox_delete = any(
-        op["op"] == "delete" and "inbox" in op["args"].get("path", "").lower()
-        for op in pending
-    )
-    if not has_inbox_delete:
+    # Only run for batch-style tasks — detected structurally as
+    # "has at least one deferred delete AND at least one deferred write".
+    # This is the generic signature of a task that processes incoming
+    # items (deletes source after processing) and produces outputs.
+    has_delete = any(op["op"] == "delete" for op in pending)
+    has_write = any(op["op"] == "write" for op in pending)
+    if not (has_delete and has_write):
         return None
 
     msg = result.get("message", "")
@@ -960,28 +839,41 @@ def _check_incomplete_request(
 
 
 def _verify_sender_email(vm, pending: list[dict], files_read: list[str]) -> str | None:
-    """Verify inbox sender email matches a known entity exactly.
+    """Verify a message sender matches a known entity exactly.
 
-    When the executor processes an inbox email and writes to outbox,
-    verify the sender's email character-by-character against entity
-    records.  Returns an override outcome if mismatch found, or None.
+    When the executor processes an incoming message and produces a reply,
+    verify the message's sender `from:` email character-by-character
+    against any file in files_read that defines an identity record
+    (has a `primary_contact_email` field in YAML frontmatter).
+
+    Task-agnostic: detects the pattern structurally —
+    (deferred delete of a file with `from:` field) +
+    (deferred write of a file with `to:` field) = message-reply pattern.
+    Identity records are detected by the presence of
+    `primary_contact_email` in frontmatter, not by folder name.
     """
-    # Find inbox delete and outbox write in pending
-    inbox_delete_path = None
-    has_outbox_write = False
+    # Find the source-message delete and the reply write in pending
+    source_path = None
+    has_reply = False
     for op in pending:
         path = op["args"].get("path", "")
-        if op["op"] == "delete" and "inbox" in path.lower():
-            inbox_delete_path = path
-        if op["op"] == "write" and "outbox" in path.lower():
-            has_outbox_write = True
+        if not path.endswith(".md"):
+            continue
+        if op["op"] == "delete":
+            source_path = path  # verified later by reading content
+        elif op["op"] == "write":
+            content = op["args"].get("content", "")
+            if content.startswith("---") and re.search(
+                r"^to:\s*\S", content[:1000], re.MULTILINE,
+            ):
+                has_reply = True
 
-    if inbox_delete_path is None or not has_outbox_write:
+    if source_path is None or not has_reply:
         return None
 
-    # Read the inbox file to get sender email
+    # Read the source message to get the sender email
     try:
-        norm = inbox_delete_path.lstrip("/")
+        norm = source_path.lstrip("/")
         result = vm.read(ReadRequest(path=norm))
         inbox_content = MessageToDict(result).get("content", "")
     except Exception:
@@ -1007,11 +899,10 @@ def _verify_sender_email(vm, pending: list[dict], files_read: list[str]) -> str 
         return None
     sender = str(sender).strip()
 
-    # Check sender against entity files the executor read
+    # Check sender against ANY read file that has an identity record
+    # (detected by `primary_contact_email` field in YAML frontmatter).
     entity_files_checked = 0
     for path in files_read:
-        if "entities" not in path.lower():
-            continue
         try:
             norm = path.lstrip("/")
             result = vm.read(ReadRequest(path=norm))
@@ -1028,6 +919,10 @@ def _verify_sender_email(vm, pending: list[dict], files_read: list[str]) -> str 
         except Exception:
             continue
         if not isinstance(efm, dict):
+            continue
+        # Structural selector: only consider files that declare an
+        # identity with a primary_contact_email field.
+        if "primary_contact_email" not in efm:
             continue
         entity_files_checked += 1
         entity_email = efm.get("primary_contact_email", "")
@@ -1135,14 +1030,18 @@ def run_agent(
     grounding = result.get("grounding_refs", [])
     all_refs = list(dict.fromkeys(list(tm_exec._files_read) + grounding))
 
-    # Ground pending attachments: read files listed in outbox email
-    # attachments so the validator can verify invoice data instead of
-    # flagging it as fabrication (the executor finds invoices via
-    # load_records/calculate but may not read() them individually).
+    # Ground pending attachments: when a pending write contains an
+    # `attachments:` YAML list referencing other files, read those
+    # referenced files so the validator can verify their content
+    # instead of flagging the agent's claims as fabrication.
+    #
+    # This is task-agnostic: it works for any YAML frontmatter with
+    # an `attachments` list of file paths, regardless of domain
+    # (invoices, photos, reports, etc.).
     pending = tm_exec.get_pending_writes()
     if outcome == OUTCOME_OK and pending:
         for op in pending:
-            if op["op"] != "write" or "outbox" not in op["args"].get("path", ""):
+            if op["op"] != "write":
                 continue
             content = op["args"].get("content", "")
             if not content.startswith("---"):
@@ -1150,9 +1049,25 @@ def run_agent(
             oend = content.find("\n---", 3)
             if oend == -1:
                 continue
-            # Extract attachment paths from YAML
-            for m in re.finditer(r"^\s*-\s*(\S+/invoices/\S+\.md)", content[:oend], re.MULTILINE):
-                att_path = m.group(1)
+            fm_block = content[4:oend]
+            # Find the attachments: list and extract each path entry.
+            # Matches YAML block of form:
+            #   attachments:
+            #     - path/to/file
+            att_section = re.search(
+                r"^attachments:\s*\n((?:\s+-\s+.+\n?)+)",
+                fm_block, re.MULTILINE,
+            )
+            if not att_section:
+                continue
+            for line in att_section.group(1).splitlines():
+                m = re.match(r"\s*-\s*(.+)", line)
+                if not m:
+                    continue
+                att_path = m.group(1).strip().strip('"').strip("'")
+                # Only ground file-like paths (contain '/' and extension)
+                if "/" not in att_path or "." not in att_path.rsplit("/", 1)[-1]:
+                    continue
                 if att_path not in all_refs:
                     try:
                         vm.read(ReadRequest(path=att_path.lstrip("/")))
@@ -1191,7 +1106,6 @@ def run_agent(
         # Pre-apply fixes: deterministic corrections before writing to harness
         _fix_queue_order(pending)
         _fix_reply_recipient(vm, pending, list(tm_exec._files_read))
-        _fix_invoice_selection(vm, pending, list(tm_exec._files_read))
         _fix_attachment_order(pending)
         print(f"\n{CLI_BOLD}Applying {len(pending)} writes{CLI_CLR}")
         for op in pending:
