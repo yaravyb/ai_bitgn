@@ -948,12 +948,14 @@ def _check_incomplete_request(
             return None
 
     if not answer:
+        print(f"  {CLI_DIM}incomplete-judge: LLM returned empty — skipping{CLI_CLR}")
         return None  # silent failure — don't override
 
     if "true" in answer:
         print(f"  {CLI_YELLOW}incomplete-request fix: LLM judge found "
               f"incomplete batch fulfillment → CLARIFICATION{CLI_CLR}")
         return "OUTCOME_NONE_CLARIFICATION"
+    print(f"  {CLI_DIM}incomplete-judge: LLM said '{answer[:40]}' — no override{CLI_CLR}")
     return None
 
 
