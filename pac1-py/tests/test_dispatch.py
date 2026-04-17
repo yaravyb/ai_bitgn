@@ -472,3 +472,54 @@ class TestExpandAnswerToFullName:
         )
         # Ambiguous — should NOT expand (too risky)
         assert result is None
+
+    def test_numeric_answer_not_expanded(self, monkeypatch):
+        """Dates, amounts, numbers must never be expanded."""
+        from agent import executor as exec_mod
+        vm = Mock()
+        vm.read.side_effect = lambda req: Mock()
+        monkeypatch.setattr(
+            exec_mod, "MessageToDict",
+            lambda obj: {"content": "---\nnote: 42 units of stock\n---\n"},
+        )
+        # Answer "42" must NOT be expanded to "42 units of stock"
+        assert exec_mod._expand_answer_to_full_name("42", ["x.md"], vm) is None
+        # Date answers must not be expanded
+        assert exec_mod._expand_answer_to_full_name("2026-03-26", ["x.md"], vm) is None
+
+    def test_lowercase_word_not_expanded(self, monkeypatch):
+        """Non-proper-noun tokens should not be treated as identifiers."""
+        from agent import executor as exec_mod
+        vm = Mock()
+        vm.read.side_effect = lambda req: Mock()
+        monkeypatch.setattr(
+            exec_mod, "MessageToDict",
+            lambda obj: {"content": "---\nnote: total sum required\n---\n"},
+        )
+        # Answer "total" (lowercase) should NOT expand — not an identifier
+        assert exec_mod._expand_answer_to_full_name("total", ["x.md"], vm) is None
+
+    def test_already_multiword_not_expanded(self, monkeypatch):
+        """Multi-word answers aren't single-name truncations."""
+        from agent import executor as exec_mod
+        vm = Mock()
+        vm.read.side_effect = lambda req: Mock()
+        monkeypatch.setattr(
+            exec_mod, "MessageToDict",
+            lambda obj: {"content": "---\nfull_name: Lukas Brenner Junior\n---\n"},
+        )
+        # "Lukas Brenner" already has a space — don't try to expand further
+        assert exec_mod._expand_answer_to_full_name(
+            "Lukas Brenner", ["x.md"], vm,
+        ) is None
+
+    def test_too_short_token_not_expanded(self, monkeypatch):
+        """2-char answers are too ambiguous to safely expand."""
+        from agent import executor as exec_mod
+        vm = Mock()
+        vm.read.side_effect = lambda req: Mock()
+        monkeypatch.setattr(
+            exec_mod, "MessageToDict",
+            lambda obj: {"content": "---\ncode: AB Corp Ltd\n---\n"},
+        )
+        assert exec_mod._expand_answer_to_full_name("AB", ["x.md"], vm) is None

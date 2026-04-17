@@ -730,13 +730,32 @@ def _expand_answer_to_full_name(
         return None
 
     def _try_expand(token: str) -> str | None:
-        """Return the single unambiguous expansion of token, or None."""
-        if not token:
+        """Return the single unambiguous expansion of token, or None.
+
+        Safety constraints prevent false positives on non-identifier answers:
+        - Skip multi-word tokens (already complete, not truncated)
+        - Skip tokens containing digits (dates, numbers, amounts)
+        - Skip short tokens (<3 chars — too ambiguous)
+        - Require at least one alpha character (not pure punctuation)
+        - Require token looks like a proper noun (starts with uppercase)
+        """
+        if not token or len(token) < 3:
             return None
-        # Find all multi-word values where `token` is the first whole word
+        # Already multi-word → not a single-word truncation
+        if " " in token:
+            return None
+        # Dates, numbers, amounts, times — never identifiers
+        if any(c.isdigit() for c in token):
+            return None
+        # Must have alpha chars
+        if not any(c.isalpha() for c in token):
+            return None
+        # Proper noun convention: capital first letter
+        if not token[0].isupper():
+            return None
+
         prefix = token + " "
         candidates = {v for v in long_values if v.startswith(prefix)}
-        # Exactly one unambiguous expansion?
         if len(candidates) == 1:
             return next(iter(candidates))
         return None  # 0 or many — don't expand
