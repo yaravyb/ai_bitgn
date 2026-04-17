@@ -6,8 +6,13 @@ from dataclasses import dataclass
 class AgentConfig:
     # Output and context
     output_cap: int = 10_000
-    auto_compact_threshold: int = 80_000
-    micro_compact_enabled: bool = False
+    # Lower threshold so long-running tasks compact BEFORE context grows
+    # large enough to cause 60+ second LLM inference (which triggers
+    # upstream nginx 504 gateway timeouts).
+    auto_compact_threshold: int = 40_000
+    # Enable micro-compact by default — trims older tool results so the
+    # conversation stays small without needing full LLM summarization.
+    micro_compact_enabled: bool = True
     micro_compact_keep_turns: int = 5
     smart_truncation_enabled: bool = False
 
