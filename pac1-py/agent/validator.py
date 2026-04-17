@@ -31,14 +31,13 @@ def validate_completion(
     print(f"  {CLI_DIM}validating...{CLI_CLR}", end=" ", flush=True)
 
     # Provide raw file contents to the validator so it can verify executor's claims.
-    # Tight caps to keep a single validator call under ~20s inference time on
-    # quantized models (prefill scales ~linearly with prompt size). Large
-    # "full-payload" calls are the main source of upstream 504 gateway
-    # timeouts — chunking out of scope for now, but per-call budget must
-    # stay small.
+    # Balanced caps: big enough to verify typical finance records (bills,
+    # invoices, entity files are ~1.5-2KB), small enough that a validator
+    # call stays under ~30s prefill on a 27B quantized model so we stay
+    # clear of the upstream nginx 504 cutoff.
     raw_files_section = ""
-    PER_FILE_CAP = 1200
-    TOTAL_CAP = 12000
+    PER_FILE_CAP = 2000
+    TOTAL_CAP = 20000
     if vm and files_read:
         file_blocks = []
         total_size = 0

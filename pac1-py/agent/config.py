@@ -4,14 +4,15 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class AgentConfig:
-    # Output and context — sized so per-call prefill stays <15s on a
-    # 27B quantized model (which is the threshold to avoid upstream
-    # nginx 504s at their 60s cutoff).
-    output_cap: int = 5_000
-    auto_compact_threshold: int = 25_000
-    # Enable micro-compact by default — trims older tool results so the
-    # conversation stays small without needing full LLM summarization.
-    micro_compact_enabled: bool = True
+    # Output and context.
+    # LESSON LEARNED: aggressive per-step trimming (micro_compact) breaks
+    # multi-step reasoning on long tasks (agent loops because it forgets
+    # what it already did). So we keep the executor's context generous
+    # and rely on auto_compact (full LLM summarization) as the only
+    # trimming mechanism, triggered only when truly needed.
+    output_cap: int = 10_000
+    auto_compact_threshold: int = 60_000
+    micro_compact_enabled: bool = False
     micro_compact_keep_turns: int = 5
     smart_truncation_enabled: bool = False
 
