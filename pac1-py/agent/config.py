@@ -4,12 +4,11 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class AgentConfig:
-    # Output and context
-    output_cap: int = 10_000
-    # Lower threshold so long-running tasks compact BEFORE context grows
-    # large enough to cause 60+ second LLM inference (which triggers
-    # upstream nginx 504 gateway timeouts).
-    auto_compact_threshold: int = 40_000
+    # Output and context — sized so per-call prefill stays <15s on a
+    # 27B quantized model (which is the threshold to avoid upstream
+    # nginx 504s at their 60s cutoff).
+    output_cap: int = 5_000
+    auto_compact_threshold: int = 25_000
     # Enable micro-compact by default — trims older tool results so the
     # conversation stays small without needing full LLM summarization.
     micro_compact_enabled: bool = True

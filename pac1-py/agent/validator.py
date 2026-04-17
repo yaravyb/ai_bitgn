@@ -31,11 +31,14 @@ def validate_completion(
     print(f"  {CLI_DIM}validating...{CLI_CLR}", end=" ", flush=True)
 
     # Provide raw file contents to the validator so it can verify executor's claims.
-    # Cap per-file at 3000 chars and total at 30000 chars to avoid context bloat
-    # that pushes inference time past the nginx 504 gateway timeout (~60s).
+    # Tight caps to keep a single validator call under ~20s inference time on
+    # quantized models (prefill scales ~linearly with prompt size). Large
+    # "full-payload" calls are the main source of upstream 504 gateway
+    # timeouts — chunking out of scope for now, but per-call budget must
+    # stay small.
     raw_files_section = ""
-    PER_FILE_CAP = 3000
-    TOTAL_CAP = 30000
+    PER_FILE_CAP = 1200
+    TOTAL_CAP = 12000
     if vm and files_read:
         file_blocks = []
         total_size = 0
