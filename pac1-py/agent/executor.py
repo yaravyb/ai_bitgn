@@ -665,6 +665,88 @@ def _fix_date_lookup_clarification(
     return {"outcome": "OUTCOME_OK", "message": answer_clean}
 
 
+def _expand_answer_to_full_name(
+    message: str, files_read: list[str], vm,
+) -> str | None:
+    """Expand a truncated identifier answer to its canonical full value.
+
+    Catches the common "Lukas" vs "Lukas Brenner" truncation pattern
+    where the executor answered with a short name (first word) but an
+    entity record has a longer `full_name`.
+
+    Task-agnostic: operates on any YAML identity record that has a
+    `full_name` field — works equally for people, projects, or any
+    other named entities.  No domain keywords or folder assumptions.
+
+    Returns the corrected message, or None if no expansion applies.
+    """
+    if not message:
+        return None
+
+    # Gather (short → full) mappings from any read file whose YAML
+    # frontmatter declares a `full_name`.  Structural detection only.
+    expansions: dict[str, str] = {}
+    for path in files_read:
+        try:
+            norm = path.lstrip("/")
+            result = vm.read(ReadRequest(path=norm))
+            content = MessageToDict(result).get("content", "") if result else ""
+        except Exception:
+            continue
+        if not content or not content.startswith("---"):
+            continue
+        end = content.find("\n---", 3)
+        if end == -1:
+            continue
+        try:
+            fm = _yaml.safe_load(content[4:end])
+        except Exception:
+            continue
+        if not isinstance(fm, dict):
+            continue
+        full_name = fm.get("full_name")
+        if not isinstance(full_name, str) or not full_name.strip():
+            continue
+        full_name = full_name.strip()
+        # Register expansions from: short `name` field, and first-word
+        # of full_name (covers "Lukas" → "Lukas Brenner" when the file
+        # only has a full_name field).
+        short_name = fm.get("name")
+        if isinstance(short_name, str) and short_name.strip():
+            short = short_name.strip()
+            if short != full_name and full_name.startswith(short):
+                expansions[short] = full_name
+        parts = full_name.split()
+        if len(parts) > 1:
+            first_word = parts[0]
+            # Only register if we don't already have a conflicting entry
+            # (avoid ambiguity: two entities sharing a first name)
+            if first_word not in expansions:
+                expansions[first_word] = full_name
+            elif expansions[first_word] != full_name:
+                # Ambiguous first name — don't auto-expand it
+                expansions[first_word] = ""  # sentinel: ambiguous
+
+    if not expansions:
+        return None
+
+    # Apply per-line so multi-name answers (one per line) are handled
+    lines = message.split("\n")
+    changed = False
+    new_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped in expansions and expansions[stripped]:
+            new_lines.append(expansions[stripped])
+            changed = True
+        else:
+            new_lines.append(line)
+
+    if not changed:
+        return None
+    return "\n".join(new_lines)
+
+
 def _fix_attachment_order(pending: list[dict]) -> None:
     """Sort attachments in outbox emails by date — newest first.
 
@@ -1134,6 +1216,16 @@ def run_agent(
         for ref in touched:
             if ref and ref not in grounding:
                 grounding.append(ref)
+
+    # Expand truncated identifier answers (e.g. "Lukas" → "Lukas Brenner")
+    # using canonical full_name fields from entity records the executor read.
+    if outcome == OUTCOME_OK:
+        expanded = _expand_answer_to_full_name(
+            message, list(tm_exec._files_read), vm,
+        )
+        if expanded is not None and expanded != message:
+            print(f"  {CLI_YELLOW}full-name fix: '{message}' → '{expanded}'{CLI_CLR}")
+            message = expanded
 
     # Submit the final answer
     outcome_style = CLI_GREEN if outcome == OUTCOME_OK else CLI_YELLOW

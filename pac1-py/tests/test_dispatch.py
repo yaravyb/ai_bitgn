@@ -351,3 +351,114 @@ class TestFixDateLookupClarification:
         result = {"outcome": "OUTCOME_NONE_CLARIFICATION", "message": ""}
         # Should return None without calling LLM (empty message)
         assert _fix_date_lookup_clarification(config, "m", "t", result, None) is None
+
+
+class TestExpandAnswerToFullName:
+    def _make_vm(self, files: dict[str, str]):
+        """Mock vm where read(path) returns the mapped content."""
+        vm = Mock()
+
+        def read_side_effect(req):
+            path = getattr(req, "path", None) or req  # flexible for test
+            if hasattr(req, "path"):
+                path = req.path
+            content = files.get(path, "")
+            resp = MagicMock()
+            # MessageToDict returns a dict, we need {"content": content}
+            return resp
+
+        vm.read.side_effect = read_side_effect
+
+        # Patch MessageToDict globally for this test
+        return vm
+
+    def test_empty_message_returns_none(self, mock_vm):
+        from agent.executor import _expand_answer_to_full_name
+        assert _expand_answer_to_full_name("", [], mock_vm) is None
+
+    def test_no_files_returns_none(self, mock_vm):
+        from agent.executor import _expand_answer_to_full_name
+        assert _expand_answer_to_full_name("Lukas", [], mock_vm) is None
+
+    def test_expands_first_word_to_full_name(self, monkeypatch):
+        from agent import executor as exec_mod
+        vm = Mock()
+
+        # Patch vm.read + MessageToDict behaviour
+        def fake_read(req):
+            return Mock()
+        vm.read.side_effect = fake_read
+
+        def fake_to_dict(obj):
+            # Simulate an entity file with full_name field
+            return {"content": "---\nfull_name: Lukas Brenner\nbirthday: 1988-03-26\n---\n"}
+
+        monkeypatch.setattr(exec_mod, "MessageToDict", fake_to_dict)
+
+        result = exec_mod._expand_answer_to_full_name(
+            "Lukas", ["10_entities/cast/lukas.md"], vm,
+        )
+        assert result == "Lukas Brenner"
+
+    def test_already_full_name_returns_none(self, monkeypatch):
+        from agent import executor as exec_mod
+        vm = Mock()
+        vm.read.side_effect = lambda req: Mock()
+        monkeypatch.setattr(
+            exec_mod, "MessageToDict",
+            lambda obj: {"content": "---\nfull_name: Lukas Brenner\n---\n"},
+        )
+        # Message is already the full name, no expansion needed
+        result = exec_mod._expand_answer_to_full_name(
+            "Lukas Brenner", ["file.md"], vm,
+        )
+        assert result is None
+
+    def test_multi_line_answer_expands_each_line(self, monkeypatch):
+        from agent import executor as exec_mod
+        vm = Mock()
+        # Track which file is requested and return different content per file
+        path_contents = {
+            "a.md": "---\nfull_name: Lukas Brenner\n---\n",
+            "b.md": "---\nfull_name: Miles Novak\n---\n",
+        }
+
+        def fake_read(req):
+            resp = Mock()
+            resp._fake_path = req.path
+            return resp
+        vm.read.side_effect = fake_read
+        monkeypatch.setattr(
+            exec_mod, "MessageToDict",
+            lambda obj: {"content": path_contents.get(obj._fake_path, "")},
+        )
+
+        result = exec_mod._expand_answer_to_full_name(
+            "Lukas\nMiles", ["a.md", "b.md"], vm,
+        )
+        assert result == "Lukas Brenner\nMiles Novak"
+
+    def test_ambiguous_first_name_does_not_expand(self, monkeypatch):
+        """If two entities share a first name, do not auto-expand."""
+        from agent import executor as exec_mod
+        vm = Mock()
+        path_contents = {
+            "a.md": "---\nfull_name: John Smith\n---\n",
+            "b.md": "---\nfull_name: John Doe\n---\n",
+        }
+
+        def fake_read(req):
+            resp = Mock()
+            resp._fake_path = req.path
+            return resp
+        vm.read.side_effect = fake_read
+        monkeypatch.setattr(
+            exec_mod, "MessageToDict",
+            lambda obj: {"content": path_contents.get(obj._fake_path, "")},
+        )
+
+        result = exec_mod._expand_answer_to_full_name(
+            "John", ["a.md", "b.md"], vm,
+        )
+        # Ambiguous — should NOT expand (too risky)
+        assert result is None
