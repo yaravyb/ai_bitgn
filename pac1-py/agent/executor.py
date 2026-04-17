@@ -670,22 +670,30 @@ def _expand_answer_to_full_name(
 ) -> str | None:
     """Expand a truncated identifier answer to its canonical full value.
 
-    Catches the common "Lukas" vs "Lukas Brenner" truncation pattern
-    where the executor answered with a short name (first word) but an
-    entity record has a longer `full_name`.
+    Schema-agnostic: scans ALL YAML string values in read files and
+    finds any value that is a strict expansion of the answer (starts
+    with the answer followed by a space — i.e. the answer is a prefix
+    word of a multi-word value).  Does NOT hardcode field names like
+    `full_name`, `display_name`, etc.
 
-    Task-agnostic: operates on any YAML identity record that has a
-    `full_name` field — works equally for people, projects, or any
-    other named entities.  No domain keywords or folder assumptions.
+    Example: message = "Lukas".  Any YAML record with a string value
+    like "Lukas Brenner" — regardless of which field it's in — will
+    trigger an expansion to "Lukas Brenner".
+
+    Safety:
+    - Only expands if exactly one unambiguous full form exists
+    - Two records with different full forms starting with the same
+      prefix cause no expansion (ambiguous)
+    - Multi-line answers expanded per-line
 
     Returns the corrected message, or None if no expansion applies.
     """
     if not message:
         return None
 
-    # Gather (short → full) mappings from any read file whose YAML
-    # frontmatter declares a `full_name`.  Structural detection only.
-    expansions: dict[str, str] = {}
+    # Collect candidate "long values" from YAML frontmatter of every
+    # read file.  We don't care about field names — only values.
+    long_values: set[str] = set()
     for path in files_read:
         try:
             norm = path.lstrip("/")
@@ -704,40 +712,44 @@ def _expand_answer_to_full_name(
             continue
         if not isinstance(fm, dict):
             continue
-        full_name = fm.get("full_name")
-        if not isinstance(full_name, str) or not full_name.strip():
-            continue
-        full_name = full_name.strip()
-        # Register expansions from: short `name` field, and first-word
-        # of full_name (covers "Lukas" → "Lukas Brenner" when the file
-        # only has a full_name field).
-        short_name = fm.get("name")
-        if isinstance(short_name, str) and short_name.strip():
-            short = short_name.strip()
-            if short != full_name and full_name.startswith(short):
-                expansions[short] = full_name
-        parts = full_name.split()
-        if len(parts) > 1:
-            first_word = parts[0]
-            # Only register if we don't already have a conflicting entry
-            # (avoid ambiguity: two entities sharing a first name)
-            if first_word not in expansions:
-                expansions[first_word] = full_name
-            elif expansions[first_word] != full_name:
-                # Ambiguous first name — don't auto-expand it
-                expansions[first_word] = ""  # sentinel: ambiguous
+        # Flatten: collect every string value (recurse into lists/dicts)
+        def _collect(obj):
+            if isinstance(obj, str):
+                s = obj.strip()
+                if " " in s and len(s) <= 100:
+                    long_values.add(s)
+            elif isinstance(obj, list):
+                for item in obj:
+                    _collect(item)
+            elif isinstance(obj, dict):
+                for v in obj.values():
+                    _collect(v)
+        _collect(fm)
 
-    if not expansions:
+    if not long_values:
         return None
 
-    # Apply per-line so multi-name answers (one per line) are handled
+    def _try_expand(token: str) -> str | None:
+        """Return the single unambiguous expansion of token, or None."""
+        if not token:
+            return None
+        # Find all multi-word values where `token` is the first whole word
+        prefix = token + " "
+        candidates = {v for v in long_values if v.startswith(prefix)}
+        # Exactly one unambiguous expansion?
+        if len(candidates) == 1:
+            return next(iter(candidates))
+        return None  # 0 or many — don't expand
+
+    # Per-line expansion so multi-name answers are handled
     lines = message.split("\n")
     changed = False
     new_lines: list[str] = []
     for line in lines:
         stripped = line.strip()
-        if stripped in expansions and expansions[stripped]:
-            new_lines.append(expansions[stripped])
+        expanded = _try_expand(stripped)
+        if expanded and expanded != stripped:
+            new_lines.append(expanded)
             changed = True
         else:
             new_lines.append(line)

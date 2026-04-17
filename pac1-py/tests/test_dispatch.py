@@ -381,24 +381,34 @@ class TestExpandAnswerToFullName:
         assert _expand_answer_to_full_name("Lukas", [], mock_vm) is None
 
     def test_expands_first_word_to_full_name(self, monkeypatch):
+        """Works regardless of which YAML field holds the long value."""
         from agent import executor as exec_mod
         vm = Mock()
-
-        # Patch vm.read + MessageToDict behaviour
-        def fake_read(req):
-            return Mock()
-        vm.read.side_effect = fake_read
-
-        def fake_to_dict(obj):
-            # Simulate an entity file with full_name field
-            return {"content": "---\nfull_name: Lukas Brenner\nbirthday: 1988-03-26\n---\n"}
-
-        monkeypatch.setattr(exec_mod, "MessageToDict", fake_to_dict)
-
+        vm.read.side_effect = lambda req: Mock()
+        # Field named full_name — common case
+        monkeypatch.setattr(
+            exec_mod, "MessageToDict",
+            lambda obj: {"content": "---\nfull_name: Lukas Brenner\nbirthday: 1988-03-26\n---\n"},
+        )
         result = exec_mod._expand_answer_to_full_name(
             "Lukas", ["10_entities/cast/lukas.md"], vm,
         )
         assert result == "Lukas Brenner"
+
+    def test_expands_regardless_of_field_name(self, monkeypatch):
+        """Schema-agnostic: works with any field name."""
+        from agent import executor as exec_mod
+        vm = Mock()
+        vm.read.side_effect = lambda req: Mock()
+        # Different schema: field named `display_name` instead of `full_name`
+        monkeypatch.setattr(
+            exec_mod, "MessageToDict",
+            lambda obj: {"content": "---\ndisplay_name: Jane Smith\nrole: admin\n---\n"},
+        )
+        result = exec_mod._expand_answer_to_full_name(
+            "Jane", ["someone.md"], vm,
+        )
+        assert result == "Jane Smith"
 
     def test_already_full_name_returns_none(self, monkeypatch):
         from agent import executor as exec_mod
