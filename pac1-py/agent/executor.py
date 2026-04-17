@@ -1124,12 +1124,15 @@ def run_agent(
             vm, grounding, list(tm_exec._files_read), stem_index,
         )
 
-    # Ensure attachment paths we read for validator-grounding are ALSO in
-    # the final grounding_refs submitted with the answer (the benchmark
-    # may require attachments to be listed as references).
+    # Ensure ALL files touched during execution are in grounding_refs:
+    # - reads (source data used to derive the answer)
+    # - writes (files created/modified as part of the answer)
+    # - validator-grounded attachments (files referenced in pending writes)
+    # The benchmark may require any of these as references.
     if outcome == OUTCOME_OK:
-        for ref in all_refs:
-            if ref not in grounding:
+        touched = list(all_refs) + list(tm_exec._files_written)
+        for ref in touched:
+            if ref and ref not in grounding:
                 grounding.append(ref)
 
     # Submit the final answer
