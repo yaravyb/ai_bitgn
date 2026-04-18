@@ -878,10 +878,16 @@ def _check_incomplete_request(
 ) -> str | None:
     """Detect incomplete batch requests where the agent silently skipped work.
 
-    Uses an LLM judge with both signals (failed reads + completion message)
-    as evidence.  The judge decides whether the task was asking to process
-    items that couldn't be completed, vs. the agent exploring wrong paths
-    during search.
+    Two-tier detection, fastest path first:
+
+    1. STRUCTURAL (free, deterministic): if a failed-read's filename is
+       literally named in the agent's completion message, the batch
+       was incomplete — the agent explicitly references a file it
+       couldn't process.
+
+    2. LLM judge (only if structural didn't fire): for cases where the
+       agent describes incompleteness without naming the file, or uses
+       non-English phrasing.  Optional — LLM failures are tolerated.
 
     Returns override outcome or None.
     """
@@ -891,10 +897,8 @@ def _check_incomplete_request(
     if not pending:
         return None
 
-    # Only run for batch-style tasks — detected structurally as
-    # "has at least one deferred delete AND at least one deferred write".
-    # This is the generic signature of a task that processes incoming
-    # items (deletes source after processing) and produces outputs.
+    # Batch-pattern gate: must have both a delete and a write (the shape
+    # of an inbox-style "process N items" task).
     has_delete = any(op["op"] == "delete" for op in pending)
     has_write = any(op["op"] == "write" for op in pending)
     if not (has_delete and has_write):
@@ -904,7 +908,8 @@ def _check_incomplete_request(
     if not msg:
         return None
 
-    # Collect evidence: failed reads (excluding deferred-write paths)
+    # Exclude failed reads that are also in pending writes (those were
+    # already handled by _drop_fabricated_writes).
     written_paths = {
         op["args"].get("path", "").lstrip("/")
         for op in pending
@@ -915,87 +920,52 @@ def _check_incomplete_request(
         if p.lstrip("/") not in written_paths
     ]
 
-    failed_reads_block = ""
-    if real_failed:
-        failed_reads_block = (
-            "\nFiles the agent tried to read but failed "
-            "(may be task-related OR exploratory misses):\n"
-            + "\n".join(f"- {p}" for p in real_failed[:5])
-        )
+    if not real_failed:
+        return None  # nothing to be incomplete about
 
-    system_msg = (
-        "You judge whether a batch task was incompletely fulfilled.\n\n"
-        "A batch task is one where the user asked the agent to process "
-        "MULTIPLE specific items (files, records, entities).  It is "
-        "incompletely fulfilled when the agent completed SOME but not "
-        "ALL of the explicitly requested items.\n\n"
-        "Evidence to consider:\n"
-        "- The task text (what was requested)\n"
-        "- The agent's completion message (what it says it did)\n"
-        "- Files the agent tried to read but failed (these might be "
-        "task-referenced items that don't exist, OR the agent "
-        "exploring wrong paths during search — distinguish carefully)\n\n"
-        "Answer ONLY 'true' or 'false':\n"
-        "- true = the task asked for N items, the agent completed fewer "
-        "(e.g. inbox message listed 5 files, agent could only process "
-        "4 because the 5th doesn't exist and this was explicitly "
-        "mentioned in the agent's message).\n"
-        "- false = either the task succeeded in full, OR the failed "
-        "reads were the agent's own search attempts (not items the "
-        "task explicitly asked to process)."
-    )
-    user_msg = (
-        f"Task: {task_text}\n\n"
-        f"Agent's completion message:\n{msg[:1500]}"
-        f"{failed_reads_block}\n\n"
-        "Did the agent incompletely fulfill a batch request?"
-    )
-
-    # Retry once on empty responses; treat empty as skip, not as "false"
-    answer = ""
-    for attempt in range(2):
-        try:
-            resp = call_llm_no_tools(
-                config, model,
-                [{"role": "system", "content": system_msg},
-                 {"role": "user", "content": user_msg}],
-                metadata=metadata, max_tokens=8,
-            )
-            answer = resp.choices[0].message.content.strip().lower()
-            if answer:
-                break
-        except Exception as exc:
-            if attempt == 0:
-                continue
-            print(f"  {CLI_DIM}incomplete-judge skipped: {exc}{CLI_CLR}")
-            return None
-
-    # Deterministic fallback for when the LLM judge returns empty (silent
-    # failure mode).  If any failed-read path is mentioned BY FILENAME in
-    # the agent's completion message, the batch was incomplete — the
-    # agent literally named a file it couldn't process.  This is a
-    # structural signal independent of LLM reliability.
-    def _message_names_failed_read() -> bool:
-        for p in real_failed:
-            basename = p.rstrip("/").split("/")[-1]
-            # Match whole filename in the message (avoid partial overlaps)
-            if basename and basename in msg:
-                return True
-        return False
-
-    if not answer:
-        if _message_names_failed_read():
-            print(f"  {CLI_YELLOW}incomplete-request fix: LLM judge empty but "
-                  f"failed-read file named in message → CLARIFICATION{CLI_CLR}")
+    # Tier 1 — structural check: agent's message names a failed-read file
+    for p in real_failed:
+        basename = p.rstrip("/").split("/")[-1]
+        if basename and basename in msg:
+            print(f"  {CLI_YELLOW}incomplete-request fix: failed-read "
+                  f"'{basename}' named in message → CLARIFICATION{CLI_CLR}")
             return "OUTCOME_NONE_CLARIFICATION"
-        print(f"  {CLI_DIM}incomplete-judge: LLM returned empty — skipping{CLI_CLR}")
-        return None  # no LLM signal, no structural signal → safe to skip
+
+    # Tier 2 — LLM judge for cases where the agent describes the gap
+    # without naming the file (e.g. "I processed 4 of 5 requested files"
+    # in Chinese/French without filenames).  Optional; silent failures
+    # preserve OK outcome.
+    failed_reads_block = (
+        "\nFiles the agent tried to read but failed:\n"
+        + "\n".join(f"- {p}" for p in real_failed[:5])
+    )
+    try:
+        resp = call_llm_no_tools(
+            config, model,
+            [
+                {"role": "system", "content": (
+                    "You judge whether a batch task was incompletely "
+                    "fulfilled.  Answer 'true' if the agent processed "
+                    "fewer items than the task requested and this is "
+                    "reflected in the completion message; 'false' "
+                    "otherwise.  One word only."
+                )},
+                {"role": "user", "content": (
+                    f"Task: {task_text}\n\n"
+                    f"Agent's message:\n{msg[:1500]}"
+                    f"{failed_reads_block}"
+                )},
+            ],
+            metadata=metadata, max_tokens=8,
+        )
+        answer = resp.choices[0].message.content.strip().lower()
+    except Exception:
+        return None  # LLM unreachable; skip this tier silently
 
     if "true" in answer:
-        print(f"  {CLI_YELLOW}incomplete-request fix: LLM judge found "
-              f"incomplete batch fulfillment → CLARIFICATION{CLI_CLR}")
+        print(f"  {CLI_YELLOW}incomplete-request fix: LLM judge "
+              f"found incompleteness → CLARIFICATION{CLI_CLR}")
         return "OUTCOME_NONE_CLARIFICATION"
-    print(f"  {CLI_DIM}incomplete-judge: LLM said '{answer[:40]}' — no override{CLI_CLR}")
     return None
 
 
