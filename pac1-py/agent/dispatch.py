@@ -544,7 +544,7 @@ def _run_compiled(compiled, ns):
     exec(compiled, ns)  # noqa: S102 — restricted namespace, LLM-generated parser only
 
 
-def _load_records(vm, path: str, config: "AgentConfig | None" = None, model: str = "", metadata: dict | None = None) -> str:
+def _load_records(vm, path: str, config: "AgentConfig | None" = None, model: str = "", metadata: dict | None = None, tm: "TaskManager | None" = None) -> str:
     """Load all structured files from a folder into a pandas DataFrame.
 
     Parsing strategy (three phases):
@@ -552,6 +552,12 @@ def _load_records(vm, path: str, config: "AgentConfig | None" = None, model: str
     2. If many files unparsed AND model available, generate a Python parser
        via single LLM call and apply it (adaptive, one-shot)
     3. Build DataFrame, auto-detect types, extract dates from filenames
+
+    If `tm` is provided, every successfully-read file is also registered
+    via tm.track_read() so it appears in the agent's grounding_refs.
+    Without this, aggregation tasks using load_records + calculate
+    produce answers with no traceable source files, causing benchmark
+    "missing required reference" failures.
     """
     global _loaded_records, _loaded_df
 
@@ -570,13 +576,18 @@ def _load_records(vm, path: str, config: "AgentConfig | None" = None, model: str
 
     # Phase 1: Read all file contents upfront
     file_contents: dict[str, str] = {}
+    folder = path.strip("/")
     for fname in files:
-        fpath = f"{path.strip('/')}/{fname}"
+        fpath = f"{folder}/{fname}"
         try:
             result = vm.read(ReadRequest(path=fpath))
             content = MessageToDict(result).get("content", "")
             if content:
                 file_contents[fname] = content
+                # Register as a grounding-eligible read so the final
+                # answer can cite these files (benchmark may require it)
+                if tm is not None:
+                    tm.track_read(fpath)
         except Exception:
             pass
 
@@ -741,7 +752,7 @@ def dispatch(
         "read": lambda: vm.read(ReadRequest(path=args["path"])),
         "current_date": lambda: vm.context(ContextRequest()),
         "calculate": lambda: _safe_calculate(args.get("expression", "")),
-        "load_records": lambda: _load_records(vm, args.get("path", ""), config=config, model=model, metadata=metadata),
+        "load_records": lambda: _load_records(vm, args.get("path", ""), config=config, model=model, metadata=metadata, tm=tm),
         "load_skill": lambda: load_skill(vm, skill_loader, args.get("name", args.get("path", ""))) if skill_loader else "Error: no skill loader",
         "write": lambda: vm.write(WriteRequest(path=args["path"], content=_normalize_write_content(args["content"]))),
         "delete": lambda: vm.delete(DeleteRequest(path=args["path"])),
