@@ -970,9 +970,26 @@ def _check_incomplete_request(
             print(f"  {CLI_DIM}incomplete-judge skipped: {exc}{CLI_CLR}")
             return None
 
+    # Deterministic fallback for when the LLM judge returns empty (silent
+    # failure mode).  If any failed-read path is mentioned BY FILENAME in
+    # the agent's completion message, the batch was incomplete — the
+    # agent literally named a file it couldn't process.  This is a
+    # structural signal independent of LLM reliability.
+    def _message_names_failed_read() -> bool:
+        for p in real_failed:
+            basename = p.rstrip("/").split("/")[-1]
+            # Match whole filename in the message (avoid partial overlaps)
+            if basename and basename in msg:
+                return True
+        return False
+
     if not answer:
+        if _message_names_failed_read():
+            print(f"  {CLI_YELLOW}incomplete-request fix: LLM judge empty but "
+                  f"failed-read file named in message → CLARIFICATION{CLI_CLR}")
+            return "OUTCOME_NONE_CLARIFICATION"
         print(f"  {CLI_DIM}incomplete-judge: LLM returned empty — skipping{CLI_CLR}")
-        return None  # silent failure — don't override
+        return None  # no LLM signal, no structural signal → safe to skip
 
     if "true" in answer:
         print(f"  {CLI_YELLOW}incomplete-request fix: LLM judge found "
