@@ -930,7 +930,7 @@ def dispatch(
         )
         if structured_count >= 3:
             try:
-                load_result = _load_records(vm, list_path)
+                load_result = _load_records(vm, list_path, tm=tm)
                 if "Loaded" in load_result:
                     txt += f"\n\n[AUTO] {load_result}"
             except Exception:
