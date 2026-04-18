@@ -523,3 +523,59 @@ class TestExpandAnswerToFullName:
             lambda obj: {"content": "---\ncode: AB Corp Ltd\n---\n"},
         )
         assert exec_mod._expand_answer_to_full_name("AB", ["x.md"], vm) is None
+
+
+class TestDropFabricatedWrites:
+    def test_no_failed_reads_is_noop(self):
+        from agent.executor import _drop_fabricated_writes
+        tm = TaskManager()
+        pending = [{"op": "write", "args": {"path": "/a.md", "content": "x"}}]
+        _drop_fabricated_writes(pending, tm)
+        assert len(pending) == 1  # unchanged
+
+    def test_drops_write_matching_failed_read(self):
+        from agent.executor import _drop_fabricated_writes
+        tm = TaskManager()
+        tm.track_read_error("/bad.md")
+        pending = [
+            {"op": "write", "args": {"path": "/good.md", "content": "ok"}},
+            {"op": "write", "args": {"path": "/bad.md", "content": "fabricated"}},
+        ]
+        _drop_fabricated_writes(pending, tm)
+        assert len(pending) == 1
+        assert pending[0]["args"]["path"] == "/good.md"
+
+    def test_keeps_writes_to_unread_paths(self):
+        """Writes to NEW paths (never read) are legitimate creations."""
+        from agent.executor import _drop_fabricated_writes
+        tm = TaskManager()
+        tm.track_read_error("/missing.md")
+        pending = [
+            {"op": "write", "args": {"path": "/outbox/new.md", "content": "new"}},
+        ]
+        _drop_fabricated_writes(pending, tm)
+        assert len(pending) == 1  # untouched — never attempted to read it
+
+    def test_preserves_delete_ops(self):
+        """Only write ops are subject to the drop rule."""
+        from agent.executor import _drop_fabricated_writes
+        tm = TaskManager()
+        tm.track_read_error("/some.md")
+        pending = [
+            {"op": "delete", "args": {"path": "/some.md"}},  # delete is fine
+            {"op": "write", "args": {"path": "/some.md", "content": "x"}},  # write is fabrication
+        ]
+        _drop_fabricated_writes(pending, tm)
+        assert len(pending) == 1
+        assert pending[0]["op"] == "delete"
+
+    def test_path_leading_slash_normalization(self):
+        """Handles paths with and without leading slash equivalently."""
+        from agent.executor import _drop_fabricated_writes
+        tm = TaskManager()
+        tm.track_read_error("some/dir/file.md")  # no leading slash
+        pending = [
+            {"op": "write", "args": {"path": "/some/dir/file.md", "content": "x"}},
+        ]
+        _drop_fabricated_writes(pending, tm)
+        assert len(pending) == 0  # should still match and drop

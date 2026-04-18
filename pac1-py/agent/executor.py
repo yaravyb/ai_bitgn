@@ -437,6 +437,37 @@ def _run_executor(
     return None, tm
 
 
+def _drop_fabricated_writes(pending: list[dict], tm: "TaskManager") -> None:
+    """Remove pending writes whose target path was a failed read.
+
+    Agents sometimes hallucinate content for files that don't exist:
+    they try to read a path, get "file not found", then write
+    plausible content anyway.  The path-in-_failed_reads signal is
+    a deterministic fabrication marker — no legitimate use case
+    both fails to read a path AND writes content to it in the same
+    batch (except the trivial "create missing file" case, which
+    wouldn't be preceded by a read attempt).
+
+    Task-agnostic: operates purely on the (failed_reads, pending_writes)
+    overlap — no folder names, schemas, or task-text assumptions.
+    """
+    if not tm._failed_reads:
+        return
+    failed_set = {p.lstrip("/") for p in tm._failed_reads}
+    to_remove = []
+    for i, op in enumerate(pending):
+        if op["op"] != "write":
+            continue
+        path = op["args"].get("path", "").lstrip("/")
+        if path in failed_set:
+            to_remove.append(i)
+            print(f"  {CLI_YELLOW}fabrication-drop: {path} "
+                  f"(failed read + write to same path){CLI_CLR}")
+    # Remove from highest index down to preserve earlier indices
+    for i in reversed(to_remove):
+        pending.pop(i)
+
+
 def _fix_queue_order(pending: list[dict]) -> None:
     """Correct queue_order_id in pending writes by re-sorting paths alphanumerically.
 
@@ -1111,6 +1142,12 @@ def run_agent(
     outcome = result["outcome"]
     message = result["message"]
     execution_context = result.get("execution_context", "")
+
+    # Drop writes to paths that had failed reads (fabrication signal).
+    # Must run BEFORE validator so the validator sees only legit writes.
+    if outcome == OUTCOME_OK:
+        pending = tm_exec.get_pending_writes()
+        _drop_fabricated_writes(pending, tm_exec)
 
     # Deterministic pre-checks: detect incomplete requests BEFORE validator
     if outcome == OUTCOME_OK:
