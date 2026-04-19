@@ -437,6 +437,62 @@ def _run_executor(
     return None, tm
 
 
+def _drop_duplicate_reply_writes(pending: list[dict]) -> None:
+    """Keep only the last of duplicate reply writes.
+
+    When the agent makes multiple deferred writes to the same folder
+    and both have YAML frontmatter with IDENTICAL `to:` fields, they
+    are redundant — the agent wrote a draft and then a final version,
+    or iterated by mistake.  Keep the last write in each duplicate
+    group (LLMs typically finalize last).
+
+    Task-agnostic: uses only the file-system tool ops and a common
+    email-protocol convention (`to:` field).  No folder names, domain
+    words, or task-specific patterns.
+    """
+    groups: dict[tuple[str, str], list[int]] = {}
+    for i, op in enumerate(pending):
+        if op["op"] != "write":
+            continue
+        path = op["args"].get("path", "")
+        if not path.endswith(".md"):
+            continue
+        content = op["args"].get("content", "")
+        if not content.startswith("---"):
+            continue
+        end = content.find("\n---", 3)
+        if end == -1:
+            continue
+        try:
+            fm = _yaml.safe_load(content[4:end])
+        except Exception:
+            continue
+        if not isinstance(fm, dict):
+            continue
+        to_value = fm.get("to", "")
+        if isinstance(to_value, list):
+            to_value = to_value[0] if to_value else ""
+        to_str = str(to_value).strip().lower()
+        if not to_str or "@" not in to_str:
+            continue
+        folder = path.rsplit("/", 1)[0] if "/" in path else ""
+        key = (folder, to_str)
+        groups.setdefault(key, []).append(i)
+
+    to_remove: list[int] = []
+    for indices in groups.values():
+        if len(indices) > 1:
+            # Keep last, drop earlier
+            for i in indices[:-1]:
+                to_remove.append(i)
+                path = pending[i]["args"].get("path", "?")
+                print(f"  {CLI_YELLOW}dup-write-drop: {path} "
+                      f"(same folder+to: as later write){CLI_CLR}")
+
+    for i in sorted(to_remove, reverse=True):
+        pending.pop(i)
+
+
 def _drop_fabricated_writes(pending: list[dict], tm: "TaskManager") -> None:
     """Remove pending writes whose target path was a failed read.
 
@@ -1113,6 +1169,14 @@ def run_agent(
         strategy_steps=strategy_steps,
     )
 
+    # Register bootstrap-read files as grounding sources.  Bootstrap
+    # reads AGENTS.md + README.md directly via vm.read (bypassing the
+    # dispatch that normally calls tm.track_read).  Without this, the
+    # validator can't verify answers derived from bootstrap context,
+    # and grounding_refs misses these files.
+    for path in phase1_ctx.get("read_paths", []):
+        tm_exec.track_read(path)
+
     if not result:
         print(f"{CLI_RED}Executor returned no result{CLI_CLR}")
         try:
@@ -1131,10 +1195,12 @@ def run_agent(
     execution_context = result.get("execution_context", "")
 
     # Drop writes to paths that had failed reads (fabrication signal).
-    # Must run BEFORE validator so the validator sees only legit writes.
+    # Drop duplicate reply writes (same folder + `to:` field).
+    # Both must run BEFORE validator so it sees only legit, non-redundant writes.
     if outcome == OUTCOME_OK:
         pending = tm_exec.get_pending_writes()
         _drop_fabricated_writes(pending, tm_exec)
+        _drop_duplicate_reply_writes(pending)
 
     # Deterministic pre-checks: detect incomplete requests BEFORE validator
     if outcome == OUTCOME_OK:

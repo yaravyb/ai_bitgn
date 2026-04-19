@@ -599,3 +599,82 @@ class TestDropFabricatedWrites:
         ]
         _drop_fabricated_writes(pending, tm)
         assert len(pending) == 0  # should still match and drop
+
+
+class TestDropDuplicateReplyWrites:
+    def test_no_writes_is_noop(self):
+        from agent.executor import _drop_duplicate_reply_writes
+        pending = []
+        _drop_duplicate_reply_writes(pending)
+        assert pending == []
+
+    def test_single_write_is_kept(self):
+        from agent.executor import _drop_duplicate_reply_writes
+        pending = [
+            {"op": "write", "args": {
+                "path": "/outbox/a.md",
+                "content": "---\nto: alice@example.com\n---\nhi",
+            }},
+        ]
+        _drop_duplicate_reply_writes(pending)
+        assert len(pending) == 1
+
+    def test_duplicate_to_field_keeps_last(self):
+        """Two writes to same folder, identical `to:` → keep last."""
+        from agent.executor import _drop_duplicate_reply_writes
+        pending = [
+            {"op": "write", "args": {
+                "path": "/outbox/eml_draft.md",
+                "content": "---\nto: alice@example.com\n---\ndraft",
+            }},
+            {"op": "write", "args": {
+                "path": "/outbox/eml_final.md",
+                "content": "---\nto: alice@example.com\n---\nfinal",
+            }},
+        ]
+        _drop_duplicate_reply_writes(pending)
+        assert len(pending) == 1
+        assert "final" in pending[0]["args"]["content"]  # last one kept
+
+    def test_different_recipients_both_kept(self):
+        """Writes to different recipients are NOT duplicates."""
+        from agent.executor import _drop_duplicate_reply_writes
+        pending = [
+            {"op": "write", "args": {
+                "path": "/outbox/to_alice.md",
+                "content": "---\nto: alice@example.com\n---\nhi",
+            }},
+            {"op": "write", "args": {
+                "path": "/outbox/to_bob.md",
+                "content": "---\nto: bob@example.com\n---\nhi",
+            }},
+        ]
+        _drop_duplicate_reply_writes(pending)
+        assert len(pending) == 2  # different recipients, both kept
+
+    def test_different_folders_both_kept(self):
+        """Same `to:` in different folders is NOT a duplicate (could be
+        different workflow stages like drafts/ and outbox/)."""
+        from agent.executor import _drop_duplicate_reply_writes
+        pending = [
+            {"op": "write", "args": {
+                "path": "/drafts/a.md",
+                "content": "---\nto: alice@example.com\n---\n",
+            }},
+            {"op": "write", "args": {
+                "path": "/outbox/a.md",
+                "content": "---\nto: alice@example.com\n---\n",
+            }},
+        ]
+        _drop_duplicate_reply_writes(pending)
+        assert len(pending) == 2
+
+    def test_no_yaml_frontmatter_not_dedup(self):
+        """Writes without YAML frontmatter aren't subject to dedup."""
+        from agent.executor import _drop_duplicate_reply_writes
+        pending = [
+            {"op": "write", "args": {"path": "/outbox/a.md", "content": "plain text"}},
+            {"op": "write", "args": {"path": "/outbox/b.md", "content": "plain text"}},
+        ]
+        _drop_duplicate_reply_writes(pending)
+        assert len(pending) == 2

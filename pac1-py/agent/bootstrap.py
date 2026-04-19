@@ -19,7 +19,7 @@ def phase1_bootstrap(vm: PcmRuntimeClientSync) -> dict:
       - readmes: concatenated README.md contents
       - skill_paths: list of doc paths from docs/ and 99_process/
     """
-    ctx: dict = {"directory_tree": "", "agents_md": ""}
+    ctx: dict = {"directory_tree": "", "agents_md": "", "read_paths": []}
 
     print(f"\n{CLI_BOLD}{'─' * 50}{CLI_CLR}")
     print(f"{CLI_BOLD}Phase 1: Bootstrap{CLI_CLR} {CLI_DIM}(deterministic, no LLM){CLI_CLR}")
@@ -81,6 +81,7 @@ def phase1_bootstrap(vm: PcmRuntimeClientSync) -> dict:
             if content:
                 print(f"  {CLI_CYAN}read{CLI_CLR} {path} ✓")
                 parts.append(f"## {path}\n\n{content}")
+                ctx["read_paths"].append(path)
         except Exception as exc:
             log.warning("Phase 1: read %s failed: %s", path, exc)
 
@@ -104,6 +105,7 @@ def phase1_bootstrap(vm: PcmRuntimeClientSync) -> dict:
             if content:
                 print(f"  {CLI_CYAN}read{CLI_CLR} {path} ✓")
                 readme_parts.append(f"## {path}\n\n{content}")
+                ctx["read_paths"].append(path)
         except Exception:
             pass
     ctx["readmes"] = "\n\n---\n\n".join(readme_parts)
