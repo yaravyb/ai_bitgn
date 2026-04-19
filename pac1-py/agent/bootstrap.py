@@ -2,10 +2,10 @@ import json
 import logging
 
 from bitgn.vm.pcm_connect import PcmRuntimeClientSync
-from bitgn.vm.pcm_pb2 import FindRequest, ReadRequest, TreeRequest
+from bitgn.vm.pcm_pb2 import ReadRequest, TreeRequest
 from google.protobuf.json_format import MessageToDict
 
-from agent.prompts import CLI_BOLD, CLI_CLR, CLI_CYAN, CLI_DIM, CLI_RED, CLI_YELLOW
+from agent.prompts import CLI_BOLD, CLI_CLR, CLI_CYAN, CLI_DIM, CLI_RED
 
 log = logging.getLogger(__name__)
 
@@ -35,41 +35,29 @@ def phase1_bootstrap(vm: PcmRuntimeClientSync) -> dict:
         print(f"  {CLI_RED}tree ✗ {exc}{CLI_CLR}")
         log.warning("Phase 1: tree failed: %s", exc)
 
-    # 2. Find and read ALL AGENTS.md files
-    #    Primary: use find to locate them. Fallback: try known paths from tree.
+    # 2. Extract AGENTS.MD paths from the tree (case-insensitive).
+    # NOTE: vm.find() was attempted here originally but is case-sensitive
+    # and never matched the uppercase .MD extension used in this workspace.
+    # Tree-based extraction is deterministic and handles any case.
+    def _extract_paths(node: dict, prefix: str = "", target: str = "AGENTS.MD") -> list[str]:
+        paths = []
+        name = node.get("name", "")
+        if name == "/":
+            current = ""
+        else:
+            current = f"{prefix}/{name}"
+        if name.upper() == target and not node.get("isDir"):
+            paths.append(current)
+        for child in node.get("children", []):
+            paths.extend(_extract_paths(child, current, target))
+        return paths
+
     agents_paths: list[str] = []
-    try:
-        result = vm.find(FindRequest(name="AGENTS.md", root="/", type=1, limit=10))
-        find_dict = MessageToDict(result)
-        for entry in find_dict.get("entries", []):
-            p = entry.get("path", "")
-            if p:
-                agents_paths.append(p)
-        log.info("Phase 1: find returned %d entries: %s", len(agents_paths), agents_paths)
-    except Exception as exc:
-        log.warning("Phase 1: find AGENTS.md failed: %s", exc)
-
-    # Fallback: extract AGENTS.md paths from the tree we already have
-    if not agents_paths and ctx["directory_tree"]:
-        def _extract_paths(node: dict, prefix: str = "", target: str = "AGENTS.MD") -> list[str]:
-            paths = []
-            name = node.get("name", "")
-            if name == "/":
-                current = ""
-            else:
-                current = f"{prefix}/{name}"
-            if name.upper() == target and not node.get("isDir"):
-                paths.append(current)
-            for child in node.get("children", []):
-                paths.extend(_extract_paths(child, current, target))
-            return paths
-
+    if ctx["directory_tree"]:
         try:
             tree_data = json.loads(ctx["directory_tree"])
             root_node = tree_data.get("root", tree_data)
             agents_paths = _extract_paths(root_node, target="AGENTS.MD")
-            if agents_paths:
-                print(f"  {CLI_YELLOW}find fallback → extracted from tree: {agents_paths}{CLI_CLR}")
         except Exception:
             pass
 
