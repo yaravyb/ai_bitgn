@@ -43,6 +43,26 @@ class TestDispatch:
         # Should NOT contain "deleted" error
         assert "deleted" not in result.lower()
 
+    def test_shadow_read_returns_pending_write_content(self, mock_vm):
+        """Reading a path with a pending write returns that write's content.
+
+        Without this, an agent reading back its own deferred write would
+        hit the VM (which hasn't applied the write yet) and get a false
+        'file not found' that triggers spurious fabrication detection.
+        """
+        tm = TaskManager()
+        config = AgentConfig()
+        # Agent defers a write to a new outbox file
+        tm.defer_write("write", {"path": "/60_outbox/outbox/eml_X.md", "content": "---\nto: a@b\n---\nhi"})
+        tm.track_write("/60_outbox/outbox/eml_X.md")
+        # Agent reads it back (self-verification)
+        result = dispatch(mock_vm, "read", {"path": "/60_outbox/outbox/eml_X.md"}, config, tm, defer_writes=True)
+        parsed = json.loads(result)
+        # Should return the written content, NOT a not-found error
+        assert "content" in parsed
+        assert "---\nto: a@b" in parsed["content"]
+        assert "error" not in parsed
+
     def test_shadow_list_filters_deferred_deletes(self, mock_vm):
         tm = TaskManager()
         config = AgentConfig()

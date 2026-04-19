@@ -812,15 +812,26 @@ def dispatch(
         deleted_norms = {p.lstrip("/") for p in tm.files_deleted}
         path = args.get("path", "")
         norm = path.lstrip("/")
-        if name == "read" and norm in deleted_norms:
-            # Check if re-written after delete (last deferred op wins)
+        if name == "read":
+            # Find the most recent pending op for this path, if any.
+            # Last-op wins: delete→write means the file exists (re-created),
+            # write→delete means it's gone, pure write means it exists.
             last_op = None
+            last_content = None
             for pw in tm.pending_writes:
                 pw_path = pw["args"].get("path", "").lstrip("/")
                 if pw_path == norm:
                     last_op = pw["op"]
-            if last_op != "write":
+                    if pw["op"] == "write":
+                        last_content = pw["args"].get("content", "")
+            if norm in deleted_norms and last_op != "write":
                 return json.dumps({"error": f"File not found: {path} (deleted)"})
+            # Reading a path that has a pending write → return the written
+            # content (agent reads its own deferred write).  Without this,
+            # the VM returns "file not found" because the write hasn't been
+            # applied yet, which triggers spurious fabrication-drop.
+            if last_op == "write" and last_content is not None:
+                return json.dumps({"content": last_content}, indent=2)
         if name == "list":
             # Get real listing, then filter out deferred deletes
             result = handler()
