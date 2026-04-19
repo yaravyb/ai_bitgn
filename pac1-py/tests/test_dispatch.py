@@ -670,11 +670,36 @@ class TestDropDuplicateReplyWrites:
         assert len(pending) == 2
 
     def test_no_yaml_frontmatter_not_dedup(self):
-        """Writes without YAML frontmatter aren't subject to dedup."""
+        """Writes without YAML frontmatter aren't subject to YAML-based dedup."""
         from agent.executor import _drop_duplicate_reply_writes
         pending = [
             {"op": "write", "args": {"path": "/outbox/a.md", "content": "plain text"}},
             {"op": "write", "args": {"path": "/outbox/b.md", "content": "plain text"}},
         ]
         _drop_duplicate_reply_writes(pending)
+        assert len(pending) == 2  # different paths + no YAML
+
+    def test_same_path_collapses_to_last(self):
+        """Two writes to the SAME path: last wins (overwrite semantics)."""
+        from agent.executor import _drop_duplicate_reply_writes
+        pending = [
+            {"op": "write", "args": {"path": "/outbox/x.md", "content": "first"}},
+            {"op": "write", "args": {"path": "/outbox/x.md", "content": "second"}},
+        ]
+        _drop_duplicate_reply_writes(pending)
+        assert len(pending) == 1
+        assert pending[0]["args"]["content"] == "second"
+
+    def test_same_path_collapses_with_intervening_op(self):
+        """Same-path collapse still fires even if a delete sits between."""
+        from agent.executor import _drop_duplicate_reply_writes
+        pending = [
+            {"op": "write", "args": {"path": "/outbox/x.md", "content": "first"}},
+            {"op": "delete", "args": {"path": "/inbox/y.md"}},
+            {"op": "write", "args": {"path": "/outbox/x.md", "content": "second"}},
+        ]
+        _drop_duplicate_reply_writes(pending)
         assert len(pending) == 2
+        # Delete preserved, only latest write remains
+        assert pending[0]["op"] == "delete"
+        assert pending[1]["args"]["content"] == "second"

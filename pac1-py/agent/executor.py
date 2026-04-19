@@ -438,21 +438,39 @@ def _run_executor(
 
 
 def _drop_duplicate_reply_writes(pending: list[dict]) -> None:
-    """Keep only the last of duplicate reply writes.
+    """Collapse multiple deferred writes to the same path or same logical target.
 
-    When the agent makes multiple deferred writes to the same folder
-    and both have YAML frontmatter with IDENTICAL `to:` fields, they
-    are redundant — the agent wrote a draft and then a final version,
-    or iterated by mistake.  Keep the last write in each duplicate
-    group (LLMs typically finalize last).
+    Two complementary rules, both task-agnostic:
 
-    Task-agnostic: uses only the file-system tool ops and a common
-    email-protocol convention (`to:` field).  No folder names, domain
-    words, or task-specific patterns.
+    1. SAME PATH: if the agent deferred two writes to the exact same
+       path, the later one wins (overwrite semantics).  Applying both
+       creates a spurious "unexpected write" signal to the benchmark.
+
+    2. SAME FOLDER + `to:`: if the agent wrote to different paths in
+       the same folder with identical YAML `to:` recipients (draft +
+       final pattern), keep only the last.  This is common when the
+       LLM iterates on its output without deleting the earlier one.
+
+    Both rules "keep last" because LLMs typically finalize iteratively.
     """
-    groups: dict[tuple[str, str], list[int]] = {}
+    # Rule 1: collapse same-path writes (keep last)
+    path_last_idx: dict[str, int] = {}
+    to_remove_rule1: set[int] = set()
     for i, op in enumerate(pending):
         if op["op"] != "write":
+            continue
+        path = op["args"].get("path", "").lstrip("/")
+        if path in path_last_idx:
+            # Earlier write exists — drop it
+            to_remove_rule1.add(path_last_idx[path])
+            print(f"  {CLI_YELLOW}dup-write-drop: {path} "
+                  f"(later write to same path){CLI_CLR}")
+        path_last_idx[path] = i
+
+    # Rule 2: collapse same-folder + same-`to:` writes (keep last)
+    groups: dict[tuple[str, str], list[int]] = {}
+    for i, op in enumerate(pending):
+        if i in to_remove_rule1 or op["op"] != "write":
             continue
         path = op["args"].get("path", "")
         if not path.endswith(".md"):
@@ -479,16 +497,16 @@ def _drop_duplicate_reply_writes(pending: list[dict]) -> None:
         key = (folder, to_str)
         groups.setdefault(key, []).append(i)
 
-    to_remove: list[int] = []
+    to_remove_rule2: set[int] = set()
     for indices in groups.values():
         if len(indices) > 1:
-            # Keep last, drop earlier
             for i in indices[:-1]:
-                to_remove.append(i)
+                to_remove_rule2.add(i)
                 path = pending[i]["args"].get("path", "?")
                 print(f"  {CLI_YELLOW}dup-write-drop: {path} "
                       f"(same folder+to: as later write){CLI_CLR}")
 
+    to_remove = to_remove_rule1 | to_remove_rule2
     for i in sorted(to_remove, reverse=True):
         pending.pop(i)
 
