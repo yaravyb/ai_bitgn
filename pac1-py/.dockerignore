@@ -1,0 +1,23 @@
+# VCS + editor
+.git
+.gitignore
+.vscode
+.idea
+
+# Python artefacts
+__pycache__
+*.pyc
+.venv
+
+# Local/test output
+runs/
+tests/
+
+# Secrets — belt + braces. Never bake env files into a layer.
+.env
+.env.*
+.env.docker
+.env_batch
+
+# Docs
+*.md
