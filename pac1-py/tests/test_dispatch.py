@@ -775,3 +775,218 @@ class TestSafeCalculateSyntaxHint:
         """R5 AC5 invariant: valid expressions unchanged."""
         from agent.dispatch import _safe_calculate
         assert _safe_calculate("1 + 2").strip() == "3"
+
+
+class TestParseLineItemsTable:
+    """R1: parser extracts ASCII line-item tables into list[dict] with the
+    four workspace-shape keys {item, qty, unit_eur, line_eur} (D1)."""
+
+    def test_parse_basic_4column_table(self):
+        from agent.dispatch import _parse_line_items_table
+        text = (
+            "| item   | qty | unit_eur | line_eur |\n"
+            "|--------|-----|----------|----------|\n"
+            "| Widget | 2   | 5.0      | 10.0     |\n"
+            "| Cable  | 1   | 3.5      | 3.5      |\n"
+        )
+        items = _parse_line_items_table(text)
+        assert isinstance(items, list)
+        assert len(items) == 2
+        assert items[0] == {"item": "Widget", "qty": 2, "unit_eur": 5.0, "line_eur": 10.0}
+        assert items[1] == {"item": "Cable", "qty": 1, "unit_eur": 3.5, "line_eur": 3.5}
+
+    def test_parse_5column_table_with_leading_index(self):
+        from agent.dispatch import _parse_line_items_table
+        text = (
+            "+---+-------------------+-----+----------+----------+\n"
+            "| # | item              | qty | unit_eur | line_eur |\n"
+            "+---+-------------------+-----+----------+----------+\n"
+            "| 1 | 2 TB SATA SSD     | 1   | 89       | 89       |\n"
+            "| 2 | USB clone adapter | 1   | 16       | 16       |\n"
+            "+---+-------------------+-----+----------+----------+\n"
+        )
+        items = _parse_line_items_table(text)
+        assert len(items) == 2
+        assert items[0]["item"] == "2 TB SATA SSD"
+        assert items[0]["qty"] == 1
+        assert items[0]["unit_eur"] == 89.0
+        assert items[0]["line_eur"] == 89.0
+        assert items[1]["item"] == "USB clone adapter"
+
+    def test_parse_cjk_vendor_name_in_cell(self):
+        """R1.c risk mitigation — CJK vendor content passes through the
+        ASCII `|`-split unchanged (research Q1)."""
+        from agent.dispatch import _parse_line_items_table
+        text = (
+            "| item           | qty | unit_eur | line_eur |\n"
+            "|----------------|-----|----------|----------|\n"
+            "| 深圳市海云电子 | 1   | 120.5    | 120.5    |\n"
+        )
+        items = _parse_line_items_table(text)
+        assert len(items) == 1
+        assert items[0]["item"] == "深圳市海云电子"
+        assert items[0]["line_eur"] == 120.5
+
+    def test_empty_body_returns_empty_list(self):
+        from agent.dispatch import _parse_line_items_table
+        assert _parse_line_items_table("") == []
+        assert _parse_line_items_table("No table here.\nJust prose.") == []
+
+    def test_parser_is_idempotent(self):
+        from agent.dispatch import _parse_line_items_table
+        text = (
+            "| item | qty | unit_eur | line_eur |\n"
+            "|------|-----|----------|----------|\n"
+            "| X    | 1   | 2.0      | 2.0      |\n"
+        )
+        a = _parse_line_items_table(text)
+        b = _parse_line_items_table(text)
+        assert a == b
+
+    def test_numeric_defaults_for_missing_cells(self):
+        """D1 null-safety: missing numeric → 0, missing string → empty."""
+        from agent.dispatch import _parse_line_items_table
+        text = (
+            "| item | qty | unit_eur | line_eur |\n"
+            "|------|-----|----------|----------|\n"
+            "| Foo  |     |          | 5.0      |\n"
+        )
+        items = _parse_line_items_table(text)
+        assert len(items) == 1
+        assert items[0]["item"] == "Foo"
+        assert items[0]["qty"] == 0
+        assert items[0]["unit_eur"] == 0.0
+        assert items[0]["line_eur"] == 5.0
+
+
+class TestLoadRecordsLineItemsColumn:
+    """R1 D2: `line_items` column survives as list[dict] past the
+    JSON-serialization pass, while other list/dict columns (e.g.
+    attachments) still emerge as JSON strings."""
+
+    def test_line_items_column_constant_exists(self):
+        from agent.dispatch import _LIST_COLUMN_EXEMPT
+        assert "line_items" in _LIST_COLUMN_EXEMPT
+
+    def test_load_records_preserves_line_items_list_dict(self, tmp_path, mock_vm):
+        """After parsing a synthetic bill, df['line_items'].iloc[0] must
+        stay a Python list of dicts (not a JSON string) — the carve-out
+        at dispatch.py:676-681 honors _LIST_COLUMN_EXEMPT."""
+        import agent.dispatch as dispatch_mod
+        from agent.config import AgentConfig
+
+        # Synthesize a bills folder with two bill files, both containing
+        # an ASCII line-items table.
+        bill1 = (
+            "---\nrecord_type: bill\ncounterparty: Acme Corp\n"
+            "purchased_on: 2026-02-07\ntotal_eur: 10.0\n---\n\n"
+            "| item   | qty | unit_eur | line_eur |\n"
+            "|--------|-----|----------|----------|\n"
+            "| Widget | 2   | 5.0      | 10.0     |\n"
+        )
+        bill2 = (
+            "---\nrecord_type: bill\ncounterparty: Beta Ltd\n"
+            "purchased_on: 2026-02-08\ntotal_eur: 3.5\n---\n\n"
+            "| item  | qty | unit_eur | line_eur |\n"
+            "|-------|-----|----------|----------|\n"
+            "| Cable | 1   | 3.5      | 3.5      |\n"
+        )
+
+        original_mtd = dispatch_mod.MessageToDict
+        responses = {
+            "list": {"entries": [
+                {"name": "bill_a.md", "isDir": False},
+                {"name": "bill_b.md", "isDir": False},
+                {"name": "bill_c.md", "isDir": False},
+            ]},
+            "read_bill_a.md": {"content": bill1},
+            "read_bill_b.md": {"content": bill2},
+            "read_bill_c.md": {"content": bill2},
+        }
+        call_state = {"last_kind": None, "last_path": None}
+
+        def mtd_patch(msg):
+            kind = call_state.get("last_kind")
+            path = call_state.get("last_path")
+            if kind == "list":
+                return responses["list"]
+            if kind == "read":
+                return responses.get(f"read_{path.rsplit('/', 1)[-1]}", {"content": ""})
+            return {}
+
+        # Wire the mock so each call updates call_state then uses mtd_patch.
+        def list_side_effect(req):
+            call_state["last_kind"] = "list"
+            call_state["last_path"] = getattr(req, "name", "")
+            return MagicMock()
+
+        def read_side_effect(req):
+            call_state["last_kind"] = "read"
+            call_state["last_path"] = getattr(req, "path", "")
+            return MagicMock()
+
+        mock_vm.list.side_effect = list_side_effect
+        mock_vm.read.side_effect = read_side_effect
+        dispatch_mod.MessageToDict = mtd_patch
+        try:
+            config = AgentConfig()
+            summary = dispatch_mod._load_records(
+                mock_vm, "bills/", config=config, model="", metadata=None, tm=None,
+            )
+            assert "Loaded" in summary or "records" in summary.lower()
+
+            df = dispatch_mod._loaded_df
+            assert df is not None, "loaded DataFrame must be populated"
+            assert "line_items" in df.columns, "line_items column must exist"
+            first = df["line_items"].iloc[0]
+            assert isinstance(first, list), (
+                f"line_items column must be list[dict], got {type(first)}"
+            )
+            if first:
+                assert isinstance(first[0], dict), (
+                    f"line_items entry must be dict, got {type(first[0])}"
+                )
+        finally:
+            dispatch_mod.MessageToDict = original_mtd
+
+    def test_load_records_still_serializes_non_exempt_list_columns(self):
+        """R1.a P0 regression guard — non-exempt list/dict columns still
+        round-trip through json.dumps, so existing `attachments:` queries
+        that assume JSON-string semantics keep working."""
+        import json as _json
+        import pandas as _pd
+        import agent.dispatch as dispatch_mod
+
+        # Directly verify the serialization loop behavior used in
+        # _load_records by running the equivalent code path on a tiny
+        # DataFrame carrying both line_items (exempt) and attachments
+        # (non-exempt).
+        df = _pd.DataFrame([
+            {
+                "_file": "msg.md",
+                "line_items": [{"item": "X", "qty": 1, "unit_eur": 2.0, "line_eur": 2.0}],
+                "attachments": ["outbox/a.md", "outbox/b.md"],
+            }
+        ])
+        for col in df.columns:
+            if col in dispatch_mod._LIST_COLUMN_EXEMPT:
+                continue
+            if df[col].apply(lambda x: isinstance(x, (list, dict))).any():
+                df[col] = df[col].apply(
+                    lambda x: _json.dumps(x) if isinstance(x, (list, dict)) else x
+                )
+
+        assert isinstance(df["line_items"].iloc[0], list), (
+            "line_items must survive as list"
+        )
+        assert isinstance(df["attachments"].iloc[0], str), (
+            "attachments must be JSON-stringified"
+        )
+        parsed_att = _json.loads(df["attachments"].iloc[0])
+        assert parsed_att == ["outbox/a.md", "outbox/b.md"]
+
+    def test_empty_line_items_default_for_files_without_table(self):
+        """R1 AC3: bill files with no line-item table default to []."""
+        from agent.dispatch import _parse_line_items_table
+        # Simulate the recovery path: if body has no table, we expect [].
+        assert _parse_line_items_table("just prose\nno tables here") == []

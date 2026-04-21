@@ -355,6 +355,13 @@ def _text_match(text: str, keywords: str) -> bool:
     return all(w.lower() in text_lower for w in keywords.split())
 
 
+# R1 D2: columns that MUST survive the _load_records JSON-serialization
+# pass as native Python types (list[dict]) instead of being stringified.
+# Downstream `calculate()` expressions use .apply(lambda items: ...) on
+# these columns, which requires the native shape.
+_LIST_COLUMN_EXEMPT: frozenset = frozenset({"line_items"})
+
+
 # R5 (D6): proactive statement-keyword sniffer — catches "multi-line script"
 # expressions BEFORE compile() so the LLM gets a targeted hint even when
 # the string technically parses as valid Python.
@@ -504,6 +511,109 @@ def _parse_ascii_table(text: str) -> dict | None:
             in_table = False
 
     return record if len(record) >= 3 else None
+
+
+def _parse_line_items_table(text: str) -> list[dict]:
+    """R1: parse an ASCII/pipe line-items table into a list of dicts.
+
+    Accepts both 4-column `| item | qty | unit_eur | line_eur |` and
+    5-column `| # | item | qty | unit_eur | line_eur |` variants. The
+    leading `#` index column is optional. Output dicts conform to D1:
+    ``{item: str, qty: int|float, unit_eur: float, line_eur: float}``.
+
+    Null-safety (D1): missing numeric fields default to ``0``; missing
+    string field ``item`` defaults to ``""``. Malformed rows (wrong
+    column count, header rows, separator rows, total/summary rows)
+    are dropped from the list. If the input contains no parseable
+    table, returns ``[]``.
+
+    Non-ASCII cell content (CJK, umlauts) passes through byte-for-byte:
+    the separator regex matches only ASCII ``+``/``-``/``|`` framing,
+    never the cell content itself (research Q1).
+    """
+    if not text:
+        return []
+
+    # A "data row" is any line that starts and ends with `|` after strip
+    # and is NOT an ASCII separator like `+---+---+`.
+    results: list[dict] = []
+    header_map: dict[str, int] | None = None  # column-name → index
+
+    for raw in text.split("\n"):
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        # ASCII separator rows (+---+---+ or |---|---|)
+        if re.match(r"^[+|][-+|:\s]+[+|]$", stripped):
+            continue
+        if not (stripped.startswith("|") and stripped.endswith("|")):
+            continue
+
+        cells = [c.strip() for c in stripped.split("|")[1:-1]]
+        if not cells:
+            continue
+
+        # First data-like row sets the header if it looks like column names.
+        # Recognize known column-name tokens.
+        tokens_lower = [c.lower() for c in cells]
+        if header_map is None:
+            known = {"item", "qty", "unit_eur", "line_eur"}
+            if any(t in known for t in tokens_lower):
+                header_map = {
+                    tokens_lower[i]: i for i in range(len(tokens_lower))
+                }
+                continue
+            # Otherwise: no header — fall through and try to treat this as
+            # the first data row under an implicit 4-column schema.
+            if len(cells) == 4:
+                header_map = {"item": 0, "qty": 1, "unit_eur": 2, "line_eur": 3}
+            elif len(cells) == 5:
+                header_map = {"#": 0, "item": 1, "qty": 2, "unit_eur": 3, "line_eur": 4}
+            else:
+                continue
+
+        # Parse a data row using the established header.
+        if len(cells) != len(header_map):
+            continue
+        if not all(k in header_map for k in ("item", "qty", "unit_eur", "line_eur")):
+            continue
+        item_val = cells[header_map["item"]]
+        qty_raw = cells[header_map["qty"]]
+        unit_raw = cells[header_map["unit_eur"]]
+        line_raw = cells[header_map["line_eur"]]
+
+        # Skip header/separator/total rows that sneak through as data.
+        if item_val.lower() in {"item", "name"}:
+            continue
+        # Total / summary rows typically have the item slot empty or named
+        # "TOTAL"; they also usually lack qty + unit_eur. Drop them.
+        if item_val.upper() == "TOTAL" and not qty_raw and not unit_raw:
+            continue
+
+        def _num(s: str, prefer_int: bool = False):
+            s = s.strip()
+            if not s:
+                return 0 if prefer_int else 0.0
+            # Strip currency symbols and thousands separators defensively.
+            s = s.replace(",", "").replace("€", "").replace("$", "").strip()
+            try:
+                if prefer_int and "." not in s:
+                    return int(s)
+                return float(s)
+            except ValueError:
+                return 0 if prefer_int else 0.0
+
+        qty = _num(qty_raw, prefer_int=True)
+        unit_eur = _num(unit_raw)
+        line_eur = _num(line_raw)
+        results.append({
+            "item": item_val,
+            "qty": qty,
+            "unit_eur": unit_eur,
+            "line_eur": line_eur,
+        })
+
+    return results
 
 
 # Cache for LLM-generated parsers: folder_path → callable
@@ -669,6 +779,29 @@ def _load_records(vm, path: str, config: "AgentConfig | None" = None, model: str
                 record["_date_from_file"] = parsed_dt.strftime("%Y-%m-%d")
             except (ValueError, OverflowError):
                 pass
+            # R1: populate the `line_items` column.
+            # Frontmatter wins over body parse (D1 idempotence / R1.b).
+            # Alias keys ``lines`` and ``items`` are also accepted.
+            fm_items = None
+            for alias in ("line_items", "lines", "items"):
+                val = record.get(alias)
+                if isinstance(val, list) and all(isinstance(x, dict) for x in val):
+                    fm_items = val
+                    break
+            if fm_items is not None:
+                # Shallow-normalize to the four-field schema with null-safety.
+                normalized: list[dict] = []
+                for raw in fm_items:
+                    normalized.append({
+                        "item": str(raw.get("item", raw.get("name", ""))),
+                        "qty": raw.get("qty", raw.get("quantity", 0)),
+                        "unit_eur": float(raw.get("unit_eur", raw.get("unit", raw.get("price", 0.0)) or 0.0)),
+                        "line_eur": float(raw.get("line_eur", raw.get("line_total", raw.get("total", 0.0)) or 0.0)),
+                    })
+                record["line_items"] = normalized
+            else:
+                # Body-table parse; if the file has no table, this returns [].
+                record["line_items"] = _parse_line_items_table(content)
             records.append(record)
         else:
             unparsed[fname] = content
@@ -720,7 +853,12 @@ def _load_records(vm, path: str, config: "AgentConfig | None" = None, model: str
     _loaded_df = pd.DataFrame(records)
 
     # Serialize list/dict columns to JSON strings for easier querying
+    # EXCEPT for columns in _LIST_COLUMN_EXEMPT (R1 D2) — those stay as
+    # native list[dict] so downstream .apply(lambda items: ...) queries
+    # work uniformly.
     for col in _loaded_df.columns:
+        if col in _LIST_COLUMN_EXEMPT:
+            continue  # R1: preserve list[dict] for .apply() queries
         if _loaded_df[col].apply(lambda x: isinstance(x, (list, dict))).any():
             _loaded_df[col] = _loaded_df[col].apply(
                 lambda x: json.dumps(x) if isinstance(x, (list, dict)) else x
