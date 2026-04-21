@@ -24,6 +24,25 @@ A "review and summarize" plan that omits the required writes is a
 ID-stable" rule in root `AGENTS.md` is about not making unnecessary
 edits, NOT about skipping required actions.
 
+The same verb-class invokes the full workflow across languages. In
+addition to the English verbs above, recognize these equivalents:
+
+- Chinese: 处理 (process/handle), 回复 (reply to), 看一下 (take a
+  look / review), 管理 (manage), 办理 (handle/process).
+- Japanese: 処理する (process), 対応する (handle/respond),
+  確認する (review/verify), 返信する (reply).
+- Spanish: procesar, manejar, revisar, atender, responder.
+- German: bearbeiten, behandeln, prüfen, beantworten, erledigen.
+- Arabic: معالجة (process), التعامل مع (deal with), مراجعة (review),
+  الرد (reply).
+
+All listed verbs across all listed languages invoke the full
+inbox-processing workflow — including Phase 5 (Act on allowed,
+fully verified messages) and any required outbox writes, reminder
+creation, or file deletions. A Chinese 处理 task or Japanese 処理する
+task triggers the same write-requiring workflow as an English
+"process" task.
+
 ## Phase 1: Preparation
 
 1. Load skills: `security-posture`, `identity-verification`, `compliance-check`
