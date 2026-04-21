@@ -294,9 +294,15 @@ def build_planner_system() -> str:
         "File timestamps are not a reliable proxy for 'today'.\n"
         "6. INDIRECT PROJECT REFERENCES: If the task mentions a project by "
         "nickname, description, or concept (not its exact folder name), plan "
-        "to load_records the projects folder and search _body, description, "
-        "or goal fields for matching keywords. Also search entity files if "
-        "the reference might be an entity name used as a project alias.\n\n"
+        "to load_records the projects folder; load_records adds a "
+        "_name_keywords synthetic column (lowercased, hyphen-split join of "
+        "name/goal/alias/notes) — filter via "
+        "df[df['_name_keywords'].str.contains(keyword, case=False, na=False)]. "
+        "If exact name match returns zero rows, fall back to _name_keywords "
+        "substring match. If more than one row matches with no clear top-1, "
+        "report OUTCOME_NONE_CLARIFICATION listing the candidates. Also "
+        "search entity files if the reference might be an entity name used "
+        "as a project alias.\n\n"
         "Use the plan_task tool."
     )
 

@@ -990,3 +990,68 @@ class TestLoadRecordsLineItemsColumn:
         from agent.dispatch import _parse_line_items_table
         # Simulate the recovery path: if body has no table, we expect [].
         assert _parse_line_items_table("just prose\nno tables here") == []
+
+
+class TestFindProject:
+    """R3 D4: `_find_project(query, df)` tokenizes query the same way as
+    the `_name_keywords` synthetic column and returns filtered rows.
+
+    Tokenization rule (R3 AC2): lowercase + hyphen-split + whitespace
+    collapsed. Case-insensitive substring-token match.
+    """
+
+    def test_exact_name_match_returns_single_row(self):
+        import pandas as _pd
+        from agent.dispatch import _find_project
+        df = _pd.DataFrame([
+            {"name": "Launch Kit", "_name_keywords": "launch kit ship"},
+            {"name": "NORA at home", "_name_keywords": "nora at home productivity"},
+        ])
+        result = _find_project("launch kit", df)
+        assert result.shape[0] == 1
+        assert result.iloc[0]["name"] == "Launch Kit"
+
+    def test_hyphen_tokenization_resolves_NORA_at_home(self):
+        """R3 AC2: 'NORA-at-home' splits into 'nora', 'at', 'home'."""
+        import pandas as _pd
+        from agent.dispatch import _find_project
+        df = _pd.DataFrame([
+            {"_name_keywords": "nora at home productivity"},
+            {"_name_keywords": "acme launch kit"},
+        ])
+        result = _find_project("NORA-at-home", df)
+        assert result.shape[0] == 1
+        assert "nora" in result.iloc[0]["_name_keywords"]
+
+    def test_substring_match_across_goal_alias_notes(self):
+        """Match finds rows via non-name fields baked into _name_keywords."""
+        import pandas as _pd
+        from agent.dispatch import _find_project
+        df = _pd.DataFrame([
+            {"_name_keywords": "alpha foo"},
+            {"_name_keywords": "beta morning launch kit sunrise"},
+        ])
+        result = _find_project("sunrise", df)
+        assert result.shape[0] == 1
+        assert "sunrise" in result.iloc[0]["_name_keywords"]
+
+    def test_ambiguous_multi_match_detectable_via_shape(self):
+        """R3 AC3: when multiple rows match, caller inspects .shape[0]
+        to escalate to OUTCOME_NONE_CLARIFICATION."""
+        import pandas as _pd
+        from agent.dispatch import _find_project
+        df = _pd.DataFrame([
+            {"_name_keywords": "alpha shared keyword"},
+            {"_name_keywords": "beta shared keyword"},
+        ])
+        result = _find_project("shared", df)
+        assert result.shape[0] == 2
+
+    def test_no_name_keywords_column_falls_back_safely(self):
+        """R3 D4: non-projects/ frames lacking _name_keywords must not
+        crash the helper — return empty frame instead."""
+        import pandas as _pd
+        from agent.dispatch import _find_project
+        df = _pd.DataFrame([{"name": "X"}, {"name": "Y"}])
+        result = _find_project("anything", df)
+        assert result.shape[0] == 0

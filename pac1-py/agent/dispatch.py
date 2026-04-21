@@ -616,6 +616,43 @@ def _parse_line_items_table(text: str) -> list[dict]:
     return results
 
 
+def _tokenize_name_query(text: str) -> list[str]:
+    """R3 AC2: lowercase + hyphen-split + whitespace-collapsed tokens.
+
+    Shared between ``_find_project`` and the ``_name_keywords`` synthetic
+    column so the query and the row text use identical tokenization.
+    """
+    if not isinstance(text, str):
+        return []
+    return text.lower().replace("-", " ").split()
+
+
+def _find_project(query: str, df) -> "pd.DataFrame":
+    """R3 D4: helper exposing the ``_name_keywords`` fallback lookup.
+
+    Tokenizes ``query`` via :func:`_tokenize_name_query`, joins the
+    tokens with ``|`` (regex alternation) and filters ``df`` against its
+    ``_name_keywords`` column. Returns the filtered frame so the caller
+    can inspect ``.shape[0]`` to detect ambiguous matches per R3 AC3.
+
+    If the frame lacks ``_name_keywords`` (e.g. a non-``projects/`` load),
+    the helper returns an empty slice instead of raising — matching
+    ``load_records``' safe-default ethos.
+    """
+    if df is None:
+        return df
+    if "_name_keywords" not in df.columns:
+        return df.iloc[0:0]
+    tokens = _tokenize_name_query(query)
+    if not tokens:
+        return df.iloc[0:0]
+    # Regex-escape each token and OR them; case-insensitive match against
+    # the deterministically-tokenized column.
+    alt = "|".join(re.escape(t) for t in tokens)
+    mask = df["_name_keywords"].str.contains(alt, case=False, na=False, regex=True)
+    return df[mask]
+
+
 # Cache for LLM-generated parsers: folder_path → callable
 _generated_parsers: dict = {}
 
@@ -851,6 +888,24 @@ def _load_records(vm, path: str, config: "AgentConfig | None" = None, model: str
     # Build DataFrame
     _loaded_records = records
     _loaded_df = pd.DataFrame(records)
+
+    # R3 D4: for projects/ loads, add a `_name_keywords` synthetic column
+    # (lowercased + hyphen-split + whitespace-collapsed join of
+    # name/goal/alias/notes) so indirect project references resolve via
+    # df['_name_keywords'].str.contains(...) as a deterministic fallback
+    # when exact-name match returns zero rows. Non-projects/ paths are
+    # untouched.
+    if path.strip("/").startswith("projects"):
+        def _keywords_for(row):
+            parts = [
+                str(row.get("name", "") or ""),
+                str(row.get("goal", "") or ""),
+                str(row.get("alias", "") or ""),
+                str(row.get("notes", "") or ""),
+            ]
+            joined = " ".join(parts).lower().replace("-", " ")
+            return " ".join(joined.split())
+        _loaded_df["_name_keywords"] = _loaded_df.apply(_keywords_for, axis=1)
 
     # Serialize list/dict columns to JSON strings for easier querying
     # EXCEPT for columns in _LIST_COLUMN_EXEMPT (R1 D2) — those stay as
