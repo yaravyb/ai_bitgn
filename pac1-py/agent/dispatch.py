@@ -355,6 +355,34 @@ def _text_match(text: str, keywords: str) -> bool:
     return all(w.lower() in text_lower for w in keywords.split())
 
 
+# R5 (D6): proactive statement-keyword sniffer — catches "multi-line script"
+# expressions BEFORE compile() so the LLM gets a targeted hint even when
+# the string technically parses as valid Python.
+#
+# Regex is anchored to line start via (?m)^\s* so valid comprehensions with
+# inline `for` tokens (e.g. `[x for x in records]`) do NOT match.
+_STATEMENT_RE = re.compile(
+    r"(?m)^\s*(import |from |def |class |for |while |async |return )"
+    r"|;\s*\S"
+)
+
+
+def _detect_statement_keywords(expression: str) -> bool:
+    """Return True if the expression looks like a Python *statement* rather
+    than an expression (R5 D6)."""
+    return bool(_STATEMENT_RE.search(expression))
+
+
+# R5 AC3: structured error hint returned on SyntaxError or sniffer hit.
+_CALCULATE_EXPRESSION_HINT = (
+    "calculate() accepts only Python expressions, not statements. "
+    "Rewrite as a comprehension: [x for x in records if cond(x)] instead of "
+    "'for x in records: ...'. Do not use import, def, for, while, or ;. "
+    "For intermediate variables, use a comprehension or nested "
+    "df.query()/df.apply() calls."
+)
+
+
 # Restricted namespace for calculate() — no builtins, no imports
 _CALC_NAMESPACE: dict = {
     "__builtins__": {},
@@ -383,13 +411,31 @@ def _safe_calculate(expression: str) -> str:
     no imports. Only pre-approved functions, pandas, and loaded data
     (df, records) are accessible.
     """
+    # R5 D6: proactive sniffer — catch statement-style expressions BEFORE
+    # compile() so the LLM gets a targeted hint even when the string would
+    # have parsed (e.g. a bare `import os`).
+    if _detect_statement_keywords(expression):
+        return f"Error: {_CALCULATE_EXPRESSION_HINT}"
+
     ns = dict(_CALC_NAMESPACE)
     if _loaded_df is not None:
         ns["df"] = _loaded_df
     ns["records"] = list(_loaded_records)
 
+    # R5 AC3 + AC4: SyntaxError branch returns the structured hint plus the
+    # original SyntaxError detail (msg + offset). Wrapping compile() in its
+    # own try block keeps runtime errors routed to the existing outer catch.
     try:
-        result = eval(compile(expression, "<calc>", "eval"), ns)  # noqa: S307 — restricted namespace, agent-generated only
+        compiled = compile(expression, "<calc>", "eval")
+    except SyntaxError as exc:
+        offset = getattr(exc, "offset", None)
+        detail = f"SyntaxError: {exc.msg}"
+        if offset is not None:
+            detail += f" (offset={offset})"
+        return f"Error: {_CALCULATE_EXPRESSION_HINT} [{detail}]"
+
+    try:
+        result = eval(compiled, ns)  # noqa: S307 — restricted namespace, agent-generated only
         # Convert pandas types to Python for clean display
         if isinstance(result, pd.DataFrame):
             return result.to_string(index=False)

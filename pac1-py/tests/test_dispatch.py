@@ -703,3 +703,75 @@ class TestDropDuplicateReplyWrites:
         # Delete preserved, only latest write remains
         assert pending[0]["op"] == "delete"
         assert pending[1]["args"]["content"] == "second"
+
+
+class TestDetectStatementKeywords:
+    """R5 D6: sniffer flags statement-style expressions BEFORE compile().
+
+    The regex is anchored to line start so valid comprehensions with
+    inline `for` tokens do NOT fire the hint.
+    """
+
+    def test_import_at_line_start_detects(self):
+        from agent.dispatch import _detect_statement_keywords
+        assert _detect_statement_keywords("import os") is True
+
+    def test_for_statement_at_line_start_detects(self):
+        from agent.dispatch import _detect_statement_keywords
+        assert _detect_statement_keywords("for x in records:\n    print(x)") is True
+
+    def test_comprehension_does_not_detect(self):
+        """A list comprehension with inline `for` must NOT fire the sniffer."""
+        from agent.dispatch import _detect_statement_keywords
+        assert _detect_statement_keywords("[x for x in records]") is False
+
+    def test_apply_lambda_does_not_detect(self):
+        from agent.dispatch import _detect_statement_keywords
+        assert _detect_statement_keywords(
+            "df['col'].apply(lambda r: r['amount'] * 2)"
+        ) is False
+
+    def test_semicolon_separator_detects(self):
+        from agent.dispatch import _detect_statement_keywords
+        assert _detect_statement_keywords("a = 1; b = 2;") is True
+
+    def test_detect_statement_keywords_allows_multiline_apply(self):
+        """Design-validation improvement #4 — multi-line .apply() must not fire."""
+        from agent.dispatch import _detect_statement_keywords
+        expr = (
+            "df['line_items'].apply(\n"
+            "    lambda items: sum(i['line_eur'] for i in items)\n"
+            ").sum()"
+        )
+        assert _detect_statement_keywords(expr) is False
+
+
+class TestSafeCalculateSyntaxHint:
+    """R5 AC3/AC4: SyntaxError branch returns structured expression-only hint."""
+
+    def test_syntax_error_returns_structured_hint(self):
+        from agent.dispatch import _safe_calculate
+        # `def foo():\n    pass` is invalid as an expression — SyntaxError.
+        result = _safe_calculate("def foo():\n    pass")
+        lowered = result.lower()
+        assert "calculate() accepts only python expressions" in lowered
+
+    def test_syntax_error_includes_original_message(self):
+        """R5 AC4: original SyntaxError msg is appended to the hint."""
+        from agent.dispatch import _safe_calculate
+        result = _safe_calculate("for x in r:\n    pass")
+        lowered = result.lower()
+        assert "calculate() accepts only python expressions" in lowered
+
+    def test_proactive_sniffer_fires_before_compile(self):
+        """`import os` parses as valid Python *statement* but fails eval —
+        the sniffer catches it before compile() per D6."""
+        from agent.dispatch import _safe_calculate
+        result = _safe_calculate("import os")
+        lowered = result.lower()
+        assert "calculate() accepts only python expressions" in lowered
+
+    def test_valid_expression_still_works(self):
+        """R5 AC5 invariant: valid expressions unchanged."""
+        from agent.dispatch import _safe_calculate
+        assert _safe_calculate("1 + 2").strip() == "3"

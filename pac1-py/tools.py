@@ -155,8 +155,21 @@ _READONLY_SCHEMAS: list[dict] = [
         "function": {
             "name": "calculate",
             "description": (
-                "Deterministic computation with pandas. Use instead of mental "
-                "math. After load_records(), query 'df' (pandas DataFrame): "
+                "Evaluate a single Python EXPRESSION against the pandas "
+                "DataFrame namespace. NOT a multi-line script — no import, "
+                "no def, no for/while loops, no ; statement separators, "
+                "no top-level assignment. Use list/dict comprehensions "
+                "instead of loops: [x for x in records if cond(x)] not "
+                "'for x in records: ...'. If you need intermediate "
+                "variables, use a comprehension with "
+                "(expr for x in records if cond) or nested df.query() / "
+                "df.apply() calls. "
+                "Examples (comprehension): "
+                "[r['full_name'] for r in records if r.get('amount', 0) > 100]. "
+                "Examples (apply): "
+                "df['line_items'].apply(lambda items: sum(i['line_eur'] "
+                "for i in items)).sum(). "
+                "After load_records(), query 'df' (pandas DataFrame): "
                 "df['total_eur'].sum(), "
                 "df[df['counterparty'] == 'X']['_file'].tolist(), "
                 "df[df['_file'].str.contains('keyword')].shape[0], "
@@ -171,7 +184,9 @@ _READONLY_SCHEMAS: list[dict] = [
                     "expression": {
                         "type": "string",
                         "description": (
-                            "Python/pandas expression. "
+                            "Single Python/pandas EXPRESSION (not a script). "
+                            "No import/def/for/while/; — use comprehensions: "
+                            "[x for x in records if x['amount'] > 100]. "
                             "DataFrame: df['col'].sum(), df[df['x']=='y'], "
                             "df.groupby('col').sum(), df.sort_values('col'). "
                             "Arithmetic: '1855 + 2400'. "
