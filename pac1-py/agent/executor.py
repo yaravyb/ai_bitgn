@@ -22,6 +22,7 @@ from agent.outcomes import (
     OUTCOME_OK,
 )
 from agent.planner import plan_task
+from agent.security_guard import structural_security_check
 from agent.prompts import (
     CLI_BOLD,
     CLI_CLR,
@@ -1239,6 +1240,24 @@ def run_agent(
         if security_override:
             outcome = security_override
             print(f"  {CLI_YELLOW}Security guard → {outcome}{CLI_CLR}")
+
+    # R4: deterministic structural fallback behind the LLM security review.
+    # BLOCKs any outbox write whose `attachments:` list references the four
+    # internal-lane paths (30_knowledge/, 90_memory/, 99_system/, AGENTS.md).
+    # OR-composes with the LLM review: if the LLM already flipped outcome
+    # to DENIED_SECURITY, the structural citation is APPENDED to the
+    # message for traceability; if the LLM passed (outcome still OK), a
+    # structural match still flips outcome.
+    if pending:
+        structural_citation = structural_security_check(pending)
+        if structural_citation:
+            if outcome == OUTCOME_OK:
+                outcome = OUTCOME_DENIED_SECURITY
+                message = structural_citation if not message else f"{message}\n{structural_citation}"
+                print(f"  {CLI_YELLOW}Structural guard → {outcome}{CLI_CLR}")
+            else:
+                # Already denied; append citation for traceability.
+                message = f"{message}\n{structural_citation}" if message else structural_citation
 
     # Deterministic email verification: exact sender match against entities
     if outcome == OUTCOME_OK and pending:
