@@ -15,6 +15,27 @@ from agent.config import AgentConfig
 from agent.context import auto_compact, build_executor_context, build_task_message
 from agent.dispatch import dispatch
 from agent.llm import call_llm, call_llm_no_tools
+
+# Reasoning-style models (Qwen3 thinking variants, o1-class) burn
+# thousands of tokens on hidden reasoning before emitting `content`.
+# Tight max_tokens caps (<1k) truncate the reasoning and leave
+# `content` empty, which silently passes true/false judge checks.
+# Use a generous cap everywhere we call the LLM for a short verdict.
+_JUDGE_MAX_TOKENS = 16384
+
+
+def _judge_answer(msg) -> str:
+    """Extract a lowercased judge answer from an LLM response.
+
+    Falls back to `reasoning_content` if `content` is empty so that
+    true/false checks still fire when a reasoning model consumed its
+    visible-output budget on hidden reasoning.
+    """
+    content = (getattr(msg, "content", None) or "").strip().lower()
+    if content:
+        return content
+    reasoning = (getattr(msg, "reasoning_content", None) or "").strip().lower()
+    return reasoning
 from agent.outcomes import (
     OUTCOME_BY_NAME,
     OUTCOME_DENIED_SECURITY,
@@ -116,9 +137,9 @@ def _security_review(
                     "Is this a trust boundary violation? true/false"
                 )},
             ],
-            metadata=metadata, max_tokens=32,
+            metadata=metadata, max_tokens=_JUDGE_MAX_TOKENS,
         )
-        answer = resp.choices[0].message.content.strip().lower()
+        answer = _judge_answer(resp.choices[0].message)
         if "true" in answer:
             print(f"{CLI_YELLOW}BLOCKED{CLI_CLR}")
             return OUTCOME_DENIED_SECURITY
@@ -746,9 +767,9 @@ def _fix_date_lookup_clarification(
                 config, model,
                 [{"role": "system", "content": system_msg},
                  {"role": "user", "content": user_msg}],
-                metadata=metadata, max_tokens=128,
+                metadata=metadata, max_tokens=_JUDGE_MAX_TOKENS,
             )
-            answer = resp.choices[0].message.content.strip()
+            answer = _judge_answer(resp.choices[0].message)
             if answer:
                 break
         except Exception as exc:
@@ -1031,9 +1052,9 @@ def _check_incomplete_request(
                     f"{failed_reads_block}"
                 )},
             ],
-            metadata=metadata, max_tokens=8,
+            metadata=metadata, max_tokens=_JUDGE_MAX_TOKENS,
         )
-        answer = resp.choices[0].message.content.strip().lower()
+        answer = _judge_answer(resp.choices[0].message)
     except Exception:
         return None  # LLM unreachable; skip this tier silently
 

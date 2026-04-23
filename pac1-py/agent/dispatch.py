@@ -659,77 +659,170 @@ _generated_parsers: dict = {}
 
 def _generate_parser_from_sample(
     sample_content: str, config: "AgentConfig", model: str, metadata: dict | None,
+    max_attempts: int = 3,
 ):
-    """Use a single LLM call to generate a Python extraction function from sample content.
+    """Use an LLM call to generate a Python extraction function from sample content.
 
     Returns a callable(content: str) -> dict or None on failure.
     The generated code runs in a restricted namespace (same security model
     as _safe_calculate — no real builtins, agent-controlled input only).
+
+    Retries up to max_attempts times when compile/exec/validation fails,
+    feeding the failed code + error back to the LLM so it can self-correct.
     """
     from agent.llm import call_llm_no_tools
 
-    prompt = (
-        "Analyze this file content and write a Python function body that "
-        "extracts all structured key-value fields into a dictionary.\n\n"
-        "RULES:\n"
-        "- The function signature is: def extract(content: str) -> dict\n"
-        "- Return a dict of {field_name: value} with string values\n"
-        "- Extract ALL fields you find (record_type, dates, amounts, names, etc.)\n"
-        "- Also add a '_body' key with the full content (max 2000 chars)\n"
-        "- Only use standard Python (re, str methods). No imports needed.\n"
-        "- Return empty dict {} if parsing fails\n"
-        "- Output ONLY the function body inside ```python``` markers, nothing else\n\n"
+    base_prompt = (
+        "Write a complete Python extraction function for this file "
+        "format. The function will be called on every file in a folder "
+        "and must return a dict of extracted fields.\n\n"
+        "Requirements:\n"
+        "- Signature: `def extract(content: str) -> dict`\n"
+        "- The function body MUST have multiple indented statements — "
+        "at minimum a `fields = {}` initializer, at least one extraction "
+        "block, and a `return fields` statement. A bare signature with "
+        "no body is invalid.\n"
+        "- Return a dict of string key → string value pairs.\n"
+        "- Always include `'_body': content[:2000]` in the returned dict.\n"
+        "- Extract all identifiable key-value pairs from YAML frontmatter "
+        "(between `---` delimiters), `key: value` lines, markdown "
+        "headings, and any other structured fields.\n"
+        "- Use only `re` (already imported) and built-in string methods. "
+        "No other imports.\n"
+        "- On an unparseable file, still return a dict containing at "
+        "least `{'_body': content[:2000]}` — never an empty dict and "
+        "never raise.\n\n"
+        "Output format: ONE ```python``` code block containing a "
+        "complete function definition with an indented body. Example "
+        "of the REQUIRED shape (adapt the extraction logic to the "
+        "sample below):\n"
+        "```python\n"
+        "def extract(content: str) -> dict:\n"
+        "    fields = {'_body': content[:2000]}\n"
+        "    fm = re.search(r'^---\\s*\\n(.*?)\\n---', content, re.DOTALL | re.MULTILINE)\n"
+        "    if fm:\n"
+        "        for line in fm.group(1).split('\\n'):\n"
+        "            if ':' in line:\n"
+        "                k, v = line.split(':', 1)\n"
+        "                fields[k.strip()] = v.strip()\n"
+        "    return fields\n"
+        "```\n\n"
         f"SAMPLE FILE:\n```\n{sample_content[:2000]}\n```"
     )
 
-    try:
-        resp = call_llm_no_tools(
-            config, model,
-            [{"role": "user", "content": prompt}],
-            metadata=metadata, max_tokens=1024,
-        )
-        code = resp.choices[0].message.content.strip()
-        # Extract code from markdown fence
-        if "```python" in code:
-            code = code.split("```python", 1)[1].split("```", 1)[0].strip()
-        elif "```" in code:
-            code = code.split("```", 1)[1].split("```", 1)[0].strip()
+    history: list[dict] = [{"role": "user", "content": base_prompt}]
+    last_error = ""
+    last_code = ""
 
-        # Wrap in function definition if not already
-        if not code.startswith("def extract"):
-            code = "def extract(content):\n" + "\n".join(
-                f"    {line}" if line.strip() else line for line in code.split("\n")
+    for attempt in range(max_attempts):
+        try:
+            # Reasoning-style models (Qwen3 thinking variants, o1-class)
+            # burn thousands of tokens on hidden reasoning before emitting
+            # the final `content`. Use a generous cap so reasoning +
+            # ~200-line function body both fit.
+            resp = call_llm_no_tools(
+                config, model, history, metadata=metadata, max_tokens=16384,
             )
+            msg = resp.choices[0].message
+            content = (msg.content or "").strip()
+            # If content is empty, see if the code hides inside
+            # reasoning_content (some reasoning variants put a draft
+            # there). Only use it if it contains a ```python code fence,
+            # so we don't accidentally try to compile natural-language
+            # chain-of-thought.
+            if not content:
+                reasoning = getattr(msg, "reasoning_content", None) or ""
+                if "```python" in reasoning or "```" in reasoning:
+                    log.info("Parser falling back to reasoning_content (%d chars, code fence found)",
+                             len(reasoning))
+                    content = reasoning.strip()
+                elif reasoning:
+                    log.info("reasoning_content has %d chars but no code fence — ignoring",
+                             len(reasoning))
+            code = content
+            last_code = code
+            # Debug: log the raw LLM response head so we can diagnose
+            # persistent "empty body" failures.
+            preview = code[:400].replace("\n", "\\n")
+            log.info("Parser LLM response (attempt %d, %d chars): %s",
+                     attempt + 1, len(code), preview)
 
-        # Compile and extract the function in a restricted namespace
-        # Security: restricted builtins (same model as _safe_calculate),
-        # code is from our own LLM call, not external user input
-        ns: dict = {
-            "re": re,
-            "__builtins__": {
-                "dict": dict, "str": str, "len": len, "list": list,
-                "int": int, "float": float, "enumerate": enumerate,
-                "range": range, "True": True, "False": False, "None": None,
-                "isinstance": isinstance, "ValueError": ValueError,
-                "Exception": Exception, "min": min, "max": max, "zip": zip,
-            },
-        }
-        compiled = compile(code, "<llm-parser>", "exec")
-        # Restricted exec — same security model as calculate()'s eval()
-        _run_compiled(compiled, ns)
-        fn = ns.get("extract")
-        if fn is None:
-            return None
+            # Extract code from markdown fence
+            if "```python" in code:
+                code = code.split("```python", 1)[1].split("```", 1)[0].strip()
+            elif "```" in code:
+                code = code.split("```", 1)[1].split("```", 1)[0].strip()
 
-        # Validate: the function should return a dict on the sample
-        test_result = fn(sample_content)
-        if isinstance(test_result, dict) and len(test_result) >= 2:
-            log.info("Generated parser OK: %d fields from sample", len(test_result))
-            return fn
-        return None
-    except Exception as exc:
-        log.warning("Parser generation failed: %s", exc)
-        return None
+            # Wrap in function definition if not already
+            if not code.startswith("def extract"):
+                code = "def extract(content):\n" + "\n".join(
+                    f"    {line}" if line.strip() else line for line in code.split("\n")
+                )
+
+            # Pre-compile sanity: a bare `def extract(...)` with no
+            # indented body would trip compile() with a generic
+            # IndentationError; raise a clearer error so the retry
+            # prompt sees "empty body" instead.
+            non_signature_lines = [
+                ln for ln in code.split("\n")[1:] if ln.strip()
+            ]
+            if not non_signature_lines:
+                raise ValueError(
+                    "Function body is empty — only the 'def extract(...)' "
+                    "signature was produced, with no indented "
+                    "statements after it."
+                )
+
+            # Compile and extract the function in a restricted namespace
+            # Security: restricted builtins (same model as _safe_calculate),
+            # code is from our own LLM call, not external user input
+            ns: dict = {
+                "re": re,
+                "__builtins__": {
+                    "dict": dict, "str": str, "len": len, "list": list,
+                    "int": int, "float": float, "enumerate": enumerate,
+                    "range": range, "True": True, "False": False, "None": None,
+                    "isinstance": isinstance, "ValueError": ValueError,
+                    "Exception": Exception, "min": min, "max": max, "zip": zip,
+                },
+            }
+            compiled = compile(code, "<llm-parser>", "exec")
+            # Restricted exec — same security model as calculate()'s eval()
+            _run_compiled(compiled, ns)
+            fn = ns.get("extract")
+            if fn is None:
+                last_error = "Generated code did not define an 'extract' function."
+            else:
+                test_result = fn(sample_content)
+                if isinstance(test_result, dict) and len(test_result) >= 2:
+                    log.info("Generated parser OK (attempt %d): %d fields from sample",
+                             attempt + 1, len(test_result))
+                    return fn
+                last_error = (
+                    f"extract() returned {type(test_result).__name__} with "
+                    f"{len(test_result) if hasattr(test_result, '__len__') else '?'} "
+                    "entries; need a dict with at least 2 fields."
+                )
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+
+        log.warning("Parser generation attempt %d failed: %s", attempt + 1, last_error)
+        if attempt + 1 >= max_attempts:
+            break
+
+        history.append({"role": "assistant", "content": last_code})
+        history.append({
+            "role": "user",
+            "content": (
+                f"That code failed with this error:\n{last_error}\n\n"
+                "Rewrite the function body, fixing the error. Remember: "
+                "output ONLY the function body inside ```python``` markers, "
+                "starting with `def extract(content):` and an indented body."
+            ),
+        })
+
+    log.warning("Parser generation gave up after %d attempts: %s", max_attempts, last_error)
+    return None
 
 
 def _run_compiled(compiled, ns):
