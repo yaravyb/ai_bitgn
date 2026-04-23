@@ -1,8 +1,11 @@
+import datetime as _dt
 import os
 import re
+import sys
 import textwrap
 import time
 import uuid
+from pathlib import Path
 
 from dotenv import load_dotenv
 load_dotenv(override=True)
@@ -33,6 +36,29 @@ CLI_CLR = "\x1B[0m"
 CLI_BLUE = "\x1B[34m"
 
 _QUANT_SUFFIX_RE = re.compile(r"(?:[-:][qQ]\d+_[A-Z0-9_]+|[-:]bf16|[-:]fp16|[-:]fp32)$")
+
+_RUNS_DIR = Path(__file__).resolve().parent / "runs"
+
+
+class _Tee:
+    """Write to two streams; drop-in replacement for sys.stdout/sys.stderr."""
+
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for s in self._streams:
+            s.write(data)
+            s.flush()
+        return len(data)
+
+    def flush(self):
+        for s in self._streams:
+            s.flush()
+
+
+def _model_id_safe(model_id: str) -> str:
+    return model_id.split("/", 1)[-1].replace(":", "_").replace("/", "_")
 
 
 def _run_display_name(model_id: str) -> str:
@@ -65,6 +91,16 @@ def main() -> None:
         raise RuntimeError("BITGN_API_KEY is not set in the environment (.env)")
 
     run_name = _run_display_name(MODEL_ID)
+
+    # Tee stdout to runs/bench_<model>_<ts>.txt; preserve original streams for restore.
+    _RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    log_ts = _dt.datetime.now().strftime("%Y%m%d_%H%M")
+    log_path = _RUNS_DIR / f"bench_{_model_id_safe(MODEL_ID)}_{log_ts}.txt"
+    log_file = open(log_path, "w", encoding="utf-8", buffering=1)
+    orig_stdout, orig_stderr = sys.stdout, sys.stderr
+    sys.stdout = _Tee(orig_stdout, log_file)
+    sys.stderr = _Tee(orig_stderr, log_file)
+    print(f"[runs] logging to {log_path}")
 
     scores: list[tuple[str, float, float]] = []
     run_start = time.time()
@@ -151,7 +187,21 @@ def main() -> None:
             print("".join(parts))
         print("─" * (col_width * len(cols)))
         avg = sum(s[1] for s in scores) / len(scores) * 100.0
-        print(f"FINAL: {avg:0.2f}%  |  Total: {total_elapsed:.1f}s  |  Tasks: {len(scores)}")
+        final_line = (
+            f"FINAL: {avg:0.2f}%  |  Total: {total_elapsed:.1f}s  "
+            f"|  Tasks: {len(scores)}"
+        )
+        print(final_line)
+        rel_log = log_path.relative_to(_RUNS_DIR.parent)
+        summary_line = (
+            f"{_dt.datetime.now().strftime('%Y-%m-%d %H:%M')}  |  "
+            f"{MODEL_ID}  |  {final_line}  |  log={rel_log}\n"
+        )
+        with open(_RUNS_DIR / "summary.txt", "a", encoding="utf-8") as f:
+            f.write(summary_line)
+
+    sys.stdout, sys.stderr = orig_stdout, orig_stderr
+    log_file.close()
 
 
 if __name__ == "__main__":
