@@ -768,6 +768,7 @@ def _fix_date_lookup_clarification(
                 [{"role": "system", "content": system_msg},
                  {"role": "user", "content": user_msg}],
                 metadata=metadata, max_tokens=_JUDGE_MAX_TOKENS,
+                enable_thinking=False,
             )
             answer = _judge_answer(resp.choices[0].message)
             if answer:
@@ -1053,6 +1054,7 @@ def _check_incomplete_request(
                 )},
             ],
             metadata=metadata, max_tokens=_JUDGE_MAX_TOKENS,
+            enable_thinking=False,
         )
         answer = _judge_answer(resp.choices[0].message)
     except Exception:

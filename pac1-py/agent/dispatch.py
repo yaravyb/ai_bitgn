@@ -716,12 +716,16 @@ def _generate_parser_from_sample(
 
     for attempt in range(max_attempts):
         try:
-            # Reasoning-style models (Qwen3 thinking variants, o1-class)
-            # burn thousands of tokens on hidden reasoning before emitting
-            # the final `content`. Use a generous cap so reasoning +
-            # ~200-line function body both fit.
+            # Suppress thinking for parser generation: this is a mechanical
+            # code-emit task where hidden reasoning used to burn the full
+            # max_tokens budget before any content was produced (probed
+            # 2026-04-24: baseline run hit 7902 chars of reasoning and
+            # finish=length with empty content; reasoning_effort="none"
+            # returned clean code in 95 tokens). Keep max_tokens generous
+            # in case the model still emits some preamble.
             resp = call_llm_no_tools(
                 config, model, history, metadata=metadata, max_tokens=16384,
+                enable_thinking=False,
             )
             msg = resp.choices[0].message
             content = (msg.content or "").strip()

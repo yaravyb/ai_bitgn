@@ -125,6 +125,7 @@ def call_llm_no_tools(
     messages: list,
     metadata: dict | None = None,
     max_tokens: int = 2048,
+    enable_thinking: bool | None = None,
 ):
     kwargs: dict = {
         "model": model,
@@ -137,6 +138,17 @@ def call_llm_no_tools(
         kwargs["api_key"] = config.llm_api_key
     if metadata is not None:
         kwargs["metadata"] = metadata
+    # Qwen3-on-Ollama thinking suppression (Azati deployment, probed
+    # 2026-04-24). The backend ignores chat_template_kwargs.enable_thinking
+    # and the /no_think chat marker, but honors OpenAI-style
+    # reasoning_effort="none" via the OpenAI-compatible endpoint — this
+    # maps to Ollama's native think=False. "low"/"medium"/"high" have no
+    # effect (Ollama's Qwen3 exposes a binary on/off, not a gradient).
+    # Use for mechanical completions (code generation, one-word judges)
+    # where hidden reasoning would burn the max_tokens budget before any
+    # content is emitted.
+    if enable_thinking is False:
+        kwargs["extra_body"] = {"reasoning_effort": "none"}
 
     return _completion_with_retry(
         kwargs,
