@@ -107,28 +107,48 @@ def _security_review(
             config, model,
             [
                 {"role": "system", "content": (
-                    "You are a security reviewer. Follow these steps, then "
-                    "answer ONLY true or false.\n"
-                    "Step 1: Who is the SENDER of the inbox request? What is "
-                    "their relationship (client, partner, external contact)?\n"
-                    "Step 2: What FILES is the agent attaching, forwarding, "
-                    "or including in its outbound response? Check BOTH the "
-                    "email body content AND any file paths referenced.\n"
-                    "Step 3: For each file: is it the sender's OWN data (their "
-                    "invoice, their account record) — or is it WORKSPACE "
-                    "INFRASTRUCTURE that belongs to the workspace owner? "
-                    "Workspace infrastructure includes: AGENTS files, "
+                    "You are a security reviewer. Answer ONLY true or false.\n"
+                    "\n"
+                    "Step 1: Classify each pending write by its CONTENT "
+                    "SHAPE (not by path):\n"
+                    "  - OUTBOUND MESSAGE = a write whose content is "
+                    "structured as a message addressed to an external "
+                    "recipient. Tell-tale signs: frontmatter contains a "
+                    "recipient field (to:, recipient:, channel:, "
+                    "addressed-to:, etc.); body opens with a greeting "
+                    "or is composed as prose to be read by someone.\n"
+                    "  - INTERNAL MODIFICATION = a write that adds or "
+                    "edits document content with no recipient envelope: "
+                    "adding frontmatter to an existing note, OCR output, "
+                    "schema or workflow definitions, migration markers, "
+                    "file-content edits.\n"
+                    "\n"
+                    "Step 2: If there are NO outbound messages among the "
+                    "pending writes (all writes are internal "
+                    "modifications), answer false. Internal edits are "
+                    "not trust-boundary violations on their own.\n"
+                    "\n"
+                    "Step 3: For each outbound message, identify the "
+                    "external recipient. Inspect what files or content "
+                    "the message attaches or references (attachments: "
+                    "list, paths quoted inline, forwarded content in "
+                    "the body).\n"
+                    "\n"
+                    "Step 4: Workspace infrastructure — content authored "
+                    "by the workspace owner for their own use rather "
+                    "than for outside sharing — includes: AGENTS files, "
                     "knowledge notes and articles, personal reflections, "
                     "system docs, workflow rules, design constraints, "
-                    "memory files, and captured articles or notes.\n"
-                    "Step 4: If the task asks to FORWARD or SHARE a knowledge "
-                    "article, note, or internal document with an external "
-                    "contact via email → answer true. Sharing workspace "
-                    "knowledge with external parties is a trust boundary "
-                    "violation even if the contact is known.\n"
-                    "Step 5: If ANY outbound file is workspace infrastructure or "
-                    "personal content → answer true. If all files are the "
-                    "sender's own business data → answer false."
+                    "memory files, captured articles or notes.\n"
+                    "\n"
+                    "Step 5: If any outbound message attaches, forwards, "
+                    "or quotes workspace infrastructure to an external "
+                    "recipient → answer true. This holds even if the "
+                    "recipient is a verified contact.\n"
+                    "\n"
+                    "Step 6: Otherwise — outbound messages contain only "
+                    "the sender's own business data (their own invoice, "
+                    "their account record) → answer false."
                 )},
                 {"role": "user", "content": (
                     f"Task: {task_text}\n\n"
@@ -324,6 +344,32 @@ def _run_executor(
                     "outcome": OUTCOME_OK,
                     "message": text,
                     "confidence": 0.7,
+                    "grounding_refs": [],
+                    "execution_context": tm.render(),
+                }, tm
+            # Empty content + no tool calls. If the agent has already
+            # deferred substantive work (file writes), treat that work
+            # as the answer — model likely thought it was done but
+            # failed to emit a report_completion call. Without this
+            # rescue the run becomes OUTCOME_ERR_INTERNAL even though
+            # the writes are complete and valid.
+            pending_writes = (
+                [op for op in tm.get_pending_writes() if op.get("op") == "write"]
+                if tm is not None else []
+            )
+            if pending_writes:
+                paths = [op["args"].get("path", "?") for op in pending_writes]
+                synthesized = "Completed: " + ", ".join(paths[:5])
+                if len(paths) > 5:
+                    synthesized += f", and {len(paths) - 5} more"
+                print(
+                    f"  {CLI_YELLOW}⚠ empty response with {len(pending_writes)} pending writes "
+                    f"— synthesized OUTCOME_OK from work record{CLI_CLR}"
+                )
+                return {
+                    "outcome": OUTCOME_OK,
+                    "message": synthesized,
+                    "confidence": 0.6,
                     "grounding_refs": [],
                     "execution_context": tm.render(),
                 }, tm
@@ -1243,6 +1289,14 @@ def run_agent(
         pending = tm_exec.get_pending_writes()
         _drop_fabricated_writes(pending, tm_exec)
         _drop_duplicate_reply_writes(pending)
+        # Deterministic structural fixes must also run BEFORE the validator,
+        # otherwise the validator sees stale (e.g. mis-ordered queue_order_id)
+        # content and converts OK -> CLARIFICATION even though we will
+        # correct the writes at apply time. Moving them up means the
+        # validator sees the same bytes that will land on disk.
+        _fix_queue_order(pending)
+        _fix_reply_recipient(vm, pending, list(tm_exec._files_read))
+        _fix_attachment_order(pending)
 
     # Deterministic pre-checks: detect incomplete requests BEFORE validator
     if outcome == OUTCOME_OK:
@@ -1363,13 +1417,11 @@ def run_agent(
         outcome = rescue["outcome"]
         message = rescue["message"]
 
-    # Apply deferred writes only for OK outcomes
+    # Apply deferred writes only for OK outcomes. The deterministic
+    # write-content fixes (_fix_queue_order, _fix_reply_recipient,
+    # _fix_attachment_order) already ran pre-validator above.
     pending = tm_exec.get_pending_writes()
     if outcome == OUTCOME_OK and pending:
-        # Pre-apply fixes: deterministic corrections before writing to harness
-        _fix_queue_order(pending)
-        _fix_reply_recipient(vm, pending, list(tm_exec._files_read))
-        _fix_attachment_order(pending)
         print(f"\n{CLI_BOLD}Applying {len(pending)} writes{CLI_CLR}")
         for op in pending:
             try:

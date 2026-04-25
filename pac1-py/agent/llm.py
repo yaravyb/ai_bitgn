@@ -63,14 +63,75 @@ def _completion_with_retry(
     kwargs.setdefault("timeout", _CALL_TIMEOUT_SEC)
     kwargs.setdefault("num_retries", 0)
 
+    # Diagnostic: estimate input size so 504s/timeouts can be correlated
+    # with context length. Includes tool schemas (they add real prompt
+    # tokens). Cheap rough estimator — 4 chars / token.
+    in_est = estimate_tokens(kwargs.get("messages") or [])
+    if kwargs.get("tools"):
+        in_est += estimate_tokens(kwargs["tools"])
+    max_out = kwargs.get("max_tokens", "?")
+    n_tools = len(kwargs.get("tools") or [])
+    print(f"  [llm→] {label}  in≈{in_est}  max_out={max_out}  tools={n_tools}", flush=True)
+
     start = time.monotonic()
     last_exc: BaseException | None = None
+    correction_added = False
     for attempt in range(max_retries):
+        attempt_start = time.monotonic()
         try:
-            return completion(**kwargs)
+            resp = completion(**kwargs)
+            usage = getattr(resp, "usage", None)
+            attempt_elapsed = time.monotonic() - attempt_start
+            if usage is not None:
+                print(
+                    f"  [llm←] {label}  prompt={getattr(usage,'prompt_tokens','?')}  "
+                    f"out={getattr(usage,'completion_tokens','?')}  "
+                    f"elapsed={attempt_elapsed:.1f}s",
+                    flush=True,
+                )
+            else:
+                print(f"  [llm←] {label}  elapsed={attempt_elapsed:.1f}s  (no usage)", flush=True)
+            return resp
         except _RETRYABLE_EXCEPTIONS as exc:
             last_exc = exc
+            attempt_elapsed = time.monotonic() - attempt_start
             elapsed = time.monotonic() - start
+            print(
+                f"  [llm✗] {label}  attempt={attempt+1}/{max_retries}  "
+                f"elapsed={attempt_elapsed:.1f}s  err={type(exc).__name__}",
+                flush=True,
+            )
+            # Feedback-on-retry: when the backend rejects the model's
+            # output as malformed tool-call syntax (e.g. "<parameter>
+            # closed by </function>"), adding a corrective system
+            # message tells the model to emit valid JSON tool calls on
+            # the next attempt. Without this, temperature=0 + identical
+            # prompt = identical broken output → all retries fail
+            # identically. Only inject the message once per call.
+            exc_text = str(exc).lower()
+            looks_like_tool_syntax_error = (
+                "syntax error" in exc_text
+                or "xml" in exc_text and "element" in exc_text
+                or "<parameter>" in exc_text
+                or "</function>" in exc_text
+            )
+            if looks_like_tool_syntax_error and not correction_added and kwargs.get("tools"):
+                correction_added = True
+                kwargs["messages"] = list(kwargs.get("messages", [])) + [{
+                    "role": "system",
+                    "content": (
+                        "Your previous response had malformed tool-call "
+                        "syntax. Emit tool calls strictly as valid JSON "
+                        "conforming to the tools schema — no XML tags "
+                        "like <parameter> or </function>. If you cannot "
+                        "produce a valid tool call, return plain text "
+                        "with your conclusion instead."
+                    ),
+                }]
+                print(
+                    f"  [retry-feedback] {label} appended tool-syntax correction",
+                    flush=True,
+                )
             if elapsed >= _RETRY_TOTAL_BUDGET_SEC:
                 log.warning(
                     "%s retry budget exhausted after %.1fs (%d/%d attempts) — giving up",

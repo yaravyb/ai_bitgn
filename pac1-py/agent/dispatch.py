@@ -14,6 +14,113 @@ def _normalize_frontmatter_gap(content: str) -> str:
     return _FRONTMATTER_GAP_RE.sub(r"\1\n", content)
 
 
+def _normalize_frontmatter_opener(content: str) -> str:
+    """Wrap (and if necessary reorder) a leading YAML key:value block in
+    ``---`` delimiters when the opener is missing.
+
+    Catches two LLM slips that both surface as "missing YAML frontmatter
+    opener" at scoring time:
+
+    1. The model emits ``key: value\\n...`` straight at the top of the
+       file with no ``---`` opener.
+    2. The model puts a short prefix (an HTML comment, a markdown
+       heading, etc.) BEFORE the YAML block, so the first non-blank
+       line is the prefix and the YAML keys appear immediately after.
+
+    Detection requires ≥2 contiguous YAML-shape lines, and they must
+    appear within the first 4 non-blank lines of the file so we never
+    misidentify body-internal ``key: value`` text. If the file already
+    contains any ``---`` line near the top we leave it alone — the
+    other normalizers handle malformed delimiters once at least one is
+    present.
+    """
+    if not content:
+        return content
+    lines = content.split("\n")
+    first_idx = next((i for i, l in enumerate(lines) if l.strip()), None)
+    if first_idx is None:
+        return content
+    # File already opens with `---`: downstream normalizers handle the rest.
+    if lines[first_idx].strip() == "---":
+        return content
+
+    yaml_start = -1
+    yaml_end = -1
+    cur_start = -1
+    cur_end = -1
+    seen_nonblank = 0
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if not s:
+            if cur_start >= 0 and cur_end - cur_start + 1 >= 2:
+                yaml_start, yaml_end = cur_start, cur_end
+                break
+            cur_start = -1
+            cur_end = -1
+            continue
+        seen_nonblank += 1
+        if seen_nonblank > 30:
+            break
+        # Any explicit `---` line near the top means the file already
+        # has frontmatter delimiters; do not try to reshape it.
+        if s == "---":
+            return content
+        # Distinguish YAML-shape lines (``key: value`` with a plain key)
+        # from markdown / comment / list lines.
+        is_yaml = False
+        if not s.startswith(("#", "-", "*", "<", "/", "[", ">", "|", "`")):
+            colon = s.find(":")
+            if colon > 0:
+                key = s[:colon]
+                if all(c.isalnum() or c in "_-." for c in key):
+                    is_yaml = True
+        if is_yaml:
+            if cur_start < 0:
+                cur_start = i
+            cur_end = i
+        else:
+            if cur_start >= 0 and cur_end - cur_start + 1 >= 2:
+                yaml_start, yaml_end = cur_start, cur_end
+                break
+            cur_start = -1
+            cur_end = -1
+    if yaml_start < 0 and cur_start >= 0 and cur_end - cur_start + 1 >= 2:
+        yaml_start, yaml_end = cur_start, cur_end
+    if yaml_start < 0:
+        return content
+
+    # Safety bound: only fire when there is no prefix at all, OR the
+    # prefix is structurally minimal (HTML comments or blank lines).
+    # Prevents misidentifying a body-internal ``key: value`` block as
+    # missing-frontmatter — a markdown document that has prose, then a
+    # heading, then YAML-shape lines is NOT a frontmatter slip and we
+    # must not move its content around.
+    prefix_lines = [l.strip() for l in lines[:yaml_start] if l.strip()]
+    def _looks_like_minimal_prefix(s: str) -> bool:
+        # Single-line HTML comment, comment opener, or comment closer.
+        return s.startswith("<!--") or s.startswith("-->") or s.endswith("-->")
+    if prefix_lines and not all(_looks_like_minimal_prefix(l) for l in prefix_lines):
+        return content
+    prefix_nonblank = len(prefix_lines)
+
+    yaml_block = "\n".join(lines[yaml_start : yaml_end + 1])
+    other_lines = lines[:yaml_start] + lines[yaml_end + 1 :]
+    while other_lines and not other_lines[0].strip():
+        other_lines = other_lines[1:]
+    other = "\n".join(other_lines)
+    n_yaml = yaml_end - yaml_start + 1
+    if yaml_start > 0 and prefix_nonblank > 0:
+        print(
+            f"  [fm-opener] reordered: moved {n_yaml}-line yaml block "
+            f"past {prefix_nonblank} prefix line(s) to file top",
+            flush=True,
+        )
+    else:
+        print(f"  [fm-opener] wrapped {n_yaml} yaml-shaped lines at file top", flush=True)
+    body = ("\n\n" + other) if other else "\n"
+    return f"---\n{yaml_block}\n---{body}"
+
+
 def _normalize_yaml_quoting(content: str) -> str:
     """Auto-quote YAML frontmatter values that contain colons.
 
@@ -178,6 +285,9 @@ def _reformat_single_table(table_lines: list[str]) -> list[str]:
 
 def _normalize_write_content(content: str) -> str:
     """Chain all write normalizers and warn if YAML is still broken."""
+    # Opener fix runs FIRST so downstream normalizers see properly
+    # delimited frontmatter when the model forgot the leading `---`.
+    content = _normalize_frontmatter_opener(content)
     content = _normalize_frontmatter_gap(content)
     content = _normalize_yaml_quoting(content)
     content = _normalize_ascii_tables(content)
@@ -1127,7 +1237,16 @@ def dispatch(
     # Defer write operations if requested (for dual-executor mode)
     _WRITE_OPS = {"write", "delete", "mkdir", "move"}
     if defer_writes and name in _WRITE_OPS and tm is not None:
-        tm.defer_write(name, dict(args))
+        # Run write normalizers at defer time so downstream consumers
+        # (validator, security checks, deferred reads) see the same
+        # corrected content that will eventually be written. Without
+        # this, structural slips like a missing `---` opener survive
+        # all the way to the validator and break the run before the
+        # apply-time normalizer ever runs.
+        deferred_args = dict(args)
+        if name == "write" and isinstance(deferred_args.get("content"), str):
+            deferred_args["content"] = _normalize_write_content(deferred_args["content"])
+        tm.defer_write(name, deferred_args)
         # Return a simulated success so the executor continues planning
         if name == "write":
             tm.track_write(args.get("path", ""))
