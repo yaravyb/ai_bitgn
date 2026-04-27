@@ -323,6 +323,13 @@ def _run_executor(
     print(f"{CLI_BOLD}{'─' * 50}{CLI_CLR}")
 
     did_search = False  # tracks if list/find/search was called
+    # Empty-output rescue counter. Qwen3-on-Ollama occasionally emits
+    # a "thought-but-stayed-silent" turn — completion_tokens > 0 but
+    # both choice.message.content and choice.message.tool_calls are
+    # empty (tokens went into a hidden <think> block with no answer).
+    # Observed once each in t038 and t062 across three full benches.
+    # We give the model one nudge to retry visibly before giving up.
+    empty_response_nudges = 0
 
     for _ in range(config.max_executor_steps):
         started = time.time()
@@ -373,6 +380,22 @@ def _run_executor(
                     "grounding_refs": [],
                     "execution_context": tm.render(),
                 }, tm
+            if empty_response_nudges < 1:
+                empty_response_nudges += 1
+                print(
+                    f"  {CLI_YELLOW}⚠ empty response and no work to rescue — "
+                    f"nudging once{CLI_CLR}"
+                )
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "Your previous turn produced no tool calls and no "
+                        "text content. Do not stop silently. Either call a "
+                        "tool to continue the task, or call report_completion "
+                        "with your answer in the 'message' field."
+                    ),
+                })
+                continue
             return None, tm
 
         n_calls = len(choice.message.tool_calls)
