@@ -75,7 +75,11 @@ def _completion_with_retry(
 
     start = time.monotonic()
     last_exc: BaseException | None = None
-    correction_added = False
+    # Progressive XML-corruption recovery. First correction is a polite
+    # reminder; second is a hard "stop using XML, switch to plain text"
+    # nudge. Bench-4 t059 burned all 3 retries with identical XML output
+    # because the polite reminder alone wasn't strong enough.
+    xml_corrections_added = 0
     for attempt in range(max_retries):
         attempt_start = time.monotonic()
         try:
@@ -107,7 +111,9 @@ def _completion_with_retry(
             # message tells the model to emit valid JSON tool calls on
             # the next attempt. Without this, temperature=0 + identical
             # prompt = identical broken output → all retries fail
-            # identically. Only inject the message once per call.
+            # identically. Two-tier correction: first attempt is a
+            # polite reminder; second is a hard "stop using XML, switch
+            # to plain text" override after the first didn't take.
             exc_text = str(exc).lower()
             looks_like_tool_syntax_error = (
                 "syntax error" in exc_text
@@ -115,23 +121,42 @@ def _completion_with_retry(
                 or "<parameter>" in exc_text
                 or "</function>" in exc_text
             )
-            if looks_like_tool_syntax_error and not correction_added and kwargs.get("tools"):
-                correction_added = True
-                kwargs["messages"] = list(kwargs.get("messages", [])) + [{
-                    "role": "system",
-                    "content": (
+            if looks_like_tool_syntax_error and kwargs.get("tools"):
+                if xml_corrections_added == 0:
+                    nudge = (
                         "Your previous response had malformed tool-call "
                         "syntax. Emit tool calls strictly as valid JSON "
                         "conforming to the tools schema — no XML tags "
                         "like <parameter> or </function>. If you cannot "
                         "produce a valid tool call, return plain text "
                         "with your conclusion instead."
-                    ),
-                }]
-                print(
-                    f"  [retry-feedback] {label} appended tool-syntax correction",
-                    flush=True,
-                )
+                    )
+                    tier = "polite"
+                elif xml_corrections_added == 1:
+                    nudge = (
+                        "STOP. Your previous attempt was rejected for "
+                        "the same XML/<parameter>/<function> syntax "
+                        "error. Do NOT attempt another tool call. "
+                        "Reply with plain text only — write your "
+                        "conclusion or the answer in normal prose. "
+                        "No tags, no JSON, no tool invocation. Just "
+                        "text."
+                    )
+                    tier = "hard-switch-to-text"
+                else:
+                    nudge = None
+                    tier = "exhausted"
+                if nudge is not None:
+                    xml_corrections_added += 1
+                    kwargs["messages"] = list(kwargs.get("messages", [])) + [{
+                        "role": "system",
+                        "content": nudge,
+                    }]
+                    print(
+                        f"  [retry-feedback] {label} appended tool-syntax "
+                        f"correction (tier={tier}, total={xml_corrections_added})",
+                        flush=True,
+                    )
             if elapsed >= _RETRY_TOTAL_BUDGET_SEC:
                 log.warning(
                     "%s retry budget exhausted after %.1fs (%d/%d attempts) — giving up",
