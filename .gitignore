@@ -6,3 +6,5 @@ __pycache__/
 .transcripts/
 /sandbox-py/.env
 /sandbox/examples_of_agents/
+# Benchmark runs — persistent logs so /tmp cleanup doesn't destroy data
+pac1-py/runs/

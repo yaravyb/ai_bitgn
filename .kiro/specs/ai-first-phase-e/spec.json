@@ -1,0 +1,23 @@
+{
+  "feature_name": "ai-first-phase-e",
+  "created_at": "2026-04-20T19:26:27Z",
+  "updated_at": "2026-04-21T12:00:00Z",
+  "language": "en",
+  "phase": "implementation-complete-mvp-t8-deferred",
+  "approvals": {
+    "requirements": {
+      "generated": true,
+      "approved": true
+    },
+    "design": {
+      "generated": true,
+      "approved": true
+    },
+    "tasks": {
+      "generated": true,
+      "approved": true
+    }
+  },
+  "ready_for_implementation": true,
+  "notes": "Requirements, design, and tasks all auto-approved via user's -y fast-track flag. Tasks phase fast-tracked on 2026-04-21: 8 top-level tasks (T5, T1, T2, T3, T4, T6, T9, T8) plus 2 optional post-MVP tasks (property-based R1 regression, conditional validator multilingual extension). T3/T4/T6 carry (P) parallel markers; T5→T1→T2 is the serial chain; T9 runs on every commit boundary; T8 is terminal verification. R7 closed at design-time per D8. All 4 design-validation improvements addressed in task decomposition. Post-T8-step-1 amendment 2026-04-21: R5 allowlist extended to include `pac1-py/agent/prompts.py` (R5c sub-commit) after tools.py+dispatch.py wording iterations (iter1, iter2) both produced t012 pass-rate <= 20%; structural blocker was attention-starved full_name mandate in executor prompt rule 7, not a missing rule. Scope expansion strictly limited to strengthening rule 7 — no new rule number, no regression of other Phase E requirements."
+}

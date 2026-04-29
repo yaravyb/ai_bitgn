@@ -1,26 +1,110 @@
+import datetime as _dt
 import os
+import re
+import sys
 import textwrap
+import time
+import uuid
+from pathlib import Path
+
+from dotenv import load_dotenv
+load_dotenv(override=True)
 
 from bitgn.harness_connect import HarnessServiceClientSync
-from bitgn.harness_pb2 import EndTrialRequest, EvalPolicy, GetBenchmarkRequest, StartPlaygroundRequest, StatusRequest
+from bitgn.harness_pb2 import (
+    EndTrialRequest,
+    EvalPolicy,
+    GetBenchmarkRequest,
+    StartRunRequest,
+    StartTrialRequest,
+    StatusRequest,
+    SubmitRunRequest,
+)
 from connectrpc.errors import ConnectError
 
 from agent import run_agent
+from observability import configure_observability
 
 BITGN_URL = os.getenv("BENCHMARK_HOST") or "https://api.bitgn.com"
 BENCHMARK_ID = os.getenv("BENCHMARK_ID") or "bitgn/pac1-dev"
-MODEL_ID = os.getenv("MODEL_ID") or "gpt-4.1-2025-04-14"
+MODEL_ID = os.getenv("MODEL_ID") or "openai/gpt-4.1-2025-04-14"
+BITGN_API_KEY = os.getenv("BITGN_API_KEY") or ""
 
 CLI_RED = "\x1B[31m"
 CLI_GREEN = "\x1B[32m"
 CLI_CLR = "\x1B[0m"
 CLI_BLUE = "\x1B[34m"
 
+_QUANT_SUFFIX_RE = re.compile(r"(?:[-:][qQ]\d+_[A-Z0-9_]+|[-:]bf16|[-:]fp16|[-:]fp32)$")
+
+_RUNS_DIR = Path(__file__).resolve().parent / "runs"
+
+
+class _Tee:
+    """Write to two streams; drop-in replacement for sys.stdout/sys.stderr."""
+
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for s in self._streams:
+            s.write(data)
+            s.flush()
+        return len(data)
+
+    def flush(self):
+        for s in self._streams:
+            s.flush()
+
+
+def _model_id_safe(model_id: str) -> str:
+    return model_id.split("/", 1)[-1].replace(":", "_").replace("/", "_")
+
+
+def _run_display_name(model_id: str) -> str:
+    """Derive the BitGN run display name from MODEL_ID.
+
+    Strips the provider prefix and any trailing quantization/format suffix
+    (e.g. "-q4_K_M", "-bf16", ":Q8_0"), then prefixes with the Azati team URL.
+    Examples:
+        openai/qwen3.5:27b-q4_K_M   → "https://azati.ai/ - qwen3.5:27b"
+        openrouter/qwen/qwen3.5-27b  → "https://azati.ai/ - qwen3.5-27b"
+        bedrock/us.meta.llama4-...    → "https://azati.ai/ - us.meta.llama4-..."
+    """
+    # Strip known provider prefixes; for openrouter/ also strip the org segment
+    if model_id.startswith("openrouter/"):
+        # openrouter/qwen/qwen3.5-27b → qwen3.5-27b (drop provider + org)
+        parts = model_id.split("/", 2)
+        short = parts[2] if len(parts) > 2 else parts[-1]
+    else:
+        short = model_id.split("/", 1)[-1]
+    short = _QUANT_SUFFIX_RE.sub("", short)
+    return f"https://azati.ai/ - {short}"
+
 
 def main() -> None:
+    configure_observability()
+
     task_filter = os.sys.argv[1:]
 
-    scores = []
+    if not BITGN_API_KEY:
+        raise RuntimeError("BITGN_API_KEY is not set in the environment (.env)")
+
+    run_name = _run_display_name(MODEL_ID)
+
+    # Tee stdout to runs/bench_<model>_<ts>.txt; preserve original streams for restore.
+    _RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    log_ts = _dt.datetime.now().strftime("%Y%m%d_%H%M")
+    log_path = _RUNS_DIR / f"bench_{_model_id_safe(MODEL_ID)}_{log_ts}.txt"
+    log_file = open(log_path, "w", encoding="utf-8", buffering=1)
+    orig_stdout, orig_stderr = sys.stdout, sys.stderr
+    sys.stdout = _Tee(orig_stdout, log_file)
+    sys.stderr = _Tee(orig_stderr, log_file)
+    print(f"[runs] logging to {log_path}")
+
+    scores: list[tuple[str, float, float]] = []
+    run_start = time.time()
+    print(f"Model: {MODEL_ID}  benchmark: {BENCHMARK_ID}")
     try:
         client = HarnessServiceClientSync(BITGN_URL)
         print("Connecting to BitGN", client.status(StatusRequest()))
@@ -30,44 +114,94 @@ def main() -> None:
             f"with {len(res.tasks)} tasks.\n{CLI_GREEN}{res.description}{CLI_CLR}"
         )
 
-        for task in res.tasks:
-            if task_filter and task.task_id not in task_filter:
-                continue
+        run = client.start_run(StartRunRequest(
+            benchmark_id=BENCHMARK_ID,
+            name=run_name,
+            api_key=BITGN_API_KEY,
+        ))
+        print(f"Run: {run.run_id} ({len(run.trial_ids)} trials)")
 
-            print(f"{'=' * 30} Starting task: {task.task_id} {'=' * 30}")
-            trial = client.start_playground(
-                StartPlaygroundRequest(
-                    benchmark_id=BENCHMARK_ID,
-                    task_id=task.task_id,
-                )
-            )
+        try:
+            for trial_id in run.trial_ids:
+                trial = client.start_trial(StartTrialRequest(trial_id=trial_id))
 
-            print(f"{CLI_BLUE}{trial.instruction}{CLI_CLR}\n{'-' * 80}")
+                if task_filter and trial.task_id not in task_filter:
+                    continue
 
-            try:
-                run_agent(MODEL_ID, trial.harness_url, trial.instruction)
-            except Exception as exc:
-                print(exc)
+                print(f"{'=' * 30} Starting task: {trial.task_id} {'=' * 30}")
+                print(f"{CLI_BLUE}{trial.instruction}{CLI_CLR}\n{'-' * 80}")
 
-            result = client.end_trial(EndTrialRequest(trial_id=trial.trial_id))
-            if result.score >= 0:
-                scores.append((task.task_id, result.score))
-                style = CLI_GREEN if result.score == 1 else CLI_RED
-                explain = textwrap.indent("\n".join(result.score_detail), "  ")
-                print(f"\n{style}Score: {result.score:0.2f}\n{explain}\n{CLI_CLR}")
+                trace_metadata = {
+                    "trace_id": str(uuid.uuid4()),
+                    "trace_name": "run_agent",
+                    "session_id": os.environ.get("SESSION_ID", ""),
+                    "trace_metadata": {
+                        "model": MODEL_ID,
+                        "task": trial.instruction[:200],
+                    },
+                }
+
+                task_start = time.time()
+                try:
+                    run_agent(MODEL_ID, trial.harness_url, trial.instruction, metadata=trace_metadata)
+                except Exception as exc:
+                    print(exc)
+                task_elapsed = time.time() - task_start
+
+                result = client.end_trial(EndTrialRequest(trial_id=trial.trial_id))
+                if result.score >= 0:
+                    scores.append((trial.task_id, result.score, task_elapsed))
+                    style = CLI_GREEN if result.score == 1 else CLI_RED
+                    explain = textwrap.indent("\n".join(result.score_detail), "  ")
+                    print(f"\n{style}Score: {result.score:0.2f}  ({task_elapsed:.1f}s)\n{explain}\n{CLI_CLR}")
+        finally:
+            client.submit_run(SubmitRunRequest(run_id=run.run_id, force=True))
 
     except ConnectError as exc:
         print(f"{exc.code}: {exc.message}")
     except KeyboardInterrupt:
         print(f"{CLI_RED}Interrupted{CLI_CLR}")
 
-    if scores:
-        for task_id, score in scores:
-            style = CLI_GREEN if score == 1 else CLI_RED
-            print(f"{task_id}: {style}{score:0.2f}{CLI_CLR}")
+    total_elapsed = time.time() - run_start
 
-        total = sum(score for _, score in scores) / len(scores) * 100.0
-        print(f"FINAL: {total:0.2f}%")
+    if scores:
+        print(f"\nModel: {MODEL_ID}")
+        rows_per_col = 10
+        cols = [scores[i:i + rows_per_col] for i in range(0, len(scores), rows_per_col)]
+        col_width = 28
+        # header separator
+        print("─" * (col_width * len(cols)))
+        for row_idx in range(rows_per_col):
+            parts = []
+            for col in cols:
+                if row_idx < len(col):
+                    task_id, score, elapsed = col[row_idx]
+                    style = CLI_GREEN if score == 1 else CLI_RED
+                    # visible text length: "t01: 1.00  (123.4s)" — pad to col_width
+                    cell = f"{task_id}: {style}{score:0.2f}{CLI_CLR}  ({elapsed:.1f}s)"
+                    visible_len = len(f"{task_id}: {score:0.2f}  ({elapsed:.1f}s)")
+                    cell += " " * max(0, col_width - visible_len)
+                    parts.append(cell)
+                else:
+                    parts.append(" " * col_width)
+            print("".join(parts))
+        print("─" * (col_width * len(cols)))
+        avg = sum(s[1] for s in scores) / len(scores) * 100.0
+        final_line = (
+            f"FINAL: {avg:0.2f}%  |  Total: {total_elapsed:.1f}s  "
+            f"|  Tasks: {len(scores)}"
+        )
+        print(final_line)
+        rel_log = log_path.relative_to(_RUNS_DIR.parent)
+        summary_line = (
+            f"{_dt.datetime.now().strftime('%Y-%m-%d %H:%M')}  |  "
+            f"{MODEL_ID}  |  {final_line}  |  log={rel_log}\n"
+        )
+        with open(_RUNS_DIR / "summary.txt", "a", encoding="utf-8") as f:
+            f.write(summary_line)
+
+    sys.stdout, sys.stderr = orig_stdout, orig_stderr
+    log_file.close()
 
 
 if __name__ == "__main__":
